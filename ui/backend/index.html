@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control Tower</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #0f1117; color: #e2e8f0; font-size: 14px; }
+    a { color: #63b3ed; text-decoration: none; }
+
+    /* Layout */
+    .shell { display: flex; height: 100vh; }
+    .sidebar { width: 200px; flex-shrink: 0; background: #1a1d27; border-right: 1px solid #2d3148;
+               display: flex; flex-direction: column; padding: 16px 0; }
+    .sidebar-logo { padding: 8px 20px 24px; font-size: 16px; font-weight: 700; color: #a78bfa; }
+    .sidebar-logo span { font-size: 20px; }
+    .nav-item { padding: 10px 20px; cursor: pointer; border-radius: 0; display: flex; align-items: center;
+                gap: 10px; color: #94a3b8; transition: background .15s, color .15s; }
+    .nav-item:hover { background: #252840; color: #e2e8f0; }
+    .nav-item.active { background: #2a2d4a; color: #a78bfa; border-right: 3px solid #a78bfa; }
+    .nav-badge { margin-left: auto; background: #dc2626; color: #fff; border-radius: 99px;
+                 padding: 1px 7px; font-size: 11px; font-weight: 600; }
+    .refresh-info { margin-top: auto; padding: 12px 20px; font-size: 11px; color: #4a5568; }
+
+    .main { flex: 1; overflow-y: auto; }
+    .topbar { background: #1a1d27; border-bottom: 1px solid #2d3148; padding: 14px 24px;
+              display: flex; align-items: center; justify-content: space-between; }
+    .topbar h1 { font-size: 18px; font-weight: 600; }
+    .topbar .meta { font-size: 12px; color: #4a5568; }
+    .content { padding: 24px; }
+
+    /* Summary cards */
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                    gap: 16px; margin-bottom: 24px; }
+    .card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 18px; }
+    .card-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .08em; }
+    .card-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+    .card-value.ok { color: #34d399; }
+    .card-value.warn { color: #fbbf24; }
+    .card-value.crit { color: #f87171; }
+
+    /* Tables */
+    .section-title { font-size: 13px; font-weight: 600; color: #94a3b8; text-transform: uppercase;
+                     letter-spacing: .08em; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; background: #1a1d27;
+            border: 1px solid #2d3148; border-radius: 10px; overflow: hidden; }
+    thead th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600;
+               color: #64748b; text-transform: uppercase; letter-spacing: .06em;
+               border-bottom: 1px solid #2d3148; background: #151821; }
+    tbody tr { border-bottom: 1px solid #1e2235; transition: background .1s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #1f2337; }
+    td { padding: 9px 14px; color: #cbd5e1; }
+    td.mono { font-family: 'SF Mono', 'Fira Mono', monospace; font-size: 12px; }
+
+    /* Badges */
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+             border-radius: 99px; font-size: 11px; font-weight: 600; }
+    .badge.operational { background: #064e3b; color: #34d399; }
+    .badge.degraded    { background: #78350f; color: #fbbf24; }
+    .badge.partial_outage { background: #7c2d12; color: #fb923c; }
+    .badge.major_outage   { background: #450a0a; color: #f87171; }
+    .badge.unknown     { background: #1e293b; color: #64748b; }
+    .badge.ok     { background: #064e3b; color: #34d399; }
+    .badge.warn   { background: #78350f; color: #fbbf24; }
+    .badge.error  { background: #450a0a; color: #f87171; }
+    .badge.critical { background: #450a0a; color: #f87171; }
+    .badge.info   { background: #1e3a5f; color: #60a5fa; }
+
+    /* Provider cards */
+    .provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+    .provider-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 16px; }
+    .provider-name { font-weight: 600; font-size: 15px; margin-bottom: 6px; text-transform: capitalize; }
+    .provider-components { font-size: 11px; color: #64748b; margin-top: 6px; line-height: 1.5; }
+
+    /* Alert rows */
+    .ack-btn { padding: 3px 10px; border: 1px solid #374151; border-radius: 5px; background: transparent;
+               color: #9ca3af; cursor: pointer; font-size: 11px; transition: all .15s; }
+    .ack-btn:hover { background: #1f2337; color: #e2e8f0; border-color: #6b7280; }
+
+    /* Pipeline */
+    .pipeline-nums { display: flex; gap: 8px; align-items: center; }
+    .num-badge { padding: 2px 8px; border-radius: 5px; font-size: 12px; font-family: monospace; }
+    .num-ok   { background: #052e16; color: #86efac; }
+    .num-fail { background: #450a0a; color: #fca5a5; }
+
+    /* Loading / empty */
+    .loading { text-align: center; padding: 40px; color: #4a5568; }
+    .empty { text-align: center; padding: 40px; color: #4a5568; font-size: 13px; }
+
+    /* Cost table pct bar */
+    .pct-bar-wrap { display: flex; align-items: center; gap: 8px; }
+    .pct-bar { height: 6px; border-radius: 3px; background: #1e293b; flex: 1; max-width: 80px; }
+    .pct-bar-fill { height: 100%; border-radius: 3px; }
+
+    .trend-up   { color: #f87171; }
+    .trend-down { color: #34d399; }
+    .trend-flat { color: #94a3b8; }
+  </style>
+</head>
+<body>
+<script type="module">
+import { h, render, Fragment } from 'https://esm.sh/preact@10';
+import { useState, useEffect, useCallback } from 'https://esm.sh/preact@10/hooks';
+import htm from 'https://esm.sh/htm@3';
+
+const html = htm.bind(h);
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+const fmt = {
+  num: (n) => n == null ? '—' : Number(n).toLocaleString(),
+  usd: (n) => n == null ? '—' : '$' + Number(n).toFixed(2),
+  ms:  (n) => n == null ? '—' : n < 1000 ? `${n}ms` : `${(n/1000).toFixed(1)}s`,
+  ago: (ts) => {
+    if (!ts) return '—';
+    const d = Math.floor((Date.now() - new Date(ts)) / 1000);
+    if (d < 60)  return `${d}s ago`;
+    if (d < 3600) return `${Math.floor(d/60)}m ago`;
+    return `${Math.floor(d/3600)}h ago`;
+  },
+  pct: (n) => n == null ? '—' : `${Number(n).toFixed(1)}%`,
+};
+
+const StatusBadge = ({ status }) => {
+  const label = (status || 'unknown').replace(/_/g, ' ');
+  return html`<span class=${`badge ${status || 'unknown'}`}>${label}</span>`;
+};
+
+// ─── Fetcher hook ─────────────────────────────────────────────────────────────
+
+function useApi(path, interval = 60000) {
+  const [data, setData] = useState(null);
+  const [err, setErr]   = useState(null);
+  const fetch_ = useCallback(() => {
+    fetch(path)
+      .then(r => r.json())
+      .then(d => { setData(d); setErr(null); })
+      .catch(e => setErr(String(e)));
+  }, [path]);
+  useEffect(() => { fetch_(); const id = setInterval(fetch_, interval); return () => clearInterval(id); }, [fetch_, interval]);
+  return [data, err, fetch_];
+}
+
+// ─── Views ────────────────────────────────────────────────────────────────────
+
+function ServicesView() {
+  const [rows] = useApi('/api/services');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  return html`
+    <div class="section-title">Service Health — ${rows.length} services</div>
+    <table>
+      <thead><tr>
+        <th>Service</th><th>Platform</th><th>Requests</th>
+        <th>Err%</th><th>Instances</th><th>Job Status</th>
+        <th>P95 Latency</th><th>Last collected</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(r => html`<tr key=${r.service_name}>
+          <td class="mono">${r.service_name}</td>
+          <td><span class="badge unknown" style="text-transform:capitalize">${(r.platform||'').replace(/_/g,' ')}</span></td>
+          <td>${fmt.num(r.request_count)}</td>
+          <td style=${r.error_rate_pct > 5 ? 'color:#f87171' : ''}>${fmt.pct(r.error_rate_pct)}</td>
+          <td>${fmt.num(r.instance_count)}</td>
+          <td>${r.job_status ? html`<${StatusBadge} status=${r.job_status === 'succeeded' ? 'operational' : 'major_outage'}/>` : '—'}</td>
+          <td>${fmt.ms(r.p95_latency_ms)}</td>
+          <td style="color:#64748b">${fmt.ago(r.collected_at)}</td>
+        </tr>`)}
+      </tbody>
+    </table>`;
+}
+
+function ProvidersView() {
+  const [rows] = useApi('/api/providers');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  const borderColor = { operational:'#064e3b', degraded:'#78350f', partial_outage:'#7c2d12', major_outage:'#450a0a' };
+  return html`
+    <div class="section-title">Third-Party Provider Status</div>
+    <div class="provider-grid">
+      ${rows.map(r => {
+        const comps = Array.isArray(r.affected_components) ? r.affected_components : [];
+        return html`<div key=${r.provider} class="provider-card"
+          style=${`border-color:${borderColor[r.overall_status]||'#2d3148'}`}>
+          <div class="provider-name">${r.provider}</div>
+          <${StatusBadge} status=${r.overall_status}/>
+          ${comps.length > 0 && html`<div class="provider-components">${comps.slice(0,3).join(', ')}${comps.length>3?` +${comps.length-3} more`:''}</div>`}
+          <div style="font-size:11px;color:#4a5568;margin-top:8px">${fmt.ago(r.polled_at)}</div>
+        </div>`;
+      })}
+    </div>`;
+}
+
+function AlertsView() {
+  const [rows, , refresh] = useApi('/api/alerts');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  if (!rows.length) return html`<div class="empty">No unacknowledged alerts. All clear.</div>`;
+
+  const ack = async (id) => {
+    await fetch(`/api/alerts/${id}/ack`, { method: 'POST' });
+    refresh();
+  };
+
+  return html`
+    <div class="section-title">${rows.length} unacknowledged alert${rows.length !== 1 ? 's' : ''}</div>
+    <table>
+      <thead><tr>
+        <th>Severity</th><th>Type</th><th>Service / Provider</th>
+        <th>Message</th><th>Fired</th><th></th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(r => html`<tr key=${r.alert_id}>
+          <td><${StatusBadge} status=${r.severity}/></td>
+          <td class="mono" style="font-size:12px">${r.alert_type}</td>
+          <td class="mono" style="font-size:12px">${r.service_name || r.provider || '—'}</td>
+          <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.message}</td>
+          <td style="color:#64748b;white-space:nowrap">${fmt.ago(r.fired_at)}</td>
+          <td><button class="ack-btn" onClick=${()=>ack(r.alert_id)}>Ack</button></td>
+        </tr>`)}
+      </tbody>
+    </table>`;
+}
+
+function PipelineView() {
+  const [rows] = useApi('/api/pipeline');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  if (!rows.length) return html`
+    <div class="empty">
+      <p>No pipeline events yet.</p>
+      <p style="margin-top:8px;font-size:12px;color:#374151">
+        Add <code style="background:#1e293b;padding:2px 6px;border-radius:4px">CT_METRICS:</code> log lines to your Cloud Run jobs to track processing metrics.
+      </p>
+    </div>`;
+
+  return html`
+    <div class="section-title">Pipeline Processing Metrics — last run per job</div>
+    <table>
+      <thead><tr>
+        <th>Job</th><th>Step</th><th>Status</th>
+        <th>Processed</th><th>Failed</th><th>Duration</th>
+        <th>24h runs</th><th>24h total processed</th><th>Last run</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(r => {
+          const h24 = r.history_24h || {};
+          return html`<tr key=${r.pipeline_id}>
+            <td class="mono">${r.pipeline_id}</td>
+            <td style="color:#94a3b8">${r.step_name}</td>
+            <td><${StatusBadge} status=${r.status}/></td>
+            <td><span class="num-badge num-ok">${fmt.num(r.rows_written)}</span></td>
+            <td>${r.rows_failed ? html`<span class="num-badge num-fail">${fmt.num(r.rows_failed)}</span>` : '—'}</td>
+            <td>${fmt.ms(r.duration_ms)}</td>
+            <td>${fmt.num(h24.runs_24h)}</td>
+            <td>${fmt.num(h24.total_processed_24h)}</td>
+            <td style="color:#64748b">${fmt.ago(r.occurred_at)}</td>
+          </tr>`;
+        })}
+      </tbody>
+    </table>
+    <div style="margin-top:16px;padding:14px;background:#151821;border-radius:8px;font-size:12px;color:#4a5568;line-height:1.8">
+      <b style="color:#64748b">How to add metrics to a service:</b><br/>
+      <code style="color:#86efac">log.info("CT_METRICS: " + json.dumps({"records_processed": 1234, "records_failed": 5, "step": "main"}))</code>
+    </div>`;
+}
+
+function CostsView() {
+  const [rows] = useApi('/api/costs', 300000);
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  if (!rows.length) return html`<div class="empty">No cost data yet. Cost collector runs daily at 06:00 IST.</div>`;
+
+  const grouped = {};
+  for (const r of rows) {
+    if (!grouped[r.cost_source]) grouped[r.cost_source] = [];
+    grouped[r.cost_source].push(r);
+  }
+
+  return html`
+    ${Object.entries(grouped).map(([source, items]) => {
+      const total = items.reduce((s, r) => s + Number(r.this_week_usd || 0), 0);
+      const totalLast = items.reduce((s, r) => s + Number(r.last_week_usd || 0), 0);
+      return html`
+        <div class="section-title" style="margin-top:${source === Object.keys(grouped)[0] ? '0' : '24px'}">${source} — ${fmt.usd(total)} this week</div>
+        <table>
+          <thead><tr>
+            <th>Resource</th><th>This week</th><th>Last week</th>
+            <th>Trend</th><th>Monthly budget</th><th>Projected burn</th>
+          </tr></thead>
+          <tbody>
+            ${items.map(r => {
+              const tw = Number(r.this_week_usd || 0);
+              const lw = Number(r.last_week_usd || 0);
+              const pct = lw > 0 ? ((tw - lw) / lw * 100) : 0;
+              const trendClass = pct > 15 ? 'trend-up' : pct < -15 ? 'trend-down' : 'trend-flat';
+              const trendLabel = Math.abs(pct) < 5 ? '→' : (pct > 0 ? `▲${pct.toFixed(0)}%` : `▼${Math.abs(pct).toFixed(0)}%`);
+              const budget = r.monthly_budget_usd ? Number(r.monthly_budget_usd) : null;
+              const projMonthly = tw / 7 * 30;
+              const burnPct = budget ? (projMonthly / budget * 100) : null;
+              return html`<tr key=${r.resource_name}>
+                <td class="mono">${r.resource_name}</td>
+                <td>${fmt.usd(tw)}</td>
+                <td style="color:#64748b">${fmt.usd(lw)}</td>
+                <td class=${trendClass}>${trendLabel}</td>
+                <td style="color:#64748b">${budget ? fmt.usd(budget)+'/mo' : '—'}</td>
+                <td>${burnPct != null ? html`
+                  <div class="pct-bar-wrap">
+                    <span style=${burnPct > 90 ? 'color:#f87171' : burnPct > 70 ? 'color:#fbbf24' : 'color:#34d399'}>${burnPct.toFixed(0)}%</span>
+                    <div class="pct-bar"><div class="pct-bar-fill" style=${`width:${Math.min(burnPct,100)}%;background:${burnPct>90?'#f87171':burnPct>70?'#fbbf24':'#34d399'}`}></div></div>
+                  </div>` : '—'}</td>
+              </tr>`;
+            })}
+          </tbody>
+        </table>`;
+    })}`;
+}
+
+function FreshnessView() {
+  const [rows] = useApi('/api/freshness');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  if (!rows.length) return html`<div class="empty">No freshness data yet. Requires Phase 3 (PeerDB) to be live.</div>`;
+  return html`
+    <div class="section-title">Data Freshness — ${rows.length} tables monitored</div>
+    <table>
+      <thead><tr>
+        <th>Database</th><th>Table</th><th>Status</th>
+        <th>Last write</th><th>Row count</th><th>Delta</th><th>Checked</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(r => html`<tr key=${`${r.database_name}.${r.table_name}`}>
+          <td class="mono" style="color:#94a3b8">${r.database_name}</td>
+          <td class="mono">${r.table_name}</td>
+          <td><${StatusBadge} status=${r.freshness_status === 'fresh' ? 'operational' : r.freshness_status === 'stale' ? 'degraded' : 'major_outage'}/></td>
+          <td style="color:#64748b">${fmt.ago(r.last_write_at)}</td>
+          <td>${fmt.num(r.row_count_snapshot)}</td>
+          <td>${r.row_count_delta != null ? html`<span style=${`color:${r.row_count_delta>0?'#34d399':'#f87171'}`}>${r.row_count_delta>0?'+':''}${fmt.num(r.row_count_delta)}</span>` : '—'}</td>
+          <td style="color:#64748b">${fmt.ago(r.checked_at)}</td>
+        </tr>`)}
+      </tbody>
+    </table>`;
+}
+
+// ─── App shell ────────────────────────────────────────────────────────────────
+
+const VIEWS = [
+  { id: 'overview',   icon: '⬡', label: 'Overview'  },
+  { id: 'services',   icon: '▦', label: 'Services'   },
+  { id: 'providers',  icon: '⚡', label: 'Providers'  },
+  { id: 'pipeline',   icon: '⇌', label: 'Pipeline'   },
+  { id: 'freshness',  icon: '⏱', label: 'Freshness'  },
+  { id: 'alerts',     icon: '🔔', label: 'Alerts'     },
+  { id: 'costs',      icon: '💰', label: 'Costs'      },
+];
+
+function OverviewView({ alerts, summary }) {
+  const s = summary || {};
+  const critical = s.critical_alerts || 0;
+  return html`
+    <div class="summary-grid">
+      <div class="card">
+        <div class="card-label">Active Services</div>
+        <div class="card-value ok">${s.active_services ?? '—'}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Open Alerts</div>
+        <div class="card-value ${s.open_alerts > 0 ? (critical > 0 ? 'crit' : 'warn') : 'ok'}">${s.open_alerts ?? '—'}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Critical Alerts</div>
+        <div class="card-value ${critical > 0 ? 'crit' : 'ok'}">${critical}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Spend (7d)</div>
+        <div class="card-value">${s.weekly_spend_usd ? '$'+Number(s.weekly_spend_usd).toFixed(2) : '—'}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Last Collection</div>
+        <div class="card-value" style="font-size:16px">${s.last_collection ? new Date(s.last_collection).toLocaleTimeString() : '—'}</div>
+      </div>
+    </div>
+    <${ProvidersView}/>`;
+}
+
+function App() {
+  const [view, setView]       = useState('overview');
+  const [summary, , ]         = useApi('/api/summary', 60000);
+  const [alerts]              = useApi('/api/alerts',  60000);
+  const openAlerts            = (alerts || []).length;
+  const critAlerts            = (alerts || []).filter(a => a.severity === 'critical').length;
+
+  const pageTitle = VIEWS.find(v => v.id === view)?.label || 'Overview';
+
+  return html`
+    <div class="shell">
+      <nav class="sidebar">
+        <div class="sidebar-logo"><span>🔭</span> Control Tower</div>
+        ${VIEWS.map(v => html`
+          <div key=${v.id} class=${`nav-item ${view === v.id ? 'active' : ''}`} onClick=${()=>setView(v.id)}>
+            <span>${v.icon}</span> ${v.label}
+            ${v.id === 'alerts' && openAlerts > 0 && html`<span class="nav-badge">${openAlerts}</span>`}
+          </div>`
+        )}
+        <div class="refresh-info">Auto-refresh: 60s</div>
+      </nav>
+      <div class="main">
+        <div class="topbar">
+          <h1>${pageTitle}</h1>
+          <div class="meta">
+            ${critAlerts > 0 ? html`<span style="color:#f87171;font-weight:600">${critAlerts} critical</span> · ` : ''}
+            ${summary?.last_collection ? `Last data: ${new Date(summary.last_collection).toLocaleString()}` : 'Loading…'}
+          </div>
+        </div>
+        <div class="content">
+          ${view === 'overview'  && html`<${OverviewView} summary=${summary} alerts=${alerts}/>`}
+          ${view === 'services'  && html`<${ServicesView}/>`}
+          ${view === 'providers' && html`<${ProvidersView}/>`}
+          ${view === 'pipeline'  && html`<${PipelineView}/>`}
+          ${view === 'freshness' && html`<${FreshnessView}/>`}
+          ${view === 'alerts'    && html`<${AlertsView}/>`}
+          ${view === 'costs'     && html`<${CostsView}/>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+render(html`<${App}/>`, document.body);
+</script>
+</body>
+</html>

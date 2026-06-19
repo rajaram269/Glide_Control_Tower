@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+venv/
+node_modules/
+*.log
+.DS_Store
+credentials*.json
+service-account*.json

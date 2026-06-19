@@ -1,0 +1,4 @@
+psycopg2-binary==2.9.10
+anthropic==0.40.0
+msal==1.31.0
+requests==2.32.3
