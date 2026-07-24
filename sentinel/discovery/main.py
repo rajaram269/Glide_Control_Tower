@@ -29,6 +29,12 @@ HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
 NOW = datetime.datetime.now(datetime.timezone.utc)
 ADVISORY_LOCK_KEY = 0x53454E54  # "SENT"
 
+# Progressive scanning: cap new/changed tables processed per run so a full pass over
+# ~450 tables never risks the Cloud Run task timeout. Each run commits per-table and
+# the incremental gate skips already-done tables, so consecutive runs (scheduled or
+# stacked manual) fill the catalog over a few runs; steady-state only touches changes.
+MAX_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_TABLES_PER_RUN", "80"))
+
 # PII-safe sampling caps (§10.3)
 MAX_DISTINCT = 50
 MAX_STR_LEN = 64
@@ -636,6 +642,7 @@ def main():
             log.info("Enumerated %d ClickHouse tables", len(tables))
 
             seen_keys = set()
+            full_pass = True   # False if we break early on the batch cap
             for meta in tables:
                 db, tbl = meta["database_name"], meta["table_name"]
                 key = (db, tbl)
@@ -646,10 +653,22 @@ def main():
                 meta["structure_hash"] = structure_hash(columns)
 
                 prior = existing.get(key)
-                # 4. Incremental gate — unchanged structure skips the LLM
+                # 4. Incremental gate — unchanged structure skips the LLM. This is what
+                # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
+                # are skipped here, so each run advances the frontier of new/changed
+                # tables until the whole catalog is filled, then steady-state is cheap.
                 if prior and prior["structure_hash"] == meta["structure_hash"]:
                     skip_count += 1
                     continue
+
+                # Per-run batch cap: only process up to MAX_TABLES_PER_RUN new/changed
+                # tables, so a run over 450 tables never risks the Cloud Run task timeout.
+                # The next scheduled (or stacked manual) run picks up the rest.
+                if llm_count >= MAX_TABLES_PER_RUN:
+                    log.info("Batch cap reached (%d tables this run); remaining tables "
+                             "will be picked up next run.", MAX_TABLES_PER_RUN)
+                    full_pass = False
+                    break
 
                 # 5. PII-safe sample
                 samples = pii_safe_samples(ch, db, tbl, columns)
@@ -684,21 +703,31 @@ def main():
                 # they converge on the next run — acceptable for observe-stage rules.
                 generate_recon_rules(cur, overlay_row, inferred, tracked_vars)
 
-            # 8. Dropped tables → retire
-            gone = set(existing) - seen_keys
-            for db, tbl in gone:
-                cur.execute(
-                    "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
-                    "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
-                    (db, tbl),
-                )
-                cur.execute(
-                    "UPDATE sentinel.monitor_targets SET status = 'retired' "
-                    "WHERE database_name = %s AND table_name = %s",
-                    (db, tbl),
-                )
-            if gone:
-                log.info("Retired %d dropped tables", len(gone))
+                # Commit each table immediately: catalog populates live (visible in the
+                # UI as it goes), and a timeout/crash never loses completed work — the
+                # incremental gate skips them on the next run. Advisory lock is
+                # session-scoped so it survives these commits.
+                pg.commit()
+
+            # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
+            # unvisited tables are absent from seen_keys and would be wrongly retired.
+            if full_pass:
+                gone = set(existing) - seen_keys
+                for db, tbl in gone:
+                    cur.execute(
+                        "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
+                        "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
+                        (db, tbl),
+                    )
+                    cur.execute(
+                        "UPDATE sentinel.monitor_targets SET status = 'retired' "
+                        "WHERE database_name = %s AND table_name = %s",
+                        (db, tbl),
+                    )
+                if gone:
+                    log.info("Retired %d dropped tables", len(gone))
+            else:
+                log.info("Partial run (batch cap) — skipping dropped-table retirement.")
 
             # 7. Global authority reconciliation (I1/I2) after all upserts
             reconcile_authority(cur, seen_keys)
