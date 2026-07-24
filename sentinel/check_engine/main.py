@@ -558,6 +558,10 @@ def main():
                     (target["id"],),
                 )
                 ran += 1
+                # Commit per target: results/incidents show live and a timeout never
+                # loses completed checks (next_due_at is advanced so they aren't re-run
+                # this cycle). Advisory lock is session-scoped, survives commits.
+                pg.commit()
 
             roll_up_incidents(cur)
 
