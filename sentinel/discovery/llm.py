@@ -325,17 +325,18 @@ def infer_overlay(payload):
     raise RuntimeError(f"all LLM providers failed: {last_err}")
 
 
-def check(payload, maker_result, maker_provider):
+def check(payload, maker_result, maker_provider, skip_source_type=False):
     """Maker-checker: a DIFFERENT provider re-derives the fields. Returns
     (agree: bool, checker_provider|None, reason:str).
 
     Only MATERIAL disagreements matter — the two things that actually make a
     consumer's answer wrong: source_type (drives which table is picked) and the
     dedup requirement (drives correctness). Concept/scope WORDING and exact
-    dedup_key column lists differ harmlessly between models ('finance' vs 'spend',
-    'vendor management' vs 'spend') and must NOT flag review — that produced a
-    flood of meaningless 'needs review' rows. Returns (True, None, '') when no
-    other provider is available."""
+    dedup_key column lists differ harmlessly between models ('finance' vs 'spend')
+    and must NOT flag review. When skip_source_type is set (a deterministic name
+    heuristic already fixed source_type authoritatively), source_type is excluded
+    too — else the checker's free guess always 'disagrees' and flags every table.
+    Returns (True, None, '') when no other provider is available."""
     checkers = [p for p in _PROVIDER_ORDER if p != maker_provider]
     for provider in checkers:
         try:
@@ -344,7 +345,7 @@ def check(payload, maker_result, maker_provider):
             log.warning("checker %s failed: %s", provider, e)
             continue
         reasons = []
-        if other["source_type"] != maker_result["source_type"]:
+        if not skip_source_type and other["source_type"] != maker_result["source_type"]:
             reasons.append(f"source_type: {maker_provider}={maker_result['source_type']} "
                            f"vs {provider}={other['source_type']}")
         if bool(other["requires_dedup"]) != bool(maker_result["requires_dedup"]):

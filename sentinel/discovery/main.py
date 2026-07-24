@@ -688,8 +688,12 @@ def main():
                     inferred["source_type"] = heur
                 llm_count += 1
 
-                # maker-checker — only material disagreements (source_type/dedup) flag review
-                agree, checker, disagree_reason = llm.check(payload, inferred, maker)
+                # maker-checker — only material disagreements (source_type/dedup) flag review.
+                # When a deterministic name heuristic set source_type, it is authoritative —
+                # exclude source_type from the checker comparison (else the checker's free
+                # guess always "disagrees" with the heuristic and flags every table).
+                agree, checker, disagree_reason = llm.check(
+                    payload, inferred, maker, skip_source_type=bool(heur))
                 review = llm.needs_review(inferred, agree)
                 conf = float(inferred.get("authority_confidence") or 0)
                 # human-readable reason for the UI (why this row needs review)
