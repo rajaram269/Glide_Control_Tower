@@ -234,16 +234,16 @@ def upsert_overlay(pg_cur, row):
            (database_name, table_name, description, summary, grain, concept,
             source_type, scope, authoritative, authority_confidence, use_instead,
             requires_dedup, dedup_method, dedup_key, version_col, delete_col, quirks,
-            variables, relationships, conflict_type, review_status, is_static,
+            variables, relationships, conflict_type, review_status, review_reason, is_static,
             structure_hash, updated_by, updated_at, retired)
            VALUES (%(database_name)s, %(table_name)s, %(description)s, %(summary)s,
                    %(grain)s, %(concept)s, %(source_type)s, %(scope)s, %(authoritative)s,
                    %(authority_confidence)s, %(use_instead)s, %(requires_dedup)s,
                    %(dedup_method)s, %(dedup_key)s, %(version_col)s, %(delete_col)s,
                    %(quirks)s, %(variables)s, %(relationships)s, %(conflict_type)s,
-                   %(review_status)s, %(is_static)s, %(structure_hash)s, 'llm', now(), false)
+                   %(review_status)s, %(review_reason)s, %(is_static)s, %(structure_hash)s, 'llm', now(), false)
            ON CONFLICT (database_name, table_name) DO UPDATE SET
-               description = EXCLUDED.description,
+               description = EXCLUDED.description, review_reason = EXCLUDED.review_reason,
                summary = EXCLUDED.summary, grain = EXCLUDED.grain, is_static = EXCLUDED.is_static,
                concept = EXCLUDED.concept, source_type = EXCLUDED.source_type,
                scope = EXCLUDED.scope, authoritative = EXCLUDED.authoritative,
@@ -297,6 +297,7 @@ def build_overlay_row(meta, columns, inferred, review):
         "relationships": Json(inferred.get("relationships") or []),
         "conflict_type": conflict,
         "review_status": "needs_review" if review else "confirmed",
+        "review_reason": inferred.get("_review_reason"),
         "is_static": bool(inferred.get("is_static")),
         "structure_hash": meta["structure_hash"],
         "_concept": inferred.get("concept"), "_scope": inferred.get("scope"),
@@ -687,12 +688,20 @@ def main():
                     inferred["source_type"] = heur
                 llm_count += 1
 
-                # maker-checker on authority/dedup or low confidence
-                agree, checker = llm.check(payload, inferred, maker)
+                # maker-checker — only material disagreements (source_type/dedup) flag review
+                agree, checker, disagree_reason = llm.check(payload, inferred, maker)
                 review = llm.needs_review(inferred, agree)
+                conf = float(inferred.get("authority_confidence") or 0)
+                # human-readable reason for the UI (why this row needs review)
+                if not review:
+                    review_reason = None
+                elif not agree:
+                    review_reason = f"maker/checker disagree — {disagree_reason}"
+                else:
+                    review_reason = f"low confidence ({conf:.2f} < {llm.CONFIRM_THRESHOLD})"
+                inferred["_review_reason"] = review_reason
                 log.info("%s.%s inferred by %s (checker=%s agree=%s review=%s conf=%.2f)",
-                         db, tbl, maker, checker, agree, review,
-                         float(inferred.get("authority_confidence") or 0))
+                         db, tbl, maker, checker, agree, review, conf)
 
                 overlay_row = build_overlay_row(meta, columns, inferred, review)
                 upsert_overlay(cur, overlay_row)

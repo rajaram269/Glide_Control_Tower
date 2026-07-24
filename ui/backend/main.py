@@ -280,14 +280,44 @@ def sentinel_review_queue():
     with get_db() as cur:
         cur.execute("""
             SELECT database_name, table_name, concept, scope, source_type,
-                   conflict_type, review_status, authoritative, use_instead,
-                   authority_confidence, updated_by
+                   conflict_type, review_status, review_reason, authoritative,
+                   use_instead, authority_confidence, updated_by, is_static
             FROM sentinel.catalog_overlay
             WHERE retired = false
               AND (conflict_type <> 'none' OR review_status = 'needs_review')
             ORDER BY conflict_type DESC, authority_confidence NULLS FIRST
         """)
         return cur.fetchall()
+
+
+@app.post("/api/sentinel/overlay/{database_name}/{table_name}/resolve")
+def sentinel_resolve_review(database_name: str, table_name: str):
+    """Human confirms a needs_review table — mark confirmed + human-pinned so the
+    discovery loop won't re-flag or overwrite it."""
+    with get_db() as cur:
+        cur.execute("""
+            UPDATE sentinel.catalog_overlay
+            SET review_status='confirmed', review_reason=NULL,
+                conflict_type='none', updated_by='human', updated_at=now()
+            WHERE database_name=%s AND table_name=%s
+        """, (database_name, table_name))
+        return {"ok": True}
+
+
+@app.post("/api/sentinel/overlay/{database_name}/{table_name}/static")
+def sentinel_set_static(database_name: str, table_name: str, value: bool = True):
+    """Human marks a table static (or not). Human-pinned so discovery won't override."""
+    with get_db() as cur:
+        cur.execute("""
+            UPDATE sentinel.catalog_overlay
+            SET is_static=%s, updated_by='human', updated_at=now()
+            WHERE database_name=%s AND table_name=%s
+        """, (value, database_name, table_name))
+        cur.execute("""
+            UPDATE sentinel.monitor_targets SET is_static=%s
+            WHERE database_name=%s AND table_name=%s
+        """, (value, database_name, table_name))
+        return {"ok": True, "is_static": value}
 
 
 @app.get("/api/sentinel/coverage")

@@ -539,58 +539,66 @@ function cadenceLabel(weeks) {
   return `~${Math.round(days/30)}mo`;
 }
 
-// Freshness — dual-source during the Sentinel cutover (§7): Sentinel verdict beside
-// the legacy data_freshness verdict, mismatches surfaced first. After cutover the
-// legacy column simply goes empty and can be removed.
+// Plain-English freshness status for the Status column.
+function freshDisplay(r) {
+  if (r.is_static) return { cls: 'info', label: 'Static · not monitored' };
+  const s = r.sentinel_status;
+  if (!s) return { cls: 'unknown', label: 'Not checked yet' };
+  if (s === 'fresh') return { cls: 'operational', label: 'Fresh' };
+  if (s === 'stale')  return { cls: 'degraded', label: 'Stale' };
+  if (s === 'dead')   return { cls: 'major_outage', label: 'Dead' };
+  if (s === 'static') return { cls: 'info', label: 'Static' };
+  return { cls: 'unknown', label: s };
+}
+
 function FreshnessView() {
   const [rows] = useApi('/api/sentinel/freshness');
   const [q, setQ] = useState('');
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">No freshness data yet. Sentinel check engine runs daily; legacy path runs hourly.</div>`;
+  if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
+  const notChecked = shown.filter(r => !r.is_static && !r.sentinel_status).length;
+  const problems = shown.filter(r => ['stale','dead'].includes(r.sentinel_status)).length;
   const mismatches = shown.filter(r => r.mismatch).length;
   return html`
     <div class="view-head">
-      <div class="section-title">
-        Data Freshness — ${rows.length} tables · Sentinel vs legacy
-        ${mismatches > 0 && html`<span style="color:var(--medium-fg)"> · ${mismatches} mismatch${mismatches!==1?'es':''}</span>`}
-      </div>
+      <div class="section-title">Data Freshness — ${rows.length} tables</div>
       <${SearchBox} value=${q} onInput=${setQ} placeholder="Search tables…" count=${shown.length}/>
+    </div>
+    <div style="margin-bottom:12px;font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap">
+      ${problems > 0 && html`<span style="color:var(--critical-fg)">● ${problems} stale/dead</span>`}
+      ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (check engine runs daily 07:30 IST)</span>`}
+      ${mismatches > 0 && html`<span style="color:var(--medium-fg)">▲ ${mismatches} differ from legacy</span>`}
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Database</th><th>Table</th><th>Expected</th>
-        <th>Sentinel</th><th>Mechanism</th><th>Sentinel last write</th>
-        <th>Tracked variables</th>
-        <th>Legacy</th><th>Legacy last write</th>
+        <th>Table</th><th>Status</th><th>Expected update</th>
+        <th>Last write</th><th>Monitored variables</th><th></th>
       </tr></thead>
       <tbody>
         ${shown.map(r => {
           const tv = Array.isArray(r.tracked_variables) ? r.tracked_variables : [];
-          return html`<tr key=${`${r.database_name}.${r.table_name}`}
-              style=${r.mismatch ? 'background:var(--medium-bg)' : ''}>
-            <td class="mono" style="color:var(--muted)">${r.database_name}</td>
-            <td class="mono">${r.table_name}${r.is_static ? html`<span class="badge info" style="margin-left:6px" title="intentionally frozen — freshness not alarmed">static</span>` : ''}</td>
-            <td style="color:var(--accent);font-size:12px">${r.is_static ? html`<span style="color:var(--info-fg)">frozen</span>` : cadenceLabel(r.expected_cadence_weeks)}</td>
-            <td>${r.is_static
-              ? html`<span class="badge info">static</span>`
-              : r.sentinel_status ? html`<${StatusBadge} status=${freshBadge(r.sentinel_status)}/>` : html`<span class="badge unknown">—</span>`}</td>
-            <td style="color:var(--muted);font-size:12px">${r.mechanism || '—'}</td>
-            <td style="color:var(--muted)">${fmt.ago(r.sentinel_last_write)}</td>
+          const d = freshDisplay(r);
+          const bad = ['stale','dead'].includes(r.sentinel_status);
+          return html`<tr key=${`${r.database_name}.${r.table_name}`} style=${bad ? 'background:var(--critical-bg)' : ''}>
+            <td class="mono clamp wide" title=${`${r.database_name}.${r.table_name}`}>
+              <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}</td>
+            <td><span class=${`badge ${d.cls}`}>${d.label}</span></td>
+            <td style="color:var(--fg-2);font-size:13px">${r.is_static ? '—' : cadenceLabel(r.expected_cadence_weeks)}</td>
+            <td style="color:var(--muted)" title=${r.sentinel_last_write || ''}>${r.is_static ? '—' : fmt.ago(r.sentinel_last_write)}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length
-              ? tv.map(v => html`<span class="badge info" style="margin-right:4px">${v}</span>`)
-              : html`<span style="color:var(--faint)">table-level only</span>`}</td>
-            <td>${r.legacy_status ? html`<${StatusBadge} status=${freshBadge(r.legacy_status)}/>` : html`<span class="badge unknown">—</span>`}</td>
-            <td style="color:var(--muted)">${fmt.ago(r.legacy_last_write)}</td>
+              ? tv.map(v => html`<span class="badge accent" style="margin-right:4px">${v}</span>`)
+              : html`<span style="color:var(--faint)">table-level</span>`}</td>
+            <td style="text-align:right">${r.mismatch ? html`<span class="badge medium" title=${`legacy says ${r.legacy_status}`}>≠ legacy</span>` : ''}</td>
           </tr>`;
         })}
       </tbody>
     </table></div>
-    <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.6">
-      During cutover both paths run. Rows highlighted amber = Sentinel and legacy disagree — investigate before retiring the legacy path.
-      <b style="color:var(--muted)">Mechanism</b> = how Sentinel read freshness (system_parts = cheap metadata; max_col = fallback scan).
-      <b style="color:var(--muted)">Tracked variables</b> = up to 3 business-segment dimensions (brand/channel/region) whose value-set is monitored for coverage; freshness is also checked per variable.
-      <b style="color:var(--info-fg)">static</b> = intentionally-frozen reference/lookup; freshness is reported as info, never flagged stale/dead.
+    <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.7">
+      <b style="color:var(--muted)">Status</b> — Fresh: updated within its expected window · Stale: overdue · Dead: long overdue · Static: intentionally frozen (never alarmed) · Not checked yet: the daily check engine hasn't run this table.
+      <b style="color:var(--muted)">Expected update</b> = how often this table's data should refresh (LLM-inferred).
+      <b style="color:var(--muted)">Monitored variables</b> = business dimensions whose value-set is tracked for coverage.
+      <b style="color:var(--medium-fg)">≠ legacy</b> = Sentinel and the old freshness path disagree (cutover check).
     </div>`;
 }
 
@@ -630,12 +638,17 @@ function CatalogDetail({ r }) {
   const dk = Array.isArray(r.dedup_key) ? r.dedup_key : [];
   const qk = Array.isArray(r.quirks) ? r.quirks : [];
   return html`
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
       ${r.concept && html`<span class="badge">${r.concept}</span>`}
       ${r.source_type && html`<span class="badge accent">${r.source_type}</span>`}
       ${r.authoritative && html`<span class="badge ok">authoritative</span>`}
       ${r.is_static && html`<span class="badge info">static</span>`}
-      ${r.review_status === 'needs_review' && html`<span class="badge warn">needs review</span>`}
+      ${r.review_status === 'needs_review' && html`<span class="badge warn" title=${r.review_reason||''}>needs review</span>`}
+    </div>
+    <div style="margin-bottom:16px">
+      <button class="ack-btn" onClick=${async()=>{await fetch(`/api/sentinel/overlay/${r.database_name}/${r.table_name}/static?value=${!r.is_static}`,{method:'POST'});location.reload();}}>
+        ${r.is_static ? '❄ Unmark static' : '❄ Mark static'}
+      </button>
     </div>
     <div class="kv"><div class="kv-label">What it is</div>${d.what_it_is || r.summary || '—'}</div>
     <div class="kv"><div class="kv-label">Purpose</div>${d.purpose || '—'}</div>
@@ -693,33 +706,61 @@ function CatalogView() {
     </${Drawer}>`;
 }
 
+async function postAction(path, refresh) {
+  await fetch(path, { method: 'POST' });
+  refresh && refresh();
+}
+
 function ReviewQueueView() {
-  const [rows] = useApi('/api/sentinel/review-queue');
+  const [rows, , refresh] = useApi('/api/sentinel/review-queue');
+  const [sel, setSel] = useState(null);
+  const [q, setQ] = useState('');
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">No conflicts or review-flagged tables. Authority is unambiguous.</div>`;
+  if (!rows.length) return html`<div class="empty">Nothing needs review. Every table's authority is unambiguous and confirmed.</div>`;
+  const shown = rows.filter(r => rowMatches(r, q));
   return html`
-    <div class="section-title">Authority & Conflicts — ${rows.length} need attention</div>
-    <div style="margin-bottom:14px;font-size:12px;color:var(--muted);line-height:1.6">
-      The query-time safety gate (§7.2.5): a consumer stops and surfaces options for any of these rather than guessing.
-      Authority self-corrects each discovery run; a human can pin a table if a concept is critical.
+    <div class="view-head">
+      <div class="section-title">Needs Review — ${rows.length}</div>
+      <${SearchBox} value=${q} onInput=${setQ} placeholder="Search…" count=${shown.length}/>
+    </div>
+    <div style="margin-bottom:14px;font-size:13px;color:var(--muted);line-height:1.6;max-width:820px">
+      These tables were catalogued but flagged for a human glance — usually because the two AI
+      models disagreed on the table's origin (source type) or whether it needs dedup, or confidence
+      was low. Sentinel still uses its best guess; a consumer just surfaces options instead of guessing
+      silently. Click a row to see the reason and <b>Confirm</b> it (pins the guess), or mark it
+      <b>Static</b> if it's a frozen reference table.
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Table</th><th>Concept / Scope / Source</th><th>Conflict</th>
-        <th>Review</th><th>Authority</th><th>Conf</th>
+        <th>Table</th><th>Concept · Source</th><th>Why flagged</th><th>Conf</th><th></th>
       </tr></thead>
       <tbody>
-        ${rows.map(r => html`<tr key=${`${r.database_name}.${r.table_name}`}>
-          <td class="mono"><span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}</td>
-          <td style="font-size:12px;color:var(--muted)">${r.concept || '?'} / ${r.scope || '—'} / ${r.source_type || '?'}</td>
-          <td>${r.conflict_type && r.conflict_type !== 'none'
-            ? html`<span class="badge error">${r.conflict_type.replace(/_/g,' ')}</span>` : '—'}</td>
-          <td>${r.review_status === 'needs_review' ? html`<span class="badge warn">needs review</span>` : '—'}</td>
-          <td>${r.authoritative ? html`<span class="badge ok">auth</span>` : (r.use_instead ? html`<span style="color:var(--muted);font-size:12px">→ ${r.use_instead}</span>` : '—')}</td>
+        ${shown.map(r => html`<tr key=${`${r.database_name}.${r.table_name}`} onClick=${()=>setSel(r)}>
+          <td class="mono clamp" title=${`${r.database_name}.${r.table_name}`}><span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}</td>
+          <td style="font-size:12px;color:var(--muted)">${r.concept || '?'} · ${r.source_type || '?'}</td>
+          <td class="clamp wide" style="font-size:12px" title=${r.review_reason || (r.conflict_type!=='none'?r.conflict_type:'')}>
+            ${r.conflict_type && r.conflict_type !== 'none'
+              ? html`<span class="badge error">${r.conflict_type.replace(/_/g,' ')}</span> `
+              : ''}${r.review_reason || (r.conflict_type!=='none' ? '' : 'flagged')}</td>
           <td>${confBadge(r.authority_confidence)}</td>
+          <td style="text-align:right;white-space:nowrap">
+            <button class="ack-btn" onClick=${(e)=>{e.stopPropagation();postAction(`/api/sentinel/overlay/${r.database_name}/${r.table_name}/resolve`, refresh);}}>Confirm</button>
+          </td>
         </tr>`)}
       </tbody>
-    </table></div>`;
+    </table></div>
+    <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
+      title=${sel ? sel.table_name : ''} subtitle=${sel ? sel.database_name : ''}>
+      ${sel && html`
+        <div class="kv"><div class="kv-label">Why it needs review</div>${sel.review_reason || sel.conflict_type || 'flagged'}</div>
+        <div class="kv"><div class="kv-label">Concept / Scope / Source</div>${sel.concept||'?'} / ${sel.scope||'—'} / ${sel.source_type||'?'}</div>
+        <div class="kv"><div class="kv-label">Authority</div>${sel.authoritative?'authoritative':(sel.use_instead?('→ '+sel.use_instead):'—')} · confidence ${sel.authority_confidence!=null?(sel.authority_confidence*100).toFixed(0)+'%':'—'}</div>
+        <div style="display:flex;gap:8px;margin-top:16px">
+          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/resolve`, refresh);setSel(null);}}>✓ Confirm (pin this)</button>
+          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/static?value=true`, refresh);setSel(null);}}>❄ Mark static</button>
+        </div>
+        <div style="margin-top:12px;font-size:12px;color:var(--faint)">Confirm pins the current guess (discovery won't re-flag or overwrite it). Mark static = a frozen reference table; freshness stops alarming it.</div>`}
+    </${Drawer}>`;
 }
 
 function CoverageView() {
@@ -853,7 +894,7 @@ const NAV_GROUPS = [
   ]},
   { label: 'Sentinel', items: [
     { id: 'catalog',    icon: '▤', label: 'Catalog'    },
-    { id: 'review',     icon: '⚖', label: 'Authority'   },
+    { id: 'review',     icon: '⚖', label: 'Needs Review' },
     { id: 'coverage',   icon: '◫', label: 'Coverage'    },
     { id: 'recon',      icon: '⇄', label: 'Reconcile'   },
     { id: 'freshness',  icon: '↻', label: 'Freshness'  },

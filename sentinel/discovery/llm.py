@@ -164,18 +164,22 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
   "scope": string or null — business subset (B2B, B2C, a brand) or null
   "variables": array of {"column": string, "role": string, "note": string or null}.
       role is one of: segment, measure, key, timestamp, other.
-      Use "segment" ONLY for a business-partitioning dimension a stakeholder would
-      group/filter reporting by AND expect a stable set of values — e.g. brand,
-      sales channel, region, category, division, customer_type. A segment must be
-      categorical with a small stable value set (roughly 3-50 distinct values).
-      Do NOT label as segment: identifiers (id, sku, order_name, customer_id),
-      free-text or high-cardinality strings (product_title, city, postal_code),
-      boolean/status flags (open, onHold, is_active), monetary/numeric measures,
-      or CDC/technical columns (anything starting with _peerdb, _sign, _version).
-      Those get role measure / key / timestamp / other as appropriate.
-      ORDER the variables array by monitoring priority: put the MOST important
-      business segments FIRST (brand/channel/region before minor ones). Only the
-      top few segments are monitored, so ordering matters.
+      Label "segment" GENEROUSLY for any categorical dimension a stakeholder would
+      group/filter reporting by, with a small stable value set (~2-50 distinct). This
+      includes not just brand/channel/region/category/division/customer_type but also
+      ERP dimension codes: document_type, currency_code, posting_group, source_code,
+      payment_method_code, transaction_type, account_type/category, dimension1/2 code,
+      state/jurisdiction, status/type enums with a few values. When unsure whether a
+      low-cardinality categorical is a segment, LABEL IT segment — under-labelling
+      leaves useful tables with zero monitored variables (a real problem on ERP/ledger
+      tables). Aim to surface the 3 most monitoring-worthy segments even on wide tables.
+      Do NOT label as segment: unique identifiers (id, entryNo, sku, order_name,
+      customer_id, document_no), free-text or high-cardinality strings (names, titles,
+      city, postal_code, narration), monetary/numeric measures, timestamps, or
+      CDC/technical columns (_peerdb*, _sign, _version).
+      Those get role measure / key / timestamp / other.
+      ORDER variables by monitoring priority — most important business segments FIRST
+      (brand/channel/region/currency before minor enums). Only the top few are monitored.
   "relationships": array of {"to": "db.table", "on": "column", "purpose": string or null}
   "quirks": array of strings (may be empty)
   "monitor_frequency_weeks": integer 1-4 — how often to RUN the check
@@ -323,10 +327,15 @@ def infer_overlay(payload):
 
 def check(payload, maker_result, maker_provider):
     """Maker-checker: a DIFFERENT provider re-derives the fields. Returns
-    (agree: bool, checker_provider|None). Agreement = same concept + source_type +
-    requires_dedup and dedup_key set-equal (the correctness-critical fields).
-    Returns (True, None) if no other provider is available (fail-open to maker's
-    result, since the confidence gate already flagged low-confidence rows)."""
+    (agree: bool, checker_provider|None, reason:str).
+
+    Only MATERIAL disagreements matter — the two things that actually make a
+    consumer's answer wrong: source_type (drives which table is picked) and the
+    dedup requirement (drives correctness). Concept/scope WORDING and exact
+    dedup_key column lists differ harmlessly between models ('finance' vs 'spend',
+    'vendor management' vs 'spend') and must NOT flag review — that produced a
+    flood of meaningless 'needs review' rows. Returns (True, None, '') when no
+    other provider is available."""
     checkers = [p for p in _PROVIDER_ORDER if p != maker_provider]
     for provider in checkers:
         try:
@@ -334,17 +343,19 @@ def check(payload, maker_result, maker_provider):
         except Exception as e:
             log.warning("checker %s failed: %s", provider, e)
             continue
-        agree = (
-            other["concept"] == maker_result["concept"]
-            and other["source_type"] == maker_result["source_type"]
-            and bool(other["requires_dedup"]) == bool(maker_result["requires_dedup"])
-            and set(other.get("dedup_key") or []) == set(maker_result.get("dedup_key") or [])
-        )
-        return agree, provider
-    return True, None  # no checker available — don't block
+        reasons = []
+        if other["source_type"] != maker_result["source_type"]:
+            reasons.append(f"source_type: {maker_provider}={maker_result['source_type']} "
+                           f"vs {provider}={other['source_type']}")
+        if bool(other["requires_dedup"]) != bool(maker_result["requires_dedup"]):
+            reasons.append(f"requires_dedup: {maker_provider}={maker_result['requires_dedup']} "
+                           f"vs {provider}={other['requires_dedup']}")
+        return (not reasons), provider, "; ".join(reasons)
+    return True, None, ""
 
 
 def needs_review(maker_result, checker_agreed):
-    """Confidence gate (§7.4): needs_review if low confidence OR checker disagreed."""
+    """Confidence gate (§7.4): needs_review if low confidence OR the checker
+    materially disagreed (source_type / dedup — see check())."""
     conf = float(maker_result.get("authority_confidence") or 0)
     return conf < CONFIRM_THRESHOLD or not checker_agreed
