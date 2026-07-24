@@ -8,3 +8,4 @@ node_modules/
 .DS_Store
 credentials*.json
 service-account*.json
+__pycache__/

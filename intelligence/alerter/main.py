@@ -18,12 +18,22 @@ log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-EMAIL_TENANT_ID = os.environ["EMAIL_TENANT_ID"]
-EMAIL_CLIENT_ID = os.environ["EMAIL_CLIENT_ID"]
-EMAIL_CLIENT_SECRET = os.environ["EMAIL_CLIENT_SECRET"]
 ALERT_EMAIL = os.environ["ALERT_EMAIL"]
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "hr@holistique.in")
+# ai@holistique.in is the only mailbox the tenant's AppOnly AccessPolicy allows
+# this app to send as (hr@ and others return ErrorAccessDenied / RAOP)
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "ai@holistique.in")
 WEEKLY_DIGEST = os.environ.get("WEEKLY_DIGEST", "false").lower() == "true"
+
+# Email transport: "graph" (MS Graph, default) or "ses" (AWS SES).
+EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "graph").lower()
+# MS Graph creds — required only for the graph transport
+EMAIL_TENANT_ID = os.environ.get("EMAIL_TENANT_ID", "")
+EMAIL_CLIENT_ID = os.environ.get("EMAIL_CLIENT_ID", "")
+EMAIL_CLIENT_SECRET = os.environ.get("EMAIL_CLIENT_SECRET", "")
+# AWS SES creds — required only for the ses transport
+SES_ACCESS_KEY_ID = os.environ.get("SES_ACCESS_KEY_ID", "")
+SES_SECRET_ACCESS_KEY = os.environ.get("SES_SECRET_ACCESS_KEY", "")
+SES_REGION = os.environ.get("SES_REGION", "ap-south-1")
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 
@@ -48,8 +58,7 @@ def get_ms_graph_token():
     return result["access_token"]
 
 
-def send_email(token, subject, html_body, to_email=None):
-    to = to_email or ALERT_EMAIL
+def _send_via_graph(token, subject, html_body, to):
     payload = {
         "message": {
             "subject": subject,
@@ -65,6 +74,32 @@ def send_email(token, subject, html_body, to_email=None):
         timeout=30,
     )
     resp.raise_for_status()
+
+
+def _send_via_ses(subject, html_body, to):
+    import boto3
+    client = boto3.client(
+        "ses", region_name=SES_REGION,
+        aws_access_key_id=SES_ACCESS_KEY_ID,
+        aws_secret_access_key=SES_SECRET_ACCESS_KEY,
+    )
+    client.send_email(
+        Source=SENDER_EMAIL,
+        Destination={"ToAddresses": [to]},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Html": {"Data": html_body}},
+        },
+    )
+
+
+def send_email(token, subject, html_body, to_email=None):
+    """Dispatch by EMAIL_TRANSPORT. `token` is the MS Graph token (None for SES)."""
+    to = to_email or ALERT_EMAIL
+    if EMAIL_TRANSPORT == "ses":
+        _send_via_ses(subject, html_body, to)
+    else:
+        _send_via_graph(token, subject, html_body, to)
 
 
 # ─── AI triage ────────────────────────────────────────────────────────────────
@@ -226,12 +261,14 @@ def main():
     log.info("Alerter starting. weekly_digest=%s", WEEKLY_DIGEST)
     pg = pg_connect()
 
-    try:
-        token = get_ms_graph_token()
-    except Exception as e:
-        log.error("Cannot get MS Graph token, aborting: %s", e)
-        pg.close()
-        return
+    token = None
+    if EMAIL_TRANSPORT != "ses":
+        try:
+            token = get_ms_graph_token()
+        except Exception as e:
+            log.error("Cannot get MS Graph token, aborting: %s", e)
+            pg.close()
+            return
 
     try:
         with pg.cursor() as cur:

@@ -1,21 +1,21 @@
 """
 Anomaly Detector — Control Tower
 Hourly Cloud Run job (at :30, offset from collector at :00).
-Reads ClickHouse replica, runs 5 anomaly checks, writes alerts to PostgreSQL.
+Reads PostgreSQL only, runs 5 anomaly checks, writes alerts to PostgreSQL.
 Deduplicates: skips if identical (alert_type, service_name) alert fired < 4h ago.
+
+All checks run against Postgres directly (control_tower schema is the source
+of truth — no ClickHouse mirror). Revisit ClickHouse (via PeerDB CDC) if/when
+row volume makes Postgres aggregation too slow.
 """
 import os, json, uuid, datetime, logging
 import psycopg2
 from psycopg2.extras import execute_values
-import clickhouse_connect
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
-CH_HOST = os.environ["CH_HOST"]
-CH_USER = os.environ["CH_USER"]
-CH_PASS = os.environ["CH_PASS"]
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 DEDUP_WINDOW_HOURS = 4
@@ -25,21 +25,16 @@ def pg_connect():
     return psycopg2.connect(PG_CONN)
 
 
-def ch_connect():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True
-    )
-
-
 # ─── Deduplication ────────────────────────────────────────────────────────────
 
 def load_recent_alerts(pg_cur):
-    """Returns set of (alert_type, service_name) fired in the last DEDUP_WINDOW_HOURS."""
+    """Returns set of (alert_type, service_name) fired in the last DEDUP_WINDOW_HOURS.
+    Includes acknowledged alerts — the alerter acks after emailing, so filtering
+    to unacked here caused the same alert to re-fire (and re-email) every hour."""
     pg_cur.execute(
         """SELECT alert_type, COALESCE(service_name, provider, '')
            FROM control_tower.alerts
-           WHERE acknowledged_at IS NULL
-             AND fired_at > NOW() - INTERVAL '%s hours'""",
+           WHERE fired_at > NOW() - INTERVAL '%s hours'""",
         (DEDUP_WINDOW_HOURS,),
     )
     return {(r[0], r[1]) for r in pg_cur.fetchall()}
@@ -47,28 +42,24 @@ def load_recent_alerts(pg_cur):
 
 # ─── Anomaly checks ───────────────────────────────────────────────────────────
 
-def check_error_rate_spike(ch):
+def check_error_rate_spike(pg_cur):
     """Check 1: error rate > 5% AND > 2x 7-day baseline."""
-    result = ch.query("""
+    pg_cur.execute("""
         WITH
         recent AS (
-            SELECT service_name,
-                   avgIf(error_rate_pct, collected_at >= now() - INTERVAL 2 HOUR) AS recent_avg
+            SELECT service_name, AVG(error_rate_pct) AS recent_avg
             FROM control_tower.service_health
-            WHERE collected_at >= now() - INTERVAL 2 HOUR
-              AND platform IN ('cloud_run_service')
+            WHERE collected_at >= NOW() - INTERVAL '2 hours'
+              AND platform = 'cloud_run_service'
             GROUP BY service_name
-            HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
         ),
         baseline AS (
-            SELECT service_name,
-                   avg(error_rate_pct) AS baseline_avg
+            SELECT service_name, AVG(error_rate_pct) AS baseline_avg
             FROM control_tower.service_health
-            WHERE collected_at >= now() - INTERVAL 7 DAY
-              AND collected_at < now() - INTERVAL 2 HOUR
-              AND platform IN ('cloud_run_service')
+            WHERE collected_at >= NOW() - INTERVAL '7 days'
+              AND collected_at < NOW() - INTERVAL '2 hours'
+              AND platform = 'cloud_run_service'
             GROUP BY service_name
-            HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
         )
         SELECT r.service_name, r.recent_avg, b.baseline_avg
         FROM recent r JOIN baseline b USING (service_name)
@@ -76,8 +67,7 @@ def check_error_rate_spike(ch):
           AND r.recent_avg > b.baseline_avg * 2
     """)
     alerts = []
-    for row in result.result_rows:
-        service, recent, baseline = row
+    for service, recent, baseline in pg_cur.fetchall():
         alerts.append({
             "alert_type": "error_rate_spike",
             "severity": "critical",
@@ -88,30 +78,28 @@ def check_error_rate_spike(ch):
     return alerts
 
 
-def check_job_duration_drift(ch):
+def check_job_duration_drift(pg_cur):
     """Check 2: job p95 duration > 1.5x 14-day baseline AND > 60s."""
-    result = ch.query("""
+    pg_cur.execute("""
         WITH
         recent AS (
             SELECT service_name,
-                   quantile(0.95)(job_duration_ms) AS p95_recent
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY job_duration_ms) AS p95_recent
             FROM control_tower.service_health
-            WHERE collected_at >= now() - INTERVAL 4 HOUR
+            WHERE collected_at >= NOW() - INTERVAL '4 hours'
               AND platform = 'cloud_run_job'
               AND job_duration_ms IS NOT NULL
             GROUP BY service_name
-            HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
         ),
         baseline AS (
             SELECT service_name,
-                   quantile(0.95)(job_duration_ms) AS p95_baseline
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY job_duration_ms) AS p95_baseline
             FROM control_tower.service_health
-            WHERE collected_at >= now() - INTERVAL 14 DAY
-              AND collected_at < now() - INTERVAL 4 HOUR
+            WHERE collected_at >= NOW() - INTERVAL '14 days'
+              AND collected_at < NOW() - INTERVAL '4 hours'
               AND platform = 'cloud_run_job'
               AND job_duration_ms IS NOT NULL
             GROUP BY service_name
-            HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
         )
         SELECT r.service_name, r.p95_recent, b.p95_baseline
         FROM recent r JOIN baseline b USING (service_name)
@@ -119,8 +107,7 @@ def check_job_duration_drift(ch):
           AND r.p95_recent > b.p95_baseline * 1.5
     """)
     alerts = []
-    for row in result.result_rows:
-        service, recent_ms, baseline_ms = row
+    for service, recent_ms, baseline_ms in pg_cur.fetchall():
         alerts.append({
             "alert_type": "job_duration_drift",
             "severity": "warn",
@@ -135,47 +122,69 @@ def check_job_duration_drift(ch):
 
 
 def check_idle_sinks(pg_cur):
-    """Check 3: tables with stale or dead freshness status."""
+    """Check 3: tables with stale or dead freshness status.
+    Batched into a single summary alert — with ~200 auto-discovered tables,
+    per-table alerts would flood the inbox."""
+    # Alert only on actionable tables: recently active (wrote within 30d) that went
+    # quiet, or manually watched. Ancient static reference tables stay visible in
+    # the UI but don't alert.
     pg_cur.execute("""
-        SELECT DISTINCT ON (database_name, table_name)
-            database_name, table_name, freshness_status, last_write_at
-        FROM control_tower.data_freshness
-        ORDER BY database_name, table_name, checked_at DESC
+        SELECT f.database_name, f.table_name, f.freshness_status, f.last_write_at
+        FROM (
+            SELECT DISTINCT ON (database_name, table_name)
+                database_name, table_name, freshness_status, last_write_at
+            FROM control_tower.data_freshness
+            ORDER BY database_name, table_name, checked_at DESC
+        ) f
+        LEFT JOIN control_tower.watched_tables w
+            ON w.database_name = f.database_name AND w.table_name = f.table_name
+        WHERE f.freshness_status IN ('stale', 'dead')
+          AND (f.last_write_at > NOW() - INTERVAL '30 days'
+               OR COALESCE(w.auto_discovered, false) = false)
     """)
-    alerts = []
+    stale, dead = [], []
     for db, table, status, last_write in pg_cur.fetchall():
-        if status in ("stale", "dead"):
-            severity = "critical" if status == "dead" else "warn"
-            alerts.append({
-                "alert_type": "idle_sink",
-                "severity": severity,
-                "service_name": f"{db}.{table}",
-                "message": f"Table {db}.{table} is {status}. Last write: {last_write}",
-                "context_json": {"status": status, "last_write_at": str(last_write)},
-            })
-    return alerts
+        entry = {"table": f"{db}.{table}", "last_write_at": str(last_write)}
+        if status == "dead":
+            dead.append(entry)
+        elif status == "stale":
+            stale.append(entry)
+
+    if not stale and not dead:
+        return []
+
+    parts = []
+    if dead:
+        parts.append(f"{len(dead)} DEAD: " + ", ".join(e["table"] for e in dead[:10])
+                     + (" …" if len(dead) > 10 else ""))
+    if stale:
+        parts.append(f"{len(stale)} stale: " + ", ".join(e["table"] for e in stale[:10])
+                     + (" …" if len(stale) > 10 else ""))
+
+    return [{
+        "alert_type": "idle_sink",
+        "severity": "critical" if dead else "warn",
+        "service_name": "data_freshness_summary",
+        "message": "Data freshness: " + " | ".join(parts),
+        "context_json": {"dead": dead, "stale": stale},
+    }]
 
 
-def check_api_degradation(ch):
+def check_api_degradation(pg_cur):
     """Check 4: third-party API error rate > 10% or latency > 2x baseline."""
-    result = ch.query("""
-        WITH
-        latest AS (
-            SELECT provider,
-                   argMax(error_rate_pct, collected_at) AS latest_error_rate,
-                   argMax(avg_latency_ms_estimate, collected_at) AS latest_latency
+    pg_cur.execute("""
+        SELECT provider, error_rate_pct, avg_latency_ms_estimate
+        FROM (
+            SELECT DISTINCT ON (provider)
+                provider, error_rate_pct, avg_latency_ms_estimate
             FROM control_tower.third_party_api_health
-            WHERE collected_at >= now() - INTERVAL 2 HOUR
-            GROUP BY provider
-            HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
-        )
-        SELECT provider, latest_error_rate, latest_latency
-        FROM latest
-        WHERE latest_error_rate > 10
+            WHERE collected_at >= NOW() - INTERVAL '2 hours'
+            ORDER BY provider, collected_at DESC
+        ) latest
+        WHERE error_rate_pct > 10
     """)
     alerts = []
-    for row in result.result_rows:
-        provider, error_rate, latency = row
+    for provider, error_rate, latency in pg_cur.fetchall():
         alerts.append({
             "alert_type": "api_degradation",
             "severity": "warn",
@@ -186,23 +195,23 @@ def check_api_degradation(ch):
     return alerts
 
 
-def check_ec2_pressure(ch):
+def check_ec2_pressure(pg_cur):
     """Check 5: EC2 CPU > 85%, memory > 90%, disk > 85% over past 2h."""
-    result = ch.query("""
+    pg_cur.execute("""
         SELECT service_name,
-               avg(cpu_utilization_pct) AS avg_cpu,
-               avg(memory_utilization_pct) AS avg_mem,
-               avg(disk_utilization_pct) AS avg_disk
+               AVG(cpu_utilization_pct) AS avg_cpu,
+               AVG(memory_utilization_pct) AS avg_mem,
+               AVG(disk_utilization_pct) AS avg_disk
         FROM control_tower.service_health
         WHERE platform IN ('ec2', 'ec2_job')
-          AND collected_at >= now() - INTERVAL 2 HOUR
+          AND collected_at >= NOW() - INTERVAL '2 hours'
         GROUP BY service_name
-        HAVING argMax(_peerdb_is_deleted, _peerdb_version) = 0
-          AND (avg_cpu > 85 OR avg_mem > 90 OR avg_disk > 85)
+        HAVING AVG(cpu_utilization_pct) > 85
+            OR AVG(memory_utilization_pct) > 90
+            OR AVG(disk_utilization_pct) > 85
     """)
     alerts = []
-    for row in result.result_rows:
-        service, cpu, mem, disk = row
+    for service, cpu, mem, disk in pg_cur.fetchall():
         reasons = []
         severity = "warn"
         if cpu and cpu > 85:
@@ -228,41 +237,21 @@ def main():
     log.info("Anomaly Detector starting.")
     pg = pg_connect()
 
-    # ClickHouse connection — optional until Phase 3 (PeerDB) is configured.
-    # If control_tower tables don't exist yet, checks that use CH will return empty results.
-    try:
-        ch = ch_connect()
-        # Verify control_tower tables exist in ClickHouse
-        ch.query("SELECT 1 FROM control_tower.service_health LIMIT 0")
-        ch_ready = True
-        log.info("ClickHouse control_tower replica: ready.")
-    except Exception as e:
-        log.warning(
-            "ClickHouse control_tower tables not yet available (Phase 3 PeerDB not configured?): %s. "
-            "Skipping metric-based anomaly checks — only PostgreSQL checks will run.",
-            e,
-        )
-        ch_ready = False
-        ch = None
-
     try:
         all_alerts = []
         with pg.cursor() as cur:
             recent = load_recent_alerts(cur)
 
-            # Run checks — CH-dependent checks skipped until Phase 3 (PeerDB) is live
             checks = [
-                (lambda: check_error_rate_spike(ch),    True),
-                (lambda: check_job_duration_drift(ch),  True),
-                (lambda: check_idle_sinks(cur),         False),
-                (lambda: check_api_degradation(ch),     True),
-                (lambda: check_ec2_pressure(ch),        True),
+                check_error_rate_spike,
+                check_job_duration_drift,
+                check_idle_sinks,
+                check_api_degradation,
+                check_ec2_pressure,
             ]
-            for check_fn, needs_ch in checks:
-                if needs_ch and not ch_ready:
-                    continue
+            for check_fn in checks:
                 try:
-                    all_alerts.extend(check_fn())
+                    all_alerts.extend(check_fn(cur))
                 except Exception as e:
                     log.warning("Anomaly check failed: %s", e)
 
@@ -311,8 +300,6 @@ def main():
         raise
     finally:
         pg.close()
-        if ch:
-            ch.close()
 
     log.info("Anomaly Detector complete.")
 

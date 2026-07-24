@@ -1,6 +1,7 @@
 google-cloud-monitoring==2.22.0
 google-cloud-logging==3.11.0
 google-cloud-run==0.10.14
+google-cloud-scheduler==2.20.0
 psycopg2-binary==2.9.10
 clickhouse-connect==0.8.4
 requests==2.32.3
