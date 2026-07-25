@@ -114,6 +114,15 @@ ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest" 3600
 # Check engine: PG + CH read only, no LLM.
 deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" "" 1800
 
+# Auto-resolver: adjudicates needs_review rows with a 3rd LLM + evidence. Reuses the
+# discovery introspection + LLM modules — copy them into its build context first.
+cp sentinel/discovery/main.py sentinel/resolver/discovery_lib.py
+cp sentinel/discovery/llm.py  sentinel/resolver/llm.py
+deploy_sentinel_job "ct-sentinel-resolver" "sentinel/resolver" ",\
+OPENAI_API_KEY=ct-sentinel-openai-key:latest,\
+GEMINI_API_KEY=ct-sentinel-gemini-key:latest,\
+ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest" 3600
+
 # ── 4. Cloud Scheduler triggers ───────────────────────────────────────────
 echo ""
 echo "[4/6] Creating Cloud Scheduler triggers..."
@@ -126,8 +135,9 @@ create_schedule() {
     --description="$desc" --project="$PROJECT" 2>/dev/null \
     && echo "  Created trigger-${job} ($sched)" || echo "  trigger-${job} exists"
 }
-# Discovery 06:45 IST (after cost collector), check tick 07:30 IST
+# Discovery 06:45 IST → resolver 07:10 IST (adjudicate reviews) → check tick 07:30 IST
 create_schedule "ct-sentinel-discovery" "15 1 * * *" "Sentinel discovery — daily 06:45 IST"
+create_schedule "ct-sentinel-resolver"  "40 1 * * *" "Sentinel auto-resolver — daily 07:10 IST"
 create_schedule "ct-sentinel-check"     "0 2 * * *"  "Sentinel check tick — daily 07:30 IST"
 
 # ── 5. Redeploy UI (Atlas-styled + /api/sentinel/*) ───────────────────────

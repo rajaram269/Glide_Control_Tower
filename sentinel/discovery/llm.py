@@ -385,3 +385,61 @@ def needs_review(maker_result, checker_agreed):
     materially disagreed (source_type / dedup — see check())."""
     conf = float(maker_result.get("authority_confidence") or 0)
     return conf < CONFIRM_THRESHOLD or not checker_agreed
+
+
+# ─── Adjudicator (auto-resolver) ──────────────────────────────────────────────
+
+RESOLVE_THRESHOLD = float(os.environ.get("SENTINEL_RESOLVE_THRESHOLD", "0.75"))
+
+_ADJUDICATE_SCHEMA_KEYS = ("source_type", "requires_dedup", "dedup_method", "dedup_key",
+                           "concept", "confidence", "reasoning")
+
+
+def adjudicate(payload, current, review_reason):
+    """A THIRD model re-examines a needs_review table with the disagreement made
+    explicit + the actual evidence, and decides the correctness-critical fields.
+    Uses the provider NOT already reflected in `current` when possible (adjudicator
+    diversity). Returns a dict {source_type, requires_dedup, dedup_method, dedup_key,
+    concept, confidence, reasoning} or raises. The caller auto-confirms only when
+    confidence >= RESOLVE_THRESHOLD."""
+    spec = (
+        "You are adjudicating a data-catalog disagreement. Two earlier analyses were "
+        "not fully certain about this table. Re-examine it from the schema, engine, "
+        "PII-safe samples and measure stats below, and decide the CORRECTNESS-CRITICAL "
+        "fields. Trust evidence over names. Return ONLY JSON with these keys:\n"
+        '  "source_type": one of erp, sales_channel, perf_marketing, web_analytics, '
+        "warehouse_ops, finance, reference, derived\n"
+        '  "concept": business concept (sales, spend, inventory, orders, reference, ...)\n'
+        '  "requires_dedup": boolean (true for ReplacingMergeTree/CDC tables)\n'
+        '  "dedup_method": one of argmax, final, none\n'
+        '  "dedup_key": array of business-key column names (present in the schema)\n'
+        '  "confidence": 0.0-1.0 — how sure you are. Be honest; low if genuinely ambiguous.\n'
+        '  "reasoning": one or two sentences citing the specific evidence you used.\n'
+        f"\nWhy this was flagged: {review_reason or 'the two models were not fully certain'}\n"
+        f"Earlier best guess: source_type={current.get('source_type')}, "
+        f"concept={current.get('concept')}, requires_dedup={current.get('requires_dedup')}, "
+        f"dedup_key={current.get('dedup_key')}.\n"
+        "Note: erp / finance / warehouse_ops are all ERP-origin and often interchangeable "
+        "for selection — only distinguish them if the evidence is clear."
+    )
+    prompt = _prompt(payload).replace(_SYSTEM, spec, 1)
+
+    # prefer a provider that is likely NOT the maker/checker of the original
+    for provider in _PROVIDER_ORDER:
+        try:
+            caller = _CALLERS[provider]
+            for attempt in (1, 2):
+                try:
+                    obj = caller(prompt)
+                    # light validation
+                    if not isinstance(obj.get("source_type"), str) or "confidence" not in obj:
+                        raise ValueError("missing required adjudication keys")
+                    obj["dedup_key"] = obj.get("dedup_key") or []
+                    obj["confidence"] = float(obj.get("confidence") or 0)
+                    obj["_adjudicator"] = provider
+                    return obj
+                except (json.JSONDecodeError, ValueError) as e:
+                    log.warning("adjudicator %s bad output (try %d): %s", provider, attempt, e)
+        except Exception as e:
+            log.warning("adjudicator %s failed: %s", provider, e)
+    raise RuntimeError("all adjudicator providers failed")
