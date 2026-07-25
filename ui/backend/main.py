@@ -394,6 +394,12 @@ def sentinel_freshness():
                     observed->>'last_write' AS sentinel_last_write,
                     observed->>'mechanism' AS mechanism,
                     (observed->>'tolerance_weeks')::numeric AS expected_cadence_weeks,
+                    -- sync vs data freshness (migration 016)
+                    observed->'sync'->>'sub_status' AS sync_status,
+                    observed->'sync'->>'last_write' AS sync_last_write,
+                    observed->'data'->>'sub_status' AS data_status,
+                    observed->'data'->>'column'     AS data_column,
+                    observed->'data'->>'max_event_date' AS data_last,
                     run_ts AS sentinel_checked_at
                 FROM sentinel.check_results
                 WHERE check_type = 'freshness' AND COALESCE(variable,'') = ''
@@ -423,6 +429,8 @@ def sentinel_freshness():
                    COALESCE(sen.table_name, leg.table_name)       AS table_name,
                    sen.sentinel_status, sen.mechanism, sen.sentinel_last_write,
                    sen.expected_cadence_weeks, sen.sentinel_checked_at,
+                   sen.sync_status, sen.sync_last_write,
+                   sen.data_status, sen.data_column, sen.data_last,
                    leg.legacy_status, leg.legacy_last_write, leg.legacy_checked_at,
                    vars.tracked_variables, COALESCE(stat.is_static, false) AS is_static,
                    (sen.sentinel_status IS NOT NULL AND leg.legacy_status IS NOT NULL

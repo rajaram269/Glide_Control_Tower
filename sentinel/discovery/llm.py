@@ -74,6 +74,12 @@ OVERLAY_SCHEMA = {
         "dedup_key":      {"type": "array", "items": {"type": "string"}},
         "authority_confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "is_static":      {"type": "boolean"},
+        # The BUSINESS/event date column (SalesDate, order_date, posting_date, txn Date)
+        # — distinct from sync/CDC columns (_peerdb_synced_at, created_at-of-load). Drives
+        # DATA freshness ("is the data itself current", e.g. May data in July) as opposed
+        # to SYNC freshness ("is the pipeline running"). null if the table has no such
+        # business/event date (dimension/reference/snapshot tables).
+        "event_date_column": {"type": ["string", "null"]},
     },
     "required": [
         "description", "summary", "grain", "concept", "source_type", "variables",
@@ -194,6 +200,15 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       should keep advancing. false for any table that receives ongoing rows (sales,
       orders, marketing insights, inventory snapshots). When true, freshness will not be
       alarmed on this table.
+  "event_date_column": string or null — the column holding the BUSINESS/EVENT DATE of
+      each row (SalesDate, order_date, posting_date, invoice_date, transaction Date, the
+      period a marketing-insight row is for). This is the date the DATA is ABOUT — used
+      to detect stale business data (e.g. a sales table whose newest SalesDate is May
+      even though it synced today). It is DIFFERENT from sync/load columns
+      (_peerdb_synced_at, created_at/updated_at that record when the row was loaded, not
+      when the business event happened). Pick the single most representative event date.
+      Use null if the table has no such business/event date (dimension/reference/master/
+      snapshot tables). Must be an actual column name present in the schema.
 Do not add, rename, or omit keys. Do not wrap in markdown."""
 
 
@@ -298,6 +313,10 @@ def _validate(obj):
         raise ValueError(f"expected_cadence_weeks out of range: {ec}")
     if not isinstance(obj["is_static"], bool):
         raise ValueError(f"is_static must be boolean: {obj['is_static']}")
+    edc = obj.get("event_date_column")  # optional; null when no business date
+    if edc is not None and not isinstance(edc, str):
+        raise ValueError(f"event_date_column must be string or null: {edc}")
+    obj.setdefault("event_date_column", None)
     return obj
 
 
@@ -337,6 +356,12 @@ def check(payload, maker_result, maker_provider, skip_source_type=False):
     heuristic already fixed source_type authoritatively), source_type is excluded
     too — else the checker's free guess always 'disagrees' and flags every table.
     Returns (True, None, '') when no other provider is available."""
+    # ERP-family source types are selection-equivalent for a consumer (all ERP origin);
+    # two models picking different labels within the family is not a material conflict.
+    _ERP_FAMILY = {"erp", "finance", "warehouse_ops"}
+    def _same_source(a, b):
+        return a == b or ({a, b} <= _ERP_FAMILY)
+
     checkers = [p for p in _PROVIDER_ORDER if p != maker_provider]
     for provider in checkers:
         try:
@@ -345,7 +370,7 @@ def check(payload, maker_result, maker_provider, skip_source_type=False):
             log.warning("checker %s failed: %s", provider, e)
             continue
         reasons = []
-        if not skip_source_type and other["source_type"] != maker_result["source_type"]:
+        if not skip_source_type and not _same_source(other["source_type"], maker_result["source_type"]):
             reasons.append(f"source_type: {maker_provider}={maker_result['source_type']} "
                            f"vs {provider}={other['source_type']}")
         if bool(other["requires_dedup"]) != bool(maker_result["requires_dedup"]):

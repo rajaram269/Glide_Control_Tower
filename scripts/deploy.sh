@@ -18,7 +18,7 @@ PROJECT=seoai-479305
 REGION=asia-south1
 INSTANCE=agenteye-pg
 SA_EMAIL="ct-collector@${PROJECT}.iam.gserviceaccount.com"
-PROXY_PORT=${PROXY_PORT:-5432}
+PROXY_PORT=${PROXY_PORT:-6543}   # uncommon port; local Postgres often owns 5432/5433
 
 echo "======================================"
 echo " Sentinel Deploy → $PROJECT / $REGION"
@@ -54,11 +54,26 @@ echo ""
 echo "[2/6] Applying migrations (011–014, sentinel schema)..."
 PG_CONN=$(gcloud secrets versions access latest --secret=ct-pg-connection-string --project="$PROJECT")
 PG_PW=$(echo "$PG_CONN" | grep -oE '(:)[^:@]+(@)' | head -1 | tr -d ':@')
+
+# Use an uncommon proxy port (a local Postgres often owns 5432/5433). Fail loudly
+# if it is taken, rather than letting psql fall through to some other local server.
+if lsof -iTCP:"$PROXY_PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
+  echo "ERROR: port $PROXY_PORT already in use — set PROXY_PORT to a free port and re-run." >&2
+  exit 1
+fi
 cloud-sql-proxy "${PROJECT}:us-central1:${INSTANCE}" --port="$PROXY_PORT" &
 PROXY_PID=$!
 trap "kill $PROXY_PID 2>/dev/null || true" EXIT
-sleep 4
+# wait until the proxy is actually listening (up to ~20s), else abort
+for i in $(seq 1 20); do
+  lsof -iTCP:"$PROXY_PORT" -sTCP:LISTEN -n >/dev/null 2>&1 && break
+  sleep 1
+  if [ "$i" -eq 20 ]; then echo "ERROR: proxy did not start on $PROXY_PORT" >&2; exit 1; fi
+done
 LOCAL="postgresql://agenteye_app:${PG_PW}@127.0.0.1:${PROXY_PORT}/control_tower"
+# sanity: confirm we're actually on control_tower via the proxy before mutating
+psql "$LOCAL" -tc "SELECT current_database()" | grep -q control_tower \
+  || { echo "ERROR: not connected to control_tower via proxy" >&2; exit 1; }
 for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql; do
   echo "  → $m"
   psql "$LOCAL" -v ON_ERROR_STOP=1 -qf "$m"

@@ -557,48 +557,54 @@ function FreshnessView() {
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
-  const notChecked = shown.filter(r => !r.is_static && !r.sentinel_status).length;
-  const problems = shown.filter(r => ['stale','dead'].includes(r.sentinel_status)).length;
-  const mismatches = shown.filter(r => r.mismatch).length;
+  const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
+  const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
+  const dataBad = shown.filter(r => ['stale','dead'].includes(r.data_status)).length;
   return html`
     <div class="view-head">
       <div class="section-title">Data Freshness — ${rows.length} tables</div>
       <${SearchBox} value=${q} onInput=${setQ} placeholder="Search tables…" count=${shown.length}/>
     </div>
     <div style="margin-bottom:12px;font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap">
-      ${problems > 0 && html`<span style="color:var(--critical-fg)">● ${problems} stale/dead</span>`}
-      ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (check engine runs daily 07:30 IST)</span>`}
-      ${mismatches > 0 && html`<span style="color:var(--medium-fg)">▲ ${mismatches} differ from legacy</span>`}
+      ${syncBad > 0 && html`<span style="color:var(--critical-fg)">● ${syncBad} sync stale/dead (pipeline)</span>`}
+      ${dataBad > 0 && html`<span style="color:var(--high-fg)">● ${dataBad} data stale/dead (business date old)</span>`}
+      ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (daily 07:30 IST)</span>`}
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Table</th><th>Status</th><th>Expected update</th>
-        <th>Last write</th><th>Monitored variables</th><th></th>
+        <th>Table</th><th>Sync</th><th>Data</th><th>Expected update</th>
+        <th>Newest data</th><th>Monitored variables</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => {
           const tv = Array.isArray(r.tracked_variables) ? r.tracked_variables : [];
-          const d = freshDisplay(r);
-          const bad = ['stale','dead'].includes(r.sentinel_status);
+          const syncD = freshDisplay({ ...r, sentinel_status: r.sync_status || r.sentinel_status });
+          const bad = ['stale','dead'].includes(r.data_status) || ['stale','dead'].includes(r.sync_status);
+          const dataBadge = r.is_static ? html`<span class="badge unknown">—</span>`
+            : !r.data_column ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
+            : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
+            : html`<span class="badge unknown">—</span>`;
           return html`<tr key=${`${r.database_name}.${r.table_name}`} style=${bad ? 'background:var(--critical-bg)' : ''}>
             <td class="mono clamp wide" title=${`${r.database_name}.${r.table_name}`}>
-              <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}</td>
-            <td><span class=${`badge ${d.cls}`}>${d.label}</span></td>
+              <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}
+              ${r.is_static ? html`<span class="badge info" style="margin-left:6px">static</span>` : ''}</td>
+            <td><span class=${`badge ${syncD.cls}`} title=${`synced ${fmt.ago(r.sync_last_write||r.sentinel_last_write)}`}>${r.is_static ? 'static' : syncD.label}</span></td>
+            <td title=${r.data_column ? `business date: ${r.data_column}` : ''}>${dataBadge}</td>
             <td style="color:var(--fg-2);font-size:13px">${r.is_static ? '—' : cadenceLabel(r.expected_cadence_weeks)}</td>
-            <td style="color:var(--muted)" title=${r.sentinel_last_write || ''}>${r.is_static ? '—' : fmt.ago(r.sentinel_last_write)}</td>
+            <td style="color:var(--muted)" title=${r.data_last || ''}>${r.data_column ? fmt.ago(r.data_last) : '—'}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length
               ? tv.map(v => html`<span class="badge accent" style="margin-right:4px">${v}</span>`)
               : html`<span style="color:var(--faint)">table-level</span>`}</td>
-            <td style="text-align:right">${r.mismatch ? html`<span class="badge medium" title=${`legacy says ${r.legacy_status}`}>≠ legacy</span>` : ''}</td>
           </tr>`;
         })}
       </tbody>
     </table></div>
     <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.7">
-      <b style="color:var(--muted)">Status</b> — Fresh: updated within its expected window · Stale: overdue · Dead: long overdue · Static: intentionally frozen (never alarmed) · Not checked yet: the daily check engine hasn't run this table.
-      <b style="color:var(--muted)">Expected update</b> = how often this table's data should refresh (LLM-inferred).
-      <b style="color:var(--muted)">Monitored variables</b> = business dimensions whose value-set is tracked for coverage.
-      <b style="color:var(--medium-fg)">≠ legacy</b> = Sentinel and the old freshness path disagree (cutover check).
+      Two independent freshnesses.
+      <b style="color:var(--muted)">Sync</b> = is the pipeline running (when rows were last written/ingested).
+      <b style="color:var(--muted)">Data</b> = is the data itself current (newest business/event date — catches e.g. a table synced today but whose newest sales date is 2 months old). <b>n/a</b> = no business date column (dimension/reference — sync-only).
+      A table can be Sync-fresh but Data-stale. Status labels: Fresh / Stale (overdue) / Dead (long overdue) / Static (frozen, never alarmed).
+      <b style="color:var(--muted)">Newest data</b> = max business date. <b style="color:var(--muted)">Monitored variables</b> = business dimensions tracked for coverage.
     </div>`;
 }
 

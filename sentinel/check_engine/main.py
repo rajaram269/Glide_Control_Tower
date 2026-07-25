@@ -57,61 +57,105 @@ def _parts_freshness(ch, db, table):
 
 
 def _maxcol_freshness(ch, db, table, col):
-    """Proven fallback (the legacy collector's mechanism)."""
-    res = ch.query(f"SELECT toDateTime64(max(`{col}`), 3) FROM `{db}`.`{table}`")
+    """max of a date/datetime column, parsing robustly across formats (String dates
+    in DD/MM/YYYY or ISO, Date/DateTime/Date32, epoch strings). Returns tz-aware
+    datetime or None. parseDateTimeBestEffortOrNull tolerates the value-format
+    variations these ClickHouse tables have (many store dates as String)."""
+    res = ch.query(
+        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`"
+    )
     r = res.result_rows
     return r[0][0] if r and r[0][0] else None
 
 
+def _classify(last, tolerance_weeks):
+    """(sub_status, status, age_hours) for a timestamp vs a tolerance. last=None → dead."""
+    if last is None:
+        return "dead", "fail", None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=datetime.timezone.utc)
+    age = NOW - last
+    age_hours = round(age.total_seconds() / 3600, 1)
+    limit = datetime.timedelta(weeks=float(tolerance_weeks))
+    if age <= limit:
+        return "fresh", "ok", age_hours
+    if age <= limit * 3:
+        return "stale", "warn", age_hours
+    return "dead", "fail", age_hours
+
+
+# Overall status = worst of the checks that apply.
+_RANK = {"ok": 0, "warn": 1, "fail": 2}
+
+
 def check_freshness(ch, target):
+    """Two freshnesses:
+      SYNC  — when rows were last written/ingested (system.parts / _peerdb_synced_at).
+              Answers 'is the pipeline running?'.
+      DATA  — newest business/event date in the data (max(event_date_column)).
+              Answers 'is the data itself current?' — catches May data synced in July.
+    DATA only runs when the table has an event_date_column; otherwise the table is
+    sync-only (dimension/reference/snapshot). Static tables never alarm."""
     db, table = target["database_name"], target["table_name"]
-    col = target.get("freshness_column") or "_peerdb_synced_at"
-    mechanism = FRESHNESS_MECHANISM
-    last = None
-    used = None
-    if mechanism in ("auto", "system_parts"):
+    tolerance_weeks = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
+
+    # ── SYNC freshness ──
+    sync_last, sync_mech = None, None
+    if FRESHNESS_MECHANISM in ("auto", "system_parts"):
         try:
-            last = _parts_freshness(ch, db, table)
-            used = "system_parts"
+            sync_last = _parts_freshness(ch, db, table); sync_mech = "system_parts"
         except Exception as e:
             log.warning("system.parts freshness failed %s.%s: %s", db, table, e)
-    if last is None and mechanism in ("auto", "max_col"):
+    if sync_last is None and FRESHNESS_MECHANISM in ("auto", "max_col"):
+        col = target.get("freshness_column") or "_peerdb_synced_at"
         try:
-            last = _maxcol_freshness(ch, db, table, col)
-            used = "max_col"
+            sync_last = _maxcol_freshness(ch, db, table, col); sync_mech = "max_col"
         except Exception as e:
             log.warning("max_col freshness failed %s.%s: %s", db, table, e)
 
-    age_hours = None
-    if last is not None:
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=datetime.timezone.utc)
-        age_hours = round((NOW - last).total_seconds() / 3600, 1)
-
-    # Static tables are intentionally frozen (fixed reference/lookup). Report freshness
-    # as INFO — never stale/dead, never an incident — so they don't false-alarm.
+    # Static tables are intentionally frozen — report info, never alarm.
     if target.get("is_static"):
-        return "ok", {"sub_status": "static", "mechanism": used,
-                      "last_write": last.isoformat() if last else None,
-                      "age_hours": age_hours, "static": True}
+        return "ok", {"sub_status": "static", "static": True,
+                      "sync_last_write": sync_last.isoformat() if sync_last else None,
+                      "mechanism": sync_mech}
 
-    # Freshness tolerance = how often the DATA is expected to update
-    # (expected_cadence_weeks), NOT how often the check runs (monitor_frequency_weeks).
-    # Fall back to the check cadence only when discovery hasn't set an expectation yet.
-    tolerance_weeks = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
-    limit = datetime.timedelta(weeks=float(tolerance_weeks))
-    if last is None:
-        return "fail", {"sub_status": "dead", "mechanism": used, "last_write": None,
-                        "tolerance_weeks": float(tolerance_weeks)}
-    age = NOW - last
-    if age <= limit:
-        sub = "fresh"; status = "ok"
-    elif age <= limit * 3:
-        sub = "stale"; status = "warn"
+    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks)
+
+    observed = {
+        "sub_status": sync_sub,          # back-compat: top-level = sync verdict
+        "mechanism": sync_mech,
+        "sync": {"sub_status": sync_sub, "last_write": sync_last.isoformat() if sync_last else None,
+                 "age_hours": sync_age},
+        "tolerance_weeks": float(tolerance_weeks),
+        "last_write": sync_last.isoformat() if sync_last else None,
+        "age_hours": sync_age,
+    }
+    overall = sync_status
+
+    # ── DATA freshness (business date), if the table has one ──
+    edc = target.get("event_date_column")
+    if edc:
+        try:
+            data_last = _maxcol_freshness(ch, db, table, edc)
+            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks)
+            observed["data"] = {"column": edc, "sub_status": data_sub,
+                                "max_event_date": data_last.isoformat() if data_last else None,
+                                "age_hours": data_age}
+            # a table can be synced-fresh but data-stale (May data in July) — flag it
+            if _RANK[data_status] > _RANK[overall]:
+                overall = data_status
+            observed["sub_status"] = _worst_sub(sync_sub, data_sub)
+        except Exception as e:
+            observed["data"] = {"column": edc, "error": str(e)}
     else:
-        sub = "dead"; status = "fail"
-    return status, {"sub_status": sub, "mechanism": used, "last_write": last.isoformat(),
-                    "age_hours": age_hours, "tolerance_weeks": float(tolerance_weeks)}
+        observed["data"] = {"column": None, "note": "no business date — sync-only"}
+
+    return overall, observed
+
+
+def _worst_sub(a, b):
+    order = {"fresh": 0, "stale": 1, "dead": 2}
+    return a if order.get(a, 0) >= order.get(b, 0) else b
 
 
 # ─── 2. Volume ──────────────────────────────────────────────────────────────────
@@ -442,7 +486,7 @@ def due_targets(pg_cur):
     pg_cur.execute("""
         SELECT t.id, t.database_name, t.table_name, t.variable,
                t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
-               t.is_static, w.freshness_column
+               t.is_static, t.event_date_column, w.freshness_column
         FROM sentinel.monitor_targets t
         LEFT JOIN control_tower.watched_tables w
                ON w.database_name = t.database_name AND w.table_name = t.table_name
@@ -452,7 +496,8 @@ def due_targets(pg_cur):
     return [
         {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
          "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
-         "cheap_source": r[6], "is_static": r[7], "freshness_column": r[8]}
+         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
+         "freshness_column": r[9]}
         for r in pg_cur.fetchall()
     ]
 

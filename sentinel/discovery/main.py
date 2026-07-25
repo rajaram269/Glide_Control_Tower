@@ -235,15 +235,17 @@ def upsert_overlay(pg_cur, row):
             source_type, scope, authoritative, authority_confidence, use_instead,
             requires_dedup, dedup_method, dedup_key, version_col, delete_col, quirks,
             variables, relationships, conflict_type, review_status, review_reason, is_static,
-            structure_hash, updated_by, updated_at, retired)
+            event_date_column, structure_hash, updated_by, updated_at, retired)
            VALUES (%(database_name)s, %(table_name)s, %(description)s, %(summary)s,
                    %(grain)s, %(concept)s, %(source_type)s, %(scope)s, %(authoritative)s,
                    %(authority_confidence)s, %(use_instead)s, %(requires_dedup)s,
                    %(dedup_method)s, %(dedup_key)s, %(version_col)s, %(delete_col)s,
                    %(quirks)s, %(variables)s, %(relationships)s, %(conflict_type)s,
-                   %(review_status)s, %(review_reason)s, %(is_static)s, %(structure_hash)s, 'llm', now(), false)
+                   %(review_status)s, %(review_reason)s, %(is_static)s,
+                   %(event_date_column)s, %(structure_hash)s, 'llm', now(), false)
            ON CONFLICT (database_name, table_name) DO UPDATE SET
                description = EXCLUDED.description, review_reason = EXCLUDED.review_reason,
+               event_date_column = EXCLUDED.event_date_column,
                summary = EXCLUDED.summary, grain = EXCLUDED.grain, is_static = EXCLUDED.is_static,
                concept = EXCLUDED.concept, source_type = EXCLUDED.source_type,
                scope = EXCLUDED.scope, authoritative = EXCLUDED.authoritative,
@@ -298,6 +300,7 @@ def build_overlay_row(meta, columns, inferred, review):
         "conflict_type": conflict,
         "review_status": "needs_review" if review else "confirmed",
         "review_reason": inferred.get("_review_reason"),
+        "event_date_column": inferred.get("event_date_column"),
         "is_static": bool(inferred.get("is_static")),
         "structure_hash": meta["structure_hash"],
         "_concept": inferred.get("concept"), "_scope": inferred.get("scope"),
@@ -379,22 +382,24 @@ def upsert_target(pg_cur, meta, inferred):
     weeks = inferred.get("monitor_frequency_weeks", 1)          # how often the CHECK runs
     expected = inferred.get("expected_cadence_weeks")           # how stale = bad (freshness)
     static = bool(inferred.get("is_static"))
+    event_col = inferred.get("event_date_column")               # business date → data freshness
     # system.parts is validated at check time; default cheap_source = system_parts,
     # check engine falls back to light_scan if unreliable (Lapse 4).
     pg_cur.execute(
         """INSERT INTO sentinel.monitor_targets
            (database_name, table_name, variable, monitor_frequency_weeks,
-            expected_cadence_weeks, is_static, cheap_source, status, next_due_at,
-            selected_by, iteration)
-           VALUES (%s, %s, '', %s, %s, %s, 'system_parts', 'active', now(), 'llm', 0)
+            expected_cadence_weeks, is_static, event_date_column, cheap_source, status,
+            next_due_at, selected_by, iteration)
+           VALUES (%s, %s, '', %s, %s, %s, %s, 'system_parts', 'active', now(), 'llm', 0)
            ON CONFLICT (database_name, table_name, variable) DO UPDATE SET
                monitor_frequency_weeks = EXCLUDED.monitor_frequency_weeks,
                expected_cadence_weeks = EXCLUDED.expected_cadence_weeks,
                is_static = EXCLUDED.is_static,
+               event_date_column = EXCLUDED.event_date_column,
                status = CASE WHEN sentinel.monitor_targets.status = 'retired'
                              THEN 'active' ELSE sentinel.monitor_targets.status END,
                iteration = sentinel.monitor_targets.iteration + 1""",
-        (meta["database_name"], meta["table_name"], weeks, expected, static),
+        (meta["database_name"], meta["table_name"], weeks, expected, static, event_col),
     )
 
 
@@ -686,6 +691,13 @@ def main():
                 heur = source_type_heuristic(db, tbl)
                 if heur:
                     inferred["source_type"] = heur
+                # Guard the LLM's event_date_column — must be a real column, and never a
+                # sync/CDC column (those are sync freshness, not data freshness).
+                edc = inferred.get("event_date_column")
+                colset = {c["name"] for c in columns}
+                if edc and (edc not in colset or edc.startswith("_peerdb") or edc in ("_sign",)):
+                    log.info("dropping bad event_date_column %r for %s.%s", edc, db, tbl)
+                    inferred["event_date_column"] = None
                 llm_count += 1
 
                 # maker-checker — only material disagreements (source_type/dedup) flag review.
