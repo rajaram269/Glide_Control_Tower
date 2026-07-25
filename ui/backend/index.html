@@ -181,6 +181,27 @@
     .callout.good { background: var(--success-bg); border: 1px solid var(--success-bd); color: var(--success-fg); }
     .callout.bad  { background: var(--critical-bg); border: 1px solid var(--critical-bd); color: var(--critical-fg); }
 
+    /* Plain-language health banner (Overview) */
+    .health { display: flex; align-items: center; gap: 14px; border-radius: 14px; padding: 18px 22px;
+              margin-bottom: 22px; border: 1px solid var(--border); }
+    .health.good { background: var(--success-bg); border-color: var(--success-bd); }
+    .health.warn { background: var(--medium-bg); border-color: var(--medium-bd); }
+    .health.bad  { background: var(--critical-bg); border-color: var(--critical-bd); }
+    .health-dot { height: 12px; width: 12px; border-radius: 50%; flex-shrink: 0; }
+    .health.good .health-dot { background: var(--success-fg); }
+    .health.warn .health-dot { background: var(--medium-fg); }
+    .health.bad  .health-dot { background: var(--critical-fg); }
+    .health-title { font-size: 16px; font-weight: 600; color: var(--fg); }
+    .health-sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+    /* clickable attention chips */
+    .chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 5px 12px;
+            font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--surface);
+            color: var(--fg-2); transition: background .12s; }
+    .chip:hover { background: var(--raised); }
+    .chip .n { font-weight: 600; }
+    .chip.bad  { color: var(--critical-fg); border-color: var(--critical-bd); }
+    .chip.warn { color: var(--medium-fg); border-color: var(--medium-bd); }
+
     /* Loading / empty */
     .loading, .empty { text-align: center; padding: 48px; color: var(--muted); font-size: 13px; }
 
@@ -400,34 +421,82 @@ function ProvidersView() {
     </div>`;
 }
 
+// Turn an alert_type slug into a plain-English title.
+function alertTitle(t) {
+  const map = {
+    sentinel_freshness: 'Data is stale',
+    sentinel_volume: 'Data volume dropped',
+    sentinel_variable_coverage: 'A segment stopped reporting',
+    sentinel_schema_drift: 'Table structure changed',
+    sentinel_reconciliation: 'Two sources disagree',
+    error_rate_spike: 'Error rate spiked',
+    job_duration_drift: 'A job is running slower',
+    idle_sink: 'A data table went idle',
+    third_party_degradation: 'A provider is degraded',
+    ec2_resource_pressure: 'A server is under pressure',
+  };
+  return map[t] || (t || 'Alert').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+// Plain "what to do" per alert type.
+function alertAdvice(t) {
+  const map = {
+    sentinel_freshness: 'The data in this table is older than expected. Check the pipeline that loads it — it may have stopped, or upstream data is late.',
+    sentinel_volume: 'This table has far fewer rows than last check. A load may have partially failed or been truncated.',
+    sentinel_variable_coverage: 'A value that used to appear (e.g. a brand or channel) is missing from recent data. That segment may have stopped feeding in.',
+    sentinel_schema_drift: 'Columns were added, removed, or retyped. Downstream queries/reports may break — verify the change was intended.',
+    sentinel_reconciliation: 'Two tables that should roughly agree on a metric are diverging. One may be wrong or stale.',
+    idle_sink: 'This ClickHouse table has not received new data recently. The job that feeds it likely failed.',
+    third_party_degradation: 'An external API (OpenAI, Anthropic, etc.) is degraded. Errors here may be transient — check the provider status.',
+  };
+  return map[t] || 'Review the details and the affected service.';
+}
+
 function AlertsView() {
   const [rows, , refresh] = useApi('/api/alerts');
+  const [sel, setSel] = useState(null);
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">No unacknowledged alerts. All clear.</div>`;
+  if (!rows.length) return html`<div class="empty">✓ No open alerts. Everything is running normally.</div>`;
 
-  const ack = async (id) => {
-    await fetch(`/api/alerts/${id}/ack`, { method: 'POST' });
-    refresh();
-  };
+  const ack = async (id) => { await fetch(`/api/alerts/${id}/ack`, { method: 'POST' }); refresh(); if (sel && sel.alert_id===id) setSel(null); };
 
   return html`
-    <div class="section-title">${rows.length} unacknowledged alert${rows.length !== 1 ? 's' : ''}</div>
+    <div class="section-title">${rows.length} open alert${rows.length !== 1 ? 's' : ''} · click one for details</div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Severity</th><th>Type</th><th>Service / Provider</th>
-        <th>Message</th><th>Fired</th><th></th>
+        <th>Severity</th><th>What happened</th><th>Where</th><th>When</th><th></th>
       </tr></thead>
       <tbody>
-        ${rows.map(r => html`<tr key=${r.alert_id}>
+        ${rows.map(r => html`<tr key=${r.alert_id} onClick=${()=>setSel(r)}>
           <td><${StatusBadge} status=${r.severity}/></td>
-          <td class="mono" style="font-size:12px">${r.alert_type}</td>
-          <td class="mono" style="font-size:12px">${r.service_name || r.provider || '—'}</td>
-          <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.message}</td>
+          <td><div style="font-weight:500">${alertTitle(r.alert_type)}</div>
+              <div class="clamp wide" style="font-size:12px;color:var(--muted)" title=${r.message}>${r.message}</div></td>
+          <td class="mono clamp" style="font-size:12px" title=${r.service_name||r.provider||''}>${r.service_name || r.provider || '—'}</td>
           <td style="color:var(--muted);white-space:nowrap">${fmt.ago(r.fired_at)}</td>
-          <td><button class="ack-btn" onClick=${()=>ack(r.alert_id)}>Ack</button></td>
+          <td style="text-align:right"><button class="ack-btn" onClick=${(e)=>{e.stopPropagation();ack(r.alert_id);}}>Dismiss</button></td>
         </tr>`)}
       </tbody>
-    </table></div>`;
+    </table></div>
+    <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
+      title=${sel ? alertTitle(sel.alert_type) : ''} subtitle=${sel ? (sel.service_name||sel.provider||'') : ''}>
+      ${sel && (() => {
+        const ctx = sel.context_json || {};
+        const scope = ctx.scope || {};
+        const obs = ctx.observed || {};
+        return html`
+          <div style="margin-bottom:14px"><${StatusBadge} status=${sel.severity}/> <span style="color:var(--muted);font-size:12px;margin-left:6px">${fmt.ago(sel.fired_at)}</span></div>
+          <div class="kv"><div class="kv-label">What happened</div>${sel.message}</div>
+          <div class="kv"><div class="kv-label">What to do</div>
+            <div class="callout bad" style="background:var(--info-bg);border-color:var(--info-bd);color:var(--info-fg)">${alertAdvice(sel.alert_type)}</div></div>
+          ${(scope.database_name || scope.table) && html`<div class="kv"><div class="kv-label">Affected table</div>
+            <span class="mono">${scope.database_name||''}${scope.table?('.'+scope.table):''}${scope.variable?(' ['+scope.variable+']'):''}</span></div>`}
+          ${Object.keys(obs).length > 0 && html`<div class="kv"><div class="kv-label">The specific numbers</div>
+            <div class="callout" style="background:var(--raised);border:1px solid var(--border)">
+              ${Object.entries(obs).filter(([k])=>!['duration_ms'].includes(k)).map(([k,v]) =>
+                html`<div><span style="color:var(--muted)">${k.replace(/_/g,' ')}:</span> <b>${typeof v==='object'?JSON.stringify(v):String(v)}</b></div>`)}
+            </div></div>`}
+          <div style="margin-top:16px"><button class="ack-btn" onClick=${()=>ack(sel.alert_id)}>✓ Dismiss this alert</button></div>`;
+      })()}
+    </${Drawer}>`;
 }
 
 function PipelineView() {
@@ -554,6 +623,7 @@ function freshDisplay(r) {
 function FreshnessView() {
   const [rows] = useApi('/api/sentinel/freshness');
   const [q, setQ] = useState('');
+  const [sel, setSel] = useState(null);
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
@@ -584,7 +654,7 @@ function FreshnessView() {
             : !r.data_column ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
             : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
             : html`<span class="badge unknown">—</span>`;
-          return html`<tr key=${`${r.database_name}.${r.table_name}`} style=${bad ? 'background:var(--critical-bg)' : ''}>
+          return html`<tr key=${`${r.database_name}.${r.table_name}`} onClick=${()=>setSel(r)} style=${bad ? 'background:var(--critical-bg)' : ''}>
             <td class="mono clamp wide" title=${`${r.database_name}.${r.table_name}`}>
               <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}
               ${r.is_static ? html`<span class="badge info" style="margin-left:6px">static</span>` : ''}</td>
@@ -599,12 +669,31 @@ function FreshnessView() {
         })}
       </tbody>
     </table></div>
+    <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
+      title=${sel ? sel.table_name : ''} subtitle=${sel ? sel.database_name : ''}>
+      ${sel && (() => {
+        const tv = Array.isArray(sel.tracked_variables) ? sel.tracked_variables : [];
+        const syncD = freshDisplay({ ...sel, sentinel_status: sel.sync_status });
+        const dataLabel = sel.is_static ? 'not monitored (static)'
+          : !sel.data_column ? 'no business date on this table — only sync is tracked'
+          : sel.data_status ? sel.data_status : 'not checked yet';
+        return html`
+          ${sel.is_static ? html`<div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg);margin-bottom:16px">This is a frozen reference table — freshness is never alarmed on it.</div>` : ''}
+          <div class="kv"><div class="kv-label">Is the pipeline running? (Sync)</div>
+            <div class=${`callout ${sel.sync_status==='fresh'?'good':(['stale','dead'].includes(sel.sync_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.sync_status)?'background:var(--raised);border:1px solid var(--border)':''}>
+              <b>${sel.is_static?'static':syncD.label}</b> — rows were last written ${fmt.ago(sel.sync_last_write||sel.sentinel_last_write)}.</div></div>
+          <div class="kv"><div class="kv-label">Is the data current? (Data)</div>
+            <div class=${`callout ${sel.data_status==='fresh'?'good':(['stale','dead'].includes(sel.data_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.data_status)?'background:var(--raised);border:1px solid var(--border)':''}>
+              <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
+          ${(['stale','dead'].includes(sel.data_status) && !['stale','dead'].includes(sel.sync_status)) && html`
+            <div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`}
+          <div class="kv"><div class="kv-label">Expected update frequency</div>${sel.is_static?'frozen':cadenceLabel(sel.expected_cadence_weeks)}</div>
+          ${tv.length>0 && html`<div class="kv"><div class="kv-label">Monitored dimensions</div>${tv.map(v=>html`<span class="badge accent" style="margin-right:4px">${v}</span>`)}</div>`}
+          ${sel.mismatch && html`<div class="kv"><div class="kv-label">Legacy check</div>The old freshness path disagrees (says ${sel.legacy_status}) — being verified before retiring it.</div>`}`;
+      })()}
+    </${Drawer}>
     <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.7">
-      Two independent freshnesses.
-      <b style="color:var(--muted)">Sync</b> = is the pipeline running (when rows were last written/ingested).
-      <b style="color:var(--muted)">Data</b> = is the data itself current (newest business/event date — catches e.g. a table synced today but whose newest sales date is 2 months old). <b>n/a</b> = no business date column (dimension/reference — sync-only).
-      A table can be Sync-fresh but Data-stale. Status labels: Fresh / Stale (overdue) / Dead (long overdue) / Static (frozen, never alarmed).
-      <b style="color:var(--muted)">Newest data</b> = max business date. <b style="color:var(--muted)">Monitored variables</b> = business dimensions tracked for coverage.
+      Two independent freshnesses. <b style="color:var(--muted)">Sync</b> = is the pipeline running. <b style="color:var(--muted)">Data</b> = is the data itself current (a table can sync today yet hold only May's data). <b>n/a</b> = no business date (reference tables). Click any row for detail.
     </div>`;
 }
 
@@ -758,14 +847,19 @@ function ReviewQueueView() {
     <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
       title=${sel ? sel.table_name : ''} subtitle=${sel ? sel.database_name : ''}>
       ${sel && html`
-        <div class="kv"><div class="kv-label">Why it needs review</div>${sel.review_reason || sel.conflict_type || 'flagged'}</div>
-        <div class="kv"><div class="kv-label">Concept / Scope / Source</div>${sel.concept||'?'} / ${sel.scope||'—'} / ${sel.source_type||'?'}</div>
-        <div class="kv"><div class="kv-label">Authority</div>${sel.authoritative?'authoritative':(sel.use_instead?('→ '+sel.use_instead):'—')} · confidence ${sel.authority_confidence!=null?(sel.authority_confidence*100).toFixed(0)+'%':'—'}</div>
-        <div style="display:flex;gap:8px;margin-top:16px">
-          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/resolve`, refresh);setSel(null);}}>✓ Confirm (pin this)</button>
-          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/static?value=true`, refresh);setSel(null);}}>❄ Mark static</button>
+        <div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg);margin-bottom:16px">
+          <b>What to do:</b> Look at the guess below. If it looks right → <b>Confirm it</b>. If this is a
+          fixed lookup table that rarely changes → <b>Mark static</b>. Not sure? Leave it — Sentinel keeps
+          using its best guess and just won't assume it's certain.
         </div>
-        <div style="margin-top:12px;font-size:12px;color:var(--faint)">Confirm pins the current guess (discovery won't re-flag or overwrite it). Mark static = a frozen reference table; freshness stops alarming it.</div>`}
+        <div class="kv"><div class="kv-label">Why it was flagged</div>${sel.review_reason || (sel.conflict_type && sel.conflict_type!=='none' ? sel.conflict_type.replace(/_/g,' ') : 'The two AI models weren\'t fully certain about this table.')}</div>
+        <div class="kv"><div class="kv-label">Sentinel's best guess</div>
+          It's a <b>${sel.concept||'?'}</b> table${sel.source_type?html` from <b>${sel.source_type}</b>`:''}${sel.scope?html`, scope <b>${sel.scope}</b>`:''}.</div>
+        <div class="kv"><div class="kv-label">Confidence</div>${sel.authority_confidence!=null?(sel.authority_confidence*100).toFixed(0)+'%':'—'}${sel.authoritative?' · marked the canonical source for this concept':(sel.use_instead?(' · defers to '+sel.use_instead):'')}</div>
+        <div style="display:flex;gap:8px;margin-top:20px">
+          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/resolve`, refresh);setSel(null);}}>✓ Confirm — looks right</button>
+          <button class="ack-btn" onClick=${()=>{postAction(`/api/sentinel/overlay/${sel.database_name}/${sel.table_name}/static?value=true`, refresh);setSel(null);}}>❄ Mark static</button>
+        </div>`}
     </${Drawer}>`;
 }
 
@@ -805,84 +899,169 @@ function CoverageView() {
     </table></div>`;
 }
 
+// Plain-English name for a reconciliation check kind.
+function reconKind(m) {
+  return ({
+    segment_vs_total: 'Parts add up to the whole',
+    cross_source_agreement: 'Two sources agree',
+    referential_integrity: 'Values exist in the reference',
+    duplicate_concept_divergence: 'Duplicate tables still match',
+  })[m] || m;
+}
+function reconExplain(r) {
+  const a = r.source_a?.split('.').pop(), b = r.source_b?.split('.').pop();
+  return ({
+    segment_vs_total: `Summing ${a} by its segments should equal the table total.`,
+    cross_source_agreement: `${a} and ${b} measure the same thing — their totals should roughly match.`,
+    referential_integrity: `Every value in ${a} should exist in ${b}.`,
+    duplicate_concept_divergence: `${a} and ${b} are duplicates — they should stay in sync.`,
+  })[r.metric] || 'These two should agree.';
+}
+
 function ReconciliationView() {
   const [rows] = useApi('/api/sentinel/reconciliation');
   const [q, setQ] = useState('');
+  const [sel, setSel] = useState(null);
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">No reconciliation rules yet. Sentinel generates them in 'observe' from table relationships.</div>`;
-  const statusBadge = (s) => s === 'active' ? 'ok' : s === 'muted' ? 'unknown' : 'info';
+  if (!rows.length) return html`<div class="empty">No cross-checks yet. Sentinel creates them automatically once it has catalogued related tables.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
+  // sort: failing first, then agreeing, then still-watching
+  const rank = r => r.last_result==='fail'?0 : r.last_result==='warn'?1 : r.status==='active'?2 : 3;
+  shown.sort((a,b)=>rank(a)-rank(b));
+  const failing = shown.filter(r=>['fail','warn'].includes(r.last_result)).length;
+  const agreeing = shown.filter(r=>r.last_result==='ok').length;
+  const watching = shown.filter(r=>!r.last_result).length;
+
+  const verdict = (r) => {
+    if (r.last_result==='fail') return { cls:'critical', label:"Don't match" };
+    if (r.last_result==='warn') return { cls:'medium', label:'Slightly off' };
+    if (r.last_result==='ok')   return { cls:'success', label:'Agree' };
+    return { cls:'unknown', label:'Not checked yet' };
+  };
+
   return html`
     <div class="view-head">
-      <div class="section-title">Cross-Table Reconciliation — ${rows.length} rules</div>
-      <${SearchBox} value=${q} onInput=${setQ} placeholder="Search rules…" count=${shown.length}/>
+      <div class="section-title">Cross-checks — ${rows.length}</div>
+      <${SearchBox} value=${q} onInput=${setQ} placeholder="Search…" count=${shown.length}/>
     </div>
-    <div style="margin-bottom:14px;font-size:12px;color:var(--muted);line-height:1.6">
-      New rules start in <b>observe</b> (log only); a rule staying within tolerance across runs auto-promotes to <b>active</b> (alerting). No human sign-off — the observe period is the false-alarm safeguard.
+    <div style="margin-bottom:14px;font-size:13px;color:var(--muted);line-height:1.6;max-width:840px">
+      Sentinel automatically cross-checks tables that <b>should agree</b> with each other — e.g. two tables
+      that report the same sales should have matching totals, and parts of a breakdown should sum to the whole.
+      When they <b>don't match</b>, one is probably wrong or stale. This is how the "gross vs net sales"
+      mismatch gets caught. New checks watch quietly for a few runs before they start alerting (avoids false alarms).
+    </div>
+    <div style="margin-bottom:12px;font-size:12px;color:var(--muted);display:flex;gap:16px;flex-wrap:wrap">
+      ${failing>0 && html`<span style="color:var(--critical-fg)">● ${failing} don't match</span>`}
+      ${agreeing>0 && html`<span style="color:var(--success-fg)">● ${agreeing} agree</span>`}
+      ${watching>0 && html`<span>◌ ${watching} still being watched</span>`}
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Concept</th><th>Metric</th><th>Source A</th><th>Source B</th>
-        <th>Direction</th><th>Tol%</th><th>Status</th><th>Stable</th>
-        <th>Last result</th><th>A vs B (diff)</th>
+        <th>Check</th><th>Between</th><th>Result</th><th>Numbers</th><th>Phase</th>
       </tr></thead>
       <tbody>
-        ${shown.map(r => html`<tr key=${r.rule_id}>
-          <td>${r.concept}</td>
-          <td style="color:var(--muted);font-size:12px">${r.metric}</td>
-          <td class="mono clamp" style="font-size:12px" title=${r.source_a}>${r.source_a}</td>
-          <td class="mono clamp" style="font-size:12px" title=${r.source_b}>${r.source_b}</td>
-          <td style="color:var(--muted)">${r.direction}</td>
-          <td>${r.tolerance_pct}</td>
-          <td><span class=${`badge ${statusBadge(r.status)}`}>${r.status}</span>
-              ${r.status === 'observe' ? html`<span style="color:var(--muted);font-size:11px"> ${r.stable_runs}/3</span>` : ''}</td>
-          <td style="color:var(--muted)">${r.stable_runs}</td>
-          <td>${r.last_result ? html`<${StatusBadge} status=${r.last_result}/>` : '—'}</td>
-          <td style="font-size:12px">${r.last_a != null
-            ? html`<span class="mono">${fmt.num(r.last_a)} vs ${fmt.num(r.last_b)}</span> <span style=${`color:${Number(r.last_diff_pct)>Number(r.tolerance_pct)?'var(--critical-fg)':'var(--success-fg)'}`}>(${r.last_diff_pct}%)</span>`
-            : '—'}</td>
-        </tr>`)}
-      </tbody>
-    </table></div>`;
-}
-
-function IncidentsView() {
-  const [rows] = useApi('/api/sentinel/incidents');
-  if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">No Sentinel incidents. All monitored data is healthy.</div>`;
-  const open = rows.filter(r => !r.resolved_at).length;
-  return html`
-    <div class="section-title">Sentinel Incidents — ${open} open, ${rows.length - open} resolved</div>
-    <div class="table-scroll"><table>
-      <thead><tr>
-        <th>Severity</th><th>Check</th><th>Scope</th><th>Message</th>
-        <th>Opened</th><th>Resolved</th><th>Emailed</th>
-      </tr></thead>
-      <tbody>
-        ${rows.map(r => {
-          const scope = r.scope || {};
-          const isRollup = r.check_type === 'rollup';
-          const isChild = r.parent_incident_id != null;
-          const scopeStr = isRollup
-            ? `${scope.database_name || ''} (${r.rolled_up_children} incidents)`
-            : `${scope.database_name || ''}.${scope.table || ''}` + (scope.variable ? ` [${scope.variable}]` : '');
-          return html`<tr key=${r.id}
-              style=${(!r.resolved_at ? '' : 'opacity:0.55;') + (isRollup ? 'background:var(--raised);font-weight:600;' : '')}>
-            <td>${isRollup ? html`<span class="badge info">rollup</span>` : html`<${StatusBadge} status=${r.severity}/>`}</td>
-            <td style="color:var(--muted);font-size:12px">${isChild ? '↳ ' : ''}${r.check_type}</td>
-            <td class="mono clamp" style=${`font-size:12px;${isChild?'padding-left:24px;color:var(--muted)':''}`} title=${scopeStr}>${scopeStr}</td>
-            <td class="clamp wide" title=${r.message}>${r.message}</td>
-            <td style="color:var(--muted)">${fmt.ago(r.opened_at)}</td>
-            <td style="color:var(--muted)">${r.resolved_at ? fmt.ago(r.resolved_at) : html`<span style="color:var(--medium-fg)">open</span>`}</td>
-            <td>${r.alert_id ? html`<span class="badge ok">✓</span>` : '—'}</td>
+        ${shown.map(r => {
+          const v = verdict(r);
+          const bad = ['fail','warn'].includes(r.last_result);
+          return html`<tr key=${r.rule_id} onClick=${()=>setSel(r)} style=${bad?'background:var(--critical-bg)':''}>
+            <td><div style="font-weight:500">${reconKind(r.metric)}</div>
+                <div style="font-size:12px;color:var(--muted)">${r.concept}</div></td>
+            <td class="mono clamp" style="font-size:12px" title=${`${r.source_a} ↔ ${r.source_b}`}>
+              ${r.source_a?.split('.').pop()} ↔ ${r.source_b?.split('.').pop()}</td>
+            <td><span class=${`badge ${v.cls}`}>${v.label}</span></td>
+            <td style="font-size:12px">${r.last_a != null
+              ? html`<span class="mono">${fmt.num(r.last_a)} vs ${fmt.num(r.last_b)}</span> <span style=${`color:${Number(r.last_diff_pct)>Number(r.tolerance_pct)?'var(--critical-fg)':'var(--success-fg)'}`}>(${r.last_diff_pct}% off)</span>`
+              : '—'}</td>
+            <td>${r.status==='active' ? html`<span class="badge ok" title="alerting">live</span>`
+              : html`<span class="badge" title=${`watching — ${r.stable_runs}/3 stable runs before it goes live`}>watching ${r.stable_runs}/3</span>`}</td>
           </tr>`;
         })}
       </tbody>
     </table></div>
-    <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.6">
-      <b style="color:var(--muted)">Emailed</b> = an incident, when opened, inserts a Control Tower alert the alerter delivers via email (one per incident, dedup by scope).
-      <b style="color:var(--muted)">Rollup</b> rows group ≥3 open incidents in one database (↳ children) to suppress alert floods.
-    </div>`;
+    <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
+      title=${sel ? reconKind(sel.metric) : ''} subtitle=${sel ? sel.concept : ''}>
+      ${sel && html`
+        <div class="kv"><div class="kv-label">What this checks</div>${reconExplain(sel)}</div>
+        <div class="kv"><div class="kv-label">Latest result</div>
+          ${sel.last_result==='fail' ? html`<div class="callout bad">They don't match — ${sel.last_diff_pct}% apart (allowed: ${sel.tolerance_pct}%). One source is likely wrong or stale.</div>`
+          : sel.last_result==='ok' ? html`<div class="callout good">They agree (within ${sel.tolerance_pct}%).</div>`
+          : html`<div class="callout" style="background:var(--raised);border:1px solid var(--border)">Not checked yet.</div>`}</div>
+        ${sel.last_a != null && html`<div class="kv"><div class="kv-label">The numbers</div>
+          <div class="mono">${sel.source_a?.split('.').pop()} = ${fmt.num(sel.last_a)}<br/>${sel.source_b?.split('.').pop()} = ${fmt.num(sel.last_b)}<br/>difference = ${sel.last_diff_pct}%</div></div>`}
+        <div class="kv"><div class="kv-label">Tables</div><span class="mono" style="font-size:12px">${sel.source_a}<br/>${sel.source_b}</span></div>
+        <div class="kv"><div class="kv-label">Phase</div>${sel.status==='active'?'Live — will raise an incident if they diverge.':`Watching (${sel.stable_runs}/3 stable runs). Goes live automatically once it's been consistently in agreement.`}</div>`}
+    </${Drawer}>`;
+}
+
+// plain title for an incident's check_type
+function incidentTitle(t) {
+  return ({
+    freshness: 'Data is stale', volume: 'Data volume dropped',
+    variable_coverage: 'A segment stopped reporting', schema_drift: 'Table structure changed',
+    reconciliation: 'Two sources disagree', rollup: 'Multiple issues in one database',
+  })[t] || (t||'Issue').replace(/_/g,' ');
+}
+function incidentAdvice(t) {
+  return ({
+    freshness: 'This table\'s data is older than expected. The pipeline that loads it may have stopped, or upstream data is late. Check the loading job.',
+    volume: 'This table lost a lot of rows since the last check. A load may have partially failed or been truncated.',
+    variable_coverage: 'A value that used to appear (a brand, channel, region…) is missing from recent data. That segment likely stopped feeding in.',
+    schema_drift: 'Columns changed. Reports and queries that use this table may break — confirm the change was intended.',
+    reconciliation: 'Two tables that should agree on a number are diverging. One is probably wrong or stale.',
+    rollup: 'Several tables in the same database have issues at once — likely a shared pipeline problem. Open the children to see each.',
+  })[t] || 'Review the affected table and the job that loads it.';
+}
+
+function IncidentsView() {
+  const [rows] = useApi('/api/sentinel/incidents');
+  const [sel, setSel] = useState(null);
+  const [q, setQ] = useState('');
+  if (!rows) return html`<div class="loading">Loading…</div>`;
+  if (!rows.length) return html`<div class="empty">✓ No issues. All monitored data is healthy and current.</div>`;
+  const shown = rows.filter(r => rowMatches(r, q));
+  const open = shown.filter(r => !r.resolved_at).length;
+  return html`
+    <div class="view-head">
+      <div class="section-title">Issues — ${open} open, ${shown.length - open} resolved</div>
+      <${SearchBox} value=${q} onInput=${setQ} placeholder="Search…" count=${shown.length}/>
+    </div>
+    <div style="margin-bottom:14px;font-size:13px;color:var(--muted);max-width:820px">
+      Problems Sentinel found in your data — stale tables, dropped volumes, missing segments, structure changes.
+      Click any row for what happened and what to do.
+    </div>
+    <div class="table-scroll"><table>
+      <thead><tr>
+        <th>Severity</th><th>What happened</th><th>Where</th><th>Opened</th><th>Status</th>
+      </tr></thead>
+      <tbody>
+        ${shown.map(r => {
+          const scope = r.scope || {};
+          const isRollup = r.check_type === 'rollup';
+          const isChild = r.parent_incident_id != null;
+          const scopeStr = isRollup ? `${scope.database_name||''} (${r.rolled_up_children} issues)`
+            : `${scope.database_name||''}.${scope.table||''}` + (scope.variable?` [${scope.variable}]`:'');
+          return html`<tr key=${r.id} onClick=${()=>setSel({...r, scopeStr})}
+              style=${(r.resolved_at ? 'opacity:0.5;' : '') + (isRollup ? 'background:var(--raised);' : (!r.resolved_at && r.severity==='critical' ? 'background:var(--critical-bg);' : ''))}>
+            <td>${isRollup ? html`<span class="badge info">group</span>` : html`<${StatusBadge} status=${r.severity}/>`}</td>
+            <td><div style="font-weight:500">${isChild?'↳ ':''}${incidentTitle(r.check_type)}</div></td>
+            <td class="mono clamp" style="font-size:12px" title=${scopeStr}>${scopeStr}</td>
+            <td style="color:var(--muted)">${fmt.ago(r.opened_at)}</td>
+            <td>${r.resolved_at ? html`<span class="badge success">resolved</span>` : html`<span class="badge medium">open</span>`}</td>
+          </tr>`;
+        })}
+      </tbody>
+    </table></div>
+    <${Drawer} open=${!!sel} onClose=${()=>setSel(null)}
+      title=${sel ? incidentTitle(sel.check_type) : ''} subtitle=${sel ? sel.scopeStr : ''}>
+      ${sel && html`
+        <div style="margin-bottom:14px"><${StatusBadge} status=${sel.severity}/> <span style="color:var(--muted);font-size:12px;margin-left:6px">opened ${fmt.ago(sel.opened_at)}${sel.resolved_at?` · resolved ${fmt.ago(sel.resolved_at)}`:''}</span></div>
+        <div class="kv"><div class="kv-label">What happened</div>${sel.message}</div>
+        <div class="kv"><div class="kv-label">What to do</div>
+          <div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg)">${incidentAdvice(sel.check_type)}</div></div>
+        <div class="kv"><div class="kv-label">Affected</div><span class="mono">${sel.scopeStr}</span></div>
+        <div class="kv"><div class="kv-label">Notified</div>${sel.alert_id ? 'Yes — an email alert was sent when this opened.' : 'No email (grouped or informational).'}</div>
+        ${sel.check_type==='rollup' && html`<div class="kv"><div class="kv-label">Note</div>${sel.rolled_up_children} separate issues in this database were grouped to avoid an alert flood. They're listed individually in this table.</div>`}`}
+    </${Drawer}>`;
 }
 
 // ─── App shell ────────────────────────────────────────────────────────────────
@@ -909,40 +1088,57 @@ const NAV_GROUPS = [
 ];
 const ALL_VIEWS = NAV_GROUPS.flatMap(g => g.items);
 
-function OverviewView({ alerts, summary }) {
+function OverviewView({ alerts, summary, go }) {
   const s = summary || {};
+  const [h] = useApi('/api/sentinel/health', 60000);
   const critical = s.critical_alerts || 0;
   const jobsFailing = s.jobs_failing || 0;
+  const openAlerts = s.open_alerts || 0;
+
+  // plain-language attention list — each chip jumps to where you fix it
+  const items = [];
+  if (critical > 0) items.push({ n: critical, label: 'critical alert' + (critical>1?'s':''), sev:'bad', go:'alerts' });
+  else if (openAlerts > 0) items.push({ n: openAlerts, label: 'alert' + (openAlerts>1?'s':'') + ' to review', sev:'warn', go:'alerts' });
+  if (jobsFailing > 0) items.push({ n: jobsFailing, label: 'job' + (jobsFailing>1?'s':'') + ' failing', sev:'bad', go:'jobs' });
+  if (h && h.sync_problem > 0) items.push({ n: h.sync_problem, label: 'table' + (h.sync_problem>1?'s':'') + ' not syncing', sev:'bad', go:'freshness' });
+  if (h && h.data_problem > 0) items.push({ n: h.data_problem, label: 'table' + (h.data_problem>1?'s':'') + ' with stale data', sev:'warn', go:'freshness' });
+  if (h && h.open_incidents > 0) items.push({ n: h.open_incidents, label: 'open incident' + (h.open_incidents>1?'s':''), sev:'warn', go:'incidents' });
+  if (h && h.needs_review > 0) items.push({ n: h.needs_review, label: 'table' + (h.needs_review>1?'s':'') + ' to review', sev:'warn', go:'review' });
+
+  const cls = items.some(i=>i.sev==='bad') ? 'bad' : items.length ? 'warn' : 'good';
+  const title = cls==='good' ? 'Everything looks healthy'
+    : cls==='bad' ? 'Some things need attention' : 'A few things to look at';
+  const sub = cls==='good'
+    ? 'All pipelines are running, data is current, and there are no open alerts.'
+    : 'Click an item below to jump to it.';
+
   return html`
-    <div class="summary-grid">
-      <div class="card">
-        <div class="card-label">Services</div>
-        <div class="card-value ok">${s.active_services ?? '—'}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Jobs</div>
-        <div class="card-value ${jobsFailing > 0 ? 'crit' : 'ok'}">
-          ${s.active_jobs ?? '—'}${jobsFailing > 0 ? html` <span style="font-size:14px">(${jobsFailing} failing)</span>` : ''}
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-label">Open Alerts</div>
-        <div class="card-value ${s.open_alerts > 0 ? (critical > 0 ? 'crit' : 'warn') : 'ok'}">${s.open_alerts ?? '—'}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Critical Alerts</div>
-        <div class="card-value ${critical > 0 ? 'crit' : 'ok'}">${critical}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Spend (7d)</div>
-        <div class="card-value">${s.weekly_spend_usd ? '$'+Number(s.weekly_spend_usd).toFixed(2) : '—'}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Last Collection</div>
-        <div class="card-value" style="font-size:16px">${s.last_collection ? new Date(s.last_collection).toLocaleTimeString() : '—'}</div>
+    <div class=${`health ${cls}`}>
+      <div class="health-dot"></div>
+      <div style="flex:1">
+        <div class="health-title">${title}</div>
+        <div class="health-sub">${sub}</div>
+        ${items.length > 0 && html`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          ${items.map(i => html`<span class=${`chip ${i.sev}`} onClick=${()=>go(i.go)}>
+            <span class="n">${i.n}</span> ${i.label} →</span>`)}
+        </div>`}
       </div>
     </div>
-    <${SentinelSummaryStrip}/>
+
+    <div class="summary-grid">
+      <div class="card"><div class="card-label">Data tables monitored</div>
+        <div class="card-value">${h ? fmt.num(h.tables_total) : '—'}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">${h ? `${h.fresh} fresh · ${h.tables_checked} checked` : ''}</div></div>
+      <div class="card"><div class="card-label">Live services</div>
+        <div class="card-value ok">${s.active_services ?? '—'}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">handling live traffic</div></div>
+      <div class="card"><div class="card-label">Scheduled jobs</div>
+        <div class="card-value ${jobsFailing>0?'crit':'ok'}">${s.active_jobs ?? '—'}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">${jobsFailing>0?`${jobsFailing} failing`:'all healthy'}</div></div>
+      <div class="card"><div class="card-label">Spend this week</div>
+        <div class="card-value" style="font-size:22px">${s.weekly_spend_usd ? '$'+Number(s.weekly_spend_usd).toFixed(0) : '—'}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">across all cloud + APIs</div></div>
+    </div>
     <${ProvidersView}/>`;
 }
 
@@ -1038,7 +1234,7 @@ function App() {
           </div>
         </div>
         <div class="content">
-          ${view === 'overview'  && html`<${OverviewView} summary=${summary} alerts=${alerts}/>`}
+          ${view === 'overview'  && html`<${OverviewView} summary=${summary} alerts=${alerts} go=${setView}/>`}
           ${view === 'services'  && html`<${ServicesView}/>`}
           ${view === 'jobs'      && html`<${JobsView}/>`}
           ${view === 'providers' && html`<${ProvidersView}/>`}

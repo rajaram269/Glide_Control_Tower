@@ -259,6 +259,30 @@ def sentinel_summary():
         return dict(cur.fetchone())
 
 
+@app.get("/api/sentinel/health")
+def sentinel_health():
+    """Plain-language data-health summary for the Overview — counts of tables by
+    the latest freshness verdict (sync + data), needs-review, open incidents."""
+    with get_db() as cur:
+        cur.execute("""
+            WITH latest AS (
+                SELECT DISTINCT ON (database_name, table_name) database_name, table_name, observed
+                FROM sentinel.check_results
+                WHERE check_type='freshness' AND COALESCE(variable,'')=''
+                ORDER BY database_name, table_name, run_ts DESC
+            )
+            SELECT
+              (SELECT count(*) FROM sentinel.catalog_overlay WHERE retired=false) AS tables_total,
+              (SELECT count(*) FROM latest) AS tables_checked,
+              (SELECT count(*) FROM latest WHERE observed->>'sub_status'='fresh') AS fresh,
+              (SELECT count(*) FROM latest WHERE observed->'sync'->>'sub_status' IN ('stale','dead')) AS sync_problem,
+              (SELECT count(*) FROM latest WHERE observed->'data'->>'sub_status' IN ('stale','dead')) AS data_problem,
+              (SELECT count(*) FROM sentinel.catalog_overlay WHERE retired=false AND review_status='needs_review') AS needs_review,
+              (SELECT count(*) FROM sentinel.incidents WHERE resolved_at IS NULL AND check_type<>'rollup') AS open_incidents
+        """)
+        return dict(cur.fetchone())
+
+
 @app.get("/api/sentinel/catalog")
 def sentinel_catalog():
     with get_db() as cur:
