@@ -212,9 +212,9 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
 Do not add, rename, or omit keys. Do not wrap in markdown."""
 
 
-def _prompt(payload):
+def _evidence_block(payload):
+    """The table facts (schema/samples/stats) — shared by discovery + adjudicator."""
     return (
-        f"{_SYSTEM}\n\n"
         f"Table: {payload['database_name']}.{payload['table_name']}\n"
         f"Engine: {payload.get('engine')}\n"
         f"ORDER BY / sorting key: {payload.get('sorting_key')}\n"
@@ -230,8 +230,15 @@ def _prompt(payload):
           "gross-only). Very different magnitudes for a same-named measure across tables "
           "mean they are NOT the same metric.\n"
         + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
-        + "\n\n" + _OUTPUT_SPEC
     )
+
+
+def _prompt(payload, system=None, output_spec=None):
+    """Discovery prompt by default. Pass system+output_spec to build a different task
+    (the adjudicator) over the SAME evidence, without the discovery output schema
+    leaking in (which made the model return discovery keys, not adjudication keys)."""
+    return (f"{system or _SYSTEM}\n\n" + _evidence_block(payload)
+            + "\n\n" + (output_spec or _OUTPUT_SPEC))
 
 
 # ─── Provider callables ───────────────────────────────────────────────────────
@@ -267,7 +274,7 @@ def _call_anthropic(prompt):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        max_tokens=1024,
+        max_tokens=2048,   # 1024 truncated the full discovery JSON → unterminated string
         temperature=0,
         messages=[{"role": "user", "content": prompt + "\n\nReturn a single JSON object only."}],
     )
@@ -402,27 +409,31 @@ def adjudicate(payload, current, review_reason):
     diversity). Returns a dict {source_type, requires_dedup, dedup_method, dedup_key,
     concept, confidence, reasoning} or raises. The caller auto-confirms only when
     confidence >= RESOLVE_THRESHOLD."""
-    spec = (
-        "You are adjudicating a data-catalog disagreement. Two earlier analyses were "
-        "not fully certain about this table. Re-examine it from the schema, engine, "
-        "PII-safe samples and measure stats below, and decide the CORRECTNESS-CRITICAL "
-        "fields. Trust evidence over names. Return ONLY JSON with these keys:\n"
-        '  "source_type": one of erp, sales_channel, perf_marketing, web_analytics, '
-        "warehouse_ops, finance, reference, derived\n"
-        '  "concept": business concept (sales, spend, inventory, orders, reference, ...)\n'
-        '  "requires_dedup": boolean (true for ReplacingMergeTree/CDC tables)\n'
-        '  "dedup_method": one of argmax, final, none\n'
-        '  "dedup_key": array of business-key column names (present in the schema)\n'
-        '  "confidence": 0.0-1.0 — how sure you are. Be honest; low if genuinely ambiguous.\n'
-        '  "reasoning": one or two sentences citing the specific evidence you used.\n'
-        f"\nWhy this was flagged: {review_reason or 'the two models were not fully certain'}\n"
+    system = (
+        "You are adjudicating a data-catalog disagreement. Two earlier analyses were not "
+        "fully certain about this table. Re-examine it from the schema, engine, PII-safe "
+        "samples and measure stats below, and decide the CORRECTNESS-CRITICAL fields. "
+        "Trust evidence over names.\n"
+        f"Why this was flagged: {review_reason or 'the two models were not fully certain'}\n"
         f"Earlier best guess: source_type={current.get('source_type')}, "
         f"concept={current.get('concept')}, requires_dedup={current.get('requires_dedup')}, "
         f"dedup_key={current.get('dedup_key')}.\n"
         "Note: erp / finance / warehouse_ops are all ERP-origin and often interchangeable "
         "for selection — only distinguish them if the evidence is clear."
     )
-    prompt = _prompt(payload).replace(_SYSTEM, spec, 1)
+    output_spec = (
+        "Return ONLY a JSON object with EXACTLY these keys (no others, no markdown):\n"
+        '  "source_type": one of erp, sales_channel, perf_marketing, web_analytics, '
+        "warehouse_ops, finance, reference, derived\n"
+        '  "concept": business concept (sales, spend, inventory, orders, reference, ...)\n'
+        '  "requires_dedup": boolean (true for ReplacingMergeTree/CDC tables)\n'
+        '  "dedup_method": one of argmax, final, none\n'
+        '  "dedup_key": array of business-key column names present in the schema\n'
+        '  "confidence": number 0.0-1.0 — how sure you are; be honest, low if ambiguous\n'
+        '  "reasoning": one or two SHORT sentences citing the evidence (keep it brief to '
+        "avoid truncation)."
+    )
+    prompt = _prompt(payload, system=system, output_spec=output_spec)
 
     # prefer a provider that is likely NOT the maker/checker of the original
     for provider in _PROVIDER_ORDER:
