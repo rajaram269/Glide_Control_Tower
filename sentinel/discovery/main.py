@@ -352,14 +352,19 @@ def reconcile_authority(pg_cur, touched_keys):
             row_conflict = conflict
             if not is_auth and conflict == "authority_gap":
                 row_conflict = "dangling_pointer"
+            # Re-flag needs_review on a real authority conflict — but NEVER un-confirm a
+            # row a human or the resolver already confirmed (their confirmation stands;
+            # an authority conflict is surfaced via conflict_type, not by reopening review).
             pg_cur.execute(
                 """UPDATE sentinel.catalog_overlay
                    SET authoritative = %s,
                        use_instead = %s,
                        conflict_type = CASE WHEN conflict_type = 'unresolved_dedup'
                                             THEN conflict_type ELSE %s END,
-                       review_status = CASE WHEN %s <> 'none' THEN 'needs_review'
-                                            ELSE review_status END
+                       review_status = CASE
+                           WHEN updated_by IN ('human','resolver') THEN review_status
+                           WHEN %s <> 'none' THEN 'needs_review'
+                           ELSE review_status END
                    WHERE database_name = %s AND table_name = %s
                      AND updated_by <> 'human'""",
                 (is_auth, use_instead, row_conflict, row_conflict, m["db"], m["tbl"]),
