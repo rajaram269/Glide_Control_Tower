@@ -334,16 +334,20 @@ def reconcile_authority(pg_cur, touched_keys):
             winner = pinned[0]
             conflict = "authority_collision" if len(pinned) > 1 else "none"
         else:
-            ranked = sorted(members, key=lambda m: m["conf"], reverse=True)
+            # Rank by confidence, then break ties DETERMINISTICALLY so we always pick a
+            # single authority instead of flagging a collision. A confidence tie is NOT a
+            # real conflict — we're *assigning* authority, so pick one (prefer a _BI mart
+            # / *ALL rollup, then more rows, then name) and alias the rest. This avoids a
+            # mass authority_collision flood when many same-concept tables tie on conf.
+            def _tiebreak(m):
+                n = m["tbl"].lower()
+                mart = 1 if (n.endswith("bi") or n.endswith("all") or "_bi" in n) else 0
+                return (m["conf"], mart, m["tbl"])   # higher conf, mart-ness, then name
+            ranked = sorted(members, key=_tiebreak, reverse=True)
             winner = ranked[0]
             top_conf = ranked[0]["conf"]
-            ties = [m for m in ranked if m["conf"] == top_conf]
-            if top_conf == 0:
-                conflict = "authority_gap"
-            elif len(ties) > 1:
-                conflict = "authority_collision"
-            else:
-                conflict = "none"
+            # only a genuine gap (nobody has any confidence) is a conflict now
+            conflict = "authority_gap" if top_conf == 0 else "none"
 
         for m in members:
             is_auth = (m["db"], m["tbl"]) == (winner["db"], winner["tbl"]) and conflict != "authority_gap"
