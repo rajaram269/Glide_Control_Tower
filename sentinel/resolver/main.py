@@ -47,16 +47,25 @@ def apply_resolution(cur, row, adj):
     confirmed, record who/why. updated_by='resolver' (not 'human') so discovery can
     still re-evaluate on a real structural change, but review_status stays confirmed."""
     reason = f"auto-resolved by {adj.get('_adjudicator')}: {adj.get('reasoning','')}"[:500]
+    # Clear the informational authority conflict flags (collision/gap/dangling) on
+    # resolution — the row is now decided, so leaving 'authority_collision' on a
+    # *confirmed* row is stale/misleading. Keep 'unresolved_dedup' unless the
+    # adjudicator actually supplied a dedup_key (then the blocker is genuinely fixed).
+    new_dedup_key = adj.get("dedup_key") or row["dedup_key"]
     cur.execute("""
         UPDATE sentinel.catalog_overlay
         SET source_type = %s, concept = %s, requires_dedup = %s, dedup_method = %s,
             dedup_key = %s, review_status = 'confirmed', review_reason = %s,
             authority_confidence = GREATEST(authority_confidence, %s),
+            conflict_type = CASE
+                WHEN conflict_type = 'unresolved_dedup' AND %s THEN conflict_type
+                ELSE 'none' END,
             updated_by = 'resolver', updated_at = now()
         WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'
     """, (adj["source_type"], adj.get("concept") or row["concept"],
           bool(adj.get("requires_dedup")), adj.get("dedup_method") or row["dedup_method"],
-          adj.get("dedup_key") or row["dedup_key"], reason, adj["confidence"],
+          new_dedup_key, reason, adj["confidence"],
+          not bool(new_dedup_key),  # keep unresolved_dedup only if still no key
           row["database_name"], row["table_name"]))
     # keep the target's source-type-derived fields consistent enough; discovery owns
     # the rest. Also propagate to source_type_vocab if a new code appeared.
