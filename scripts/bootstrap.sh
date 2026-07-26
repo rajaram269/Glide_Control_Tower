@@ -42,6 +42,8 @@ for role in \
   roles/monitoring.viewer \
   roles/logging.viewer \
   roles/run.viewer \
+  roles/run.invoker \
+  roles/cloudscheduler.viewer \
   roles/cloudsql.client \
   roles/secretmanager.secretAccessor \
   roles/bigquery.dataViewer \
@@ -106,6 +108,71 @@ deploy_job "ct-cost-collector" "collectors/cost_collector"
 deploy_job "ct-anomaly-detector" "intelligence/anomaly_detector"
 deploy_job "ct-alerter"        "intelligence/alerter"
 
+# ── Sentinel jobs (data freshness/consistency monitor + catalog overlay) ──
+# Discovery needs the LLM keys; both need PG + ClickHouse read. Deployed with a
+# dedicated secret set (the generic deploy_job secret list lacks the sentinel keys).
+deploy_sentinel_job() {
+  local name=$1 dir=$2 extra_secrets=$3
+  echo "  Building $name..."
+  gcloud builds submit "$dir" \
+    --tag="gcr.io/${PROJECT}/${name}:latest" \
+    --project="$PROJECT" --quiet
+  gcloud run jobs create "$name" \
+    --image="gcr.io/${PROJECT}/${name}:latest" \
+    --region="$REGION" \
+    --service-account="$SA_EMAIL" \
+    --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
+    --set-secrets="PG_CONN=ct-pg-connection-string:latest,\
+CH_HOST=ct-clickhouse-host:latest,\
+CH_USER=ct-clickhouse-user:latest,\
+CH_PASS=ct-clickhouse-password:latest${extra_secrets}" \
+    --max-retries=1 \
+    --task-timeout=1800 \
+    --project="$PROJECT" 2>/dev/null || \
+  gcloud run jobs update "$name" \
+    --image="gcr.io/${PROJECT}/${name}:latest" \
+    --region="$REGION" --project="$PROJECT" --quiet
+  echo "  Deployed $name"
+}
+
+# Discovery: + LLM cascade keys (OpenAI/Gemini/Claude). Add these secrets first.
+deploy_sentinel_job "ct-sentinel-discovery" "sentinel/discovery" ",\
+OPENAI_API_KEY=ct-sentinel-openai-key:latest,\
+GEMINI_API_KEY=ct-sentinel-gemini-key:latest,\
+ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest"
+
+# Check engine: PG + CH read only (no LLM).
+deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" ""
+
+# To switch the alerter to AWS SES instead of MS Graph, add the ct-ses-* secrets
+# then update ct-alerter (and ct-alerter-weekly):
+#   gcloud run jobs update ct-alerter --region=$REGION --project=$PROJECT \
+#     --update-env-vars=EMAIL_TRANSPORT=ses \
+#     --update-secrets=SES_ACCESS_KEY_ID=ct-ses-access-key-id:latest,\
+# SES_SECRET_ACCESS_KEY=ct-ses-secret-access-key:latest,SES_REGION=ct-ses-region:latest
+# MS Graph remains the default (EMAIL_TRANSPORT unset → graph).
+
+# Weekly digest = same alerter image with WEEKLY_DIGEST=true.
+# Its scheduler trigger targets this job name, so it must exist.
+gcloud run jobs create ct-alerter-weekly \
+  --image="gcr.io/${PROJECT}/ct-alerter:latest" \
+  --region="$REGION" \
+  --service-account="$SA_EMAIL" \
+  --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
+  --set-secrets="PG_CONN=ct-pg-connection-string:latest,\
+ANTHROPIC_API_KEY=ct-anthropic-api-key:latest,\
+EMAIL_TENANT_ID=ct-email-tenant-id:latest,\
+EMAIL_CLIENT_ID=ct-email-client-id:latest,\
+EMAIL_CLIENT_SECRET=ct-email-client-secret:latest,\
+ALERT_EMAIL=ct-alert-email:latest" \
+  --set-env-vars="WEEKLY_DIGEST=true,SENDER_EMAIL=ai@holistique.in" \
+  --max-retries=2 --task-timeout=600 \
+  --project="$PROJECT" 2>/dev/null || \
+gcloud run jobs update ct-alerter-weekly \
+  --image="gcr.io/${PROJECT}/ct-alerter:latest" \
+  --region="$REGION" --project="$PROJECT" --quiet
+echo "  Deployed ct-alerter-weekly"
+
 # Deploy UI (Cloud Run service, not a job)
 echo "  Building ct-ui..."
 gcloud builds submit ui/backend \
@@ -153,6 +220,10 @@ create_schedule "ct-cost-collector"   "30 0 * * *"           "Cost Collector —
 create_schedule "ct-anomaly-detector" "30 * * * *"           "Anomaly Detector — hourly at :30"
 create_schedule "ct-alerter"          "45 * * * *"           "Alerter — hourly at :45"
 create_schedule "ct-alerter-weekly"   "15 3 * * 1"           "Weekly cost digest — Mon 09:00 IST"
+
+# Sentinel: discovery daily 06:45 IST (after cost collector), check tick daily 07:30 IST
+create_schedule "ct-sentinel-discovery" "15 1 * * *"         "Sentinel discovery — daily 06:45 IST"
+create_schedule "ct-sentinel-check"     "0 2 * * *"          "Sentinel check tick — daily 07:30 IST"
 
 # ── 7. Verify ─────────────────────────────────────────────────────────────
 echo ""

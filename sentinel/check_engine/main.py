@@ -1,0 +1,740 @@
+"""
+Sentinel Check Engine — Control Tower.
+
+Daily tick Cloud Run job. Runs due monitor_targets (next_due_at <= now), executes
+the 5 checks against ClickHouse (READ-ONLY), writes check_results + incidents, and
+bridges each opened incident to control_tower.alerts so the live ct-alerter delivers
+email. Never writes to ClickHouse.
+
+Checks (DATA_MONITOR_SPEC §8 / SENTINEL_BUILD_SPEC §5-6):
+ 1 freshness   — system.parts primary, max(col) fallback (Lapse 4); dedup OFF
+ 2 volume      — sum(rows) over active parts; dedup OFF
+ 3 variable_coverage — active values missing from recent data
+ 4 schema_drift — columns vs stored structure_hash
+ 5 reconciliation — deduped metric compare; dedup ON
+"""
+import os, json, hashlib, logging, datetime
+import psycopg2
+from psycopg2.extras import execute_values, Json
+import clickhouse_connect
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+PG_CONN = os.environ["PG_CONN"]
+CH_HOST = os.environ["CH_HOST"]
+CH_USER = os.environ["CH_USER"]
+CH_PASS = os.environ["CH_PASS"]
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
+# Lapse 4: let ops force the proven mechanism if system.parts proves unreliable
+FRESHNESS_MECHANISM = os.environ.get("SENTINEL_FRESHNESS", "auto")  # auto|system_parts|max_col
+
+NOW = datetime.datetime.now(datetime.timezone.utc)
+ADVISORY_LOCK_KEY = 0x53454E43  # "SENC"
+
+# Reconciliation is the expensive phase (whole-table dedup'd scans in ClickHouse). Cap
+# how many tables' recon we run per tick so a big backlog can't run the job past its
+# task-timeout; the rest are picked up on later ticks. Phase-1 checks are uncapped
+# (they're cheap metadata reads).
+MAX_RECON_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_RECON_TABLES_PER_RUN", "40"))
+
+
+def pg_connect():
+    return psycopg2.connect(PG_CONN)
+
+
+# Hard per-query ceilings. Without these, one slow reconciliation query (a big table,
+# a bad join) leaves the Python client blocked on the ClickHouse socket while holding
+# an open Postgres transaction — the whole daily check wedges (seen in prod: a single
+# recon query on a large table hung the run for minutes with zero progress). A query
+# that exceeds the ceiling raises, we log + mark that check 'warn', and move on.
+CH_MAX_EXECUTION_SECONDS = int(os.environ.get("SENTINEL_CH_QUERY_TIMEOUT", "45"))
+
+
+def ch_connect():
+    return clickhouse_connect.get_client(
+        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True,
+        # server-side wall-clock cap + client socket read timeout (a touch higher so the
+        # server's own timeout error surfaces instead of a bare socket timeout)
+        settings={"max_execution_time": CH_MAX_EXECUTION_SECONDS},
+        send_receive_timeout=CH_MAX_EXECUTION_SECONDS + 15,
+    )
+
+
+# ─── 1. Freshness ──────────────────────────────────────────────────────────────
+
+def _parts_freshness(ch, db, table):
+    """Cheap metadata read — no data scan. Returns latest modification_time or None."""
+    res = ch.query(
+        "SELECT max(modification_time) FROM system.parts "
+        "WHERE database = {db:String} AND table = {tbl:String} AND active",
+        parameters={"db": db, "tbl": table},
+    )
+    r = res.result_rows
+    return r[0][0] if r and r[0][0] else None
+
+
+def _maxcol_freshness(ch, db, table, col):
+    """max of a date/datetime column, parsing robustly across formats (String dates
+    in DD/MM/YYYY or ISO, Date/DateTime/Date32, epoch strings). Returns tz-aware
+    datetime or None. parseDateTimeBestEffortOrNull tolerates the value-format
+    variations these ClickHouse tables have (many store dates as String)."""
+    res = ch.query(
+        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`"
+    )
+    r = res.result_rows
+    return r[0][0] if r and r[0][0] else None
+
+
+def _classify(last, tolerance_weeks):
+    """(sub_status, status, age_hours) for a timestamp vs a tolerance. last=None → dead."""
+    if last is None:
+        return "dead", "fail", None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=datetime.timezone.utc)
+    age = NOW - last
+    age_hours = round(age.total_seconds() / 3600, 1)
+    limit = datetime.timedelta(weeks=float(tolerance_weeks))
+    if age <= limit:
+        return "fresh", "ok", age_hours
+    if age <= limit * 3:
+        return "stale", "warn", age_hours
+    return "dead", "fail", age_hours
+
+
+# Overall status = worst of the checks that apply.
+_RANK = {"ok": 0, "warn": 1, "fail": 2}
+
+
+def check_freshness(ch, target):
+    """Two freshnesses:
+      SYNC  — when rows were last written/ingested (system.parts / _peerdb_synced_at).
+              Answers 'is the pipeline running?'.
+      DATA  — newest business/event date in the data (max(event_date_column)).
+              Answers 'is the data itself current?' — catches May data synced in July.
+    DATA only runs when the table has an event_date_column; otherwise the table is
+    sync-only (dimension/reference/snapshot). Static tables never alarm."""
+    db, table = target["database_name"], target["table_name"]
+    tolerance_weeks = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
+
+    # ── SYNC freshness ──
+    sync_last, sync_mech = None, None
+    if FRESHNESS_MECHANISM in ("auto", "system_parts"):
+        try:
+            sync_last = _parts_freshness(ch, db, table); sync_mech = "system_parts"
+        except Exception as e:
+            log.warning("system.parts freshness failed %s.%s: %s", db, table, e)
+    if sync_last is None and FRESHNESS_MECHANISM in ("auto", "max_col"):
+        col = target.get("freshness_column") or "_peerdb_synced_at"
+        try:
+            sync_last = _maxcol_freshness(ch, db, table, col); sync_mech = "max_col"
+        except Exception as e:
+            log.warning("max_col freshness failed %s.%s: %s", db, table, e)
+
+    # Static tables are intentionally frozen — report info, never alarm.
+    if target.get("is_static"):
+        return "ok", {"sub_status": "static", "static": True,
+                      "sync_last_write": sync_last.isoformat() if sync_last else None,
+                      "mechanism": sync_mech}
+
+    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks)
+
+    observed = {
+        "sub_status": sync_sub,          # back-compat: top-level = sync verdict
+        "mechanism": sync_mech,
+        "sync": {"sub_status": sync_sub, "last_write": sync_last.isoformat() if sync_last else None,
+                 "age_hours": sync_age},
+        "tolerance_weeks": float(tolerance_weeks),
+        "last_write": sync_last.isoformat() if sync_last else None,
+        "age_hours": sync_age,
+    }
+    overall = sync_status
+
+    # ── DATA freshness (business date), if the table has one ──
+    edc = target.get("event_date_column")
+    if edc:
+        try:
+            data_last = _maxcol_freshness(ch, db, table, edc)
+            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks)
+            observed["data"] = {"column": edc, "sub_status": data_sub,
+                                "max_event_date": data_last.isoformat() if data_last else None,
+                                "age_hours": data_age}
+            # a table can be synced-fresh but data-stale (May data in July) — flag it
+            if _RANK[data_status] > _RANK[overall]:
+                overall = data_status
+            observed["sub_status"] = _worst_sub(sync_sub, data_sub)
+        except Exception as e:
+            observed["data"] = {"column": edc, "error": str(e)}
+    else:
+        observed["data"] = {"column": None, "note": "no business date — sync-only"}
+
+    return overall, observed
+
+
+def _worst_sub(a, b):
+    order = {"fresh": 0, "stale": 1, "dead": 2}
+    return a if order.get(a, 0) >= order.get(b, 0) else b
+
+
+# ─── 2. Volume ──────────────────────────────────────────────────────────────────
+
+# A row-count DROP is the anomaly (PeerDB-mirrored tables are append/upsert, not
+# truncate). Warn if the count fell vs the last recorded volume by more than the
+# band; a modest drop can be legitimate dedup/compaction so the band avoids noise.
+VOLUME_DROP_WARN_PCT = 5.0   # >5% fewer rows than last check → warn
+VOLUME_DROP_FAIL_PCT = 30.0  # >30% fewer → fail (likely a real data loss)
+
+
+def check_volume(ch, pg_cur, target):
+    db, table = target["database_name"], target["table_name"]
+    try:
+        res = ch.query(
+            "SELECT sum(rows) FROM system.parts "
+            "WHERE database = {db:String} AND table = {tbl:String} AND active",
+            parameters={"db": db, "tbl": table},
+        )
+        rows = int(res.result_rows[0][0] or 0)
+    except Exception as e:
+        return "warn", {"error": str(e)}
+
+    # Baseline = most recent prior volume check_result for this target.
+    pg_cur.execute(
+        """SELECT (observed->>'row_count')::bigint
+           FROM sentinel.check_results
+           WHERE check_type = 'volume' AND database_name = %s AND table_name = %s
+             AND COALESCE(variable,'') = %s AND observed ? 'row_count'
+           ORDER BY run_ts DESC LIMIT 1""",
+        (db, table, target.get("variable", "")),
+    )
+    r = pg_cur.fetchone()
+    prev = r[0] if r and r[0] is not None else None
+    if prev is None or prev == 0:
+        return "ok", {"row_count": rows, "baseline": None, "note": "first observation"}
+
+    drop_pct = (prev - rows) / prev * 100.0
+    observed = {"row_count": rows, "baseline": prev, "drop_pct": round(drop_pct, 2)}
+    if drop_pct >= VOLUME_DROP_FAIL_PCT:
+        return "fail", observed
+    if drop_pct >= VOLUME_DROP_WARN_PCT:
+        return "warn", observed
+    return "ok", observed
+
+
+# ─── 4. Schema drift ─────────────────────────────────────────────────────────────
+
+def check_schema_drift(ch, pg_cur, target):
+    db, table = target["database_name"], target["table_name"]
+    try:
+        res = ch.query(
+            "SELECT name, type FROM system.columns "
+            "WHERE database = {db:String} AND table = {tbl:String} ORDER BY name",
+            parameters={"db": db, "tbl": table},
+        )
+        cols = [{"name": r[0], "type": r[1]} for r in res.result_rows]
+    except Exception as e:
+        return "warn", {"error": str(e)}
+    canon = ";".join(f"{c['name']}:{c['type']}" for c in cols)
+    current_hash = hashlib.sha256(canon.encode()).hexdigest()
+    pg_cur.execute(
+        "SELECT structure_hash FROM sentinel.catalog_overlay "
+        "WHERE database_name = %s AND table_name = %s",
+        (db, table),
+    )
+    r = pg_cur.fetchone()
+    stored = r[0] if r else None
+    if stored is None:
+        return "ok", {"note": "no stored hash yet"}
+    if stored != current_hash:
+        return "warn", {"drift": True, "stored_hash": stored[:12], "current_hash": current_hash[:12]}
+    return "ok", {"drift": False}
+
+
+# ─── 3. Variable coverage ───────────────────────────────────────────────────────
+#
+# For a per-variable target, compare the values seen recently in ClickHouse against
+# the `active` value universe in variable_values (set-difference). Missing active
+# values = a coverage gap (a segment stopped reporting). Signal read — dedup OFF.
+
+def check_variable_coverage(ch, pg_cur, target):
+    db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
+    if not variable:
+        return "ok", {"note": "table-level target, no variable"}
+    pg_cur.execute(
+        """SELECT value FROM sentinel.variable_values
+           WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
+        (db, table, variable),
+    )
+    expected = {r[0] for r in pg_cur.fetchall()}
+    if not expected:
+        return "ok", {"note": "no active values tracked yet"}
+    try:
+        res = ch.query(f"SELECT DISTINCT toString(`{variable}`) FROM `{db}`.`{table}`")
+        present = {r[0] for r in res.result_rows}
+    except Exception as e:
+        return "warn", {"error": str(e)}
+    missing = sorted(expected - present)
+    if missing:
+        status = "fail" if len(missing) >= max(3, len(expected) // 2) else "warn"
+        return status, {"missing_values": missing[:50], "missing_count": len(missing),
+                        "expected_count": len(expected)}
+    return "ok", {"expected_count": len(expected), "missing_count": 0}
+
+
+# ─── 5. Cross-table reconciliation (dedup ON) ────────────────────────────────────
+#
+# Runs the `active` + `observe` rules whose source_a is this table. Metrics are
+# computed WITH overlay dedup so discrepancies are real, not CDC artifacts.
+# observe rules log + accrue stable_runs (auto-promote); active rules can alert.
+
+def _overlay_dedup(pg_cur, db, table):
+    pg_cur.execute(
+        "SELECT requires_dedup, dedup_key, version_col, delete_col FROM sentinel.catalog_overlay "
+        "WHERE database_name = %s AND table_name = %s",
+        (db, table),
+    )
+    r = pg_cur.fetchone()
+    if not r or not r[0] or not r[1]:
+        return None
+    return {"key": r[1], "version": r[2], "delete": r[3]}
+
+
+def _parse_ref(ref):
+    """A rule source ref is 'db.table', 'db.table#dimension' (segment rules), or
+    'db.table::measure_col' (cross-source measure rules). Returns (db, table, measure)."""
+    measure = None
+    if "::" in ref:
+        ref, measure = ref.split("::", 1)
+    ref = ref.split("#", 1)[0]
+    db, table = ref.split(".", 1)
+    return db, table, measure
+
+
+def _dedup_inner(db, table, dedup):
+    """Deduped row subquery (or plain table) per the overlay CDC pattern."""
+    if dedup and dedup["key"]:
+        keys = ", ".join(f"`{k}`" for k in dedup["key"])
+        if dedup["version"] and dedup["delete"]:
+            # keep latest non-deleted version per key, carry all cols for measure sum
+            return (f"SELECT * FROM `{db}`.`{table}` "
+                    f"WHERE (`{dedup['delete']}`, `{dedup['version']}`) IN "
+                    f"(SELECT argMax(`{dedup['delete']}`, `{dedup['version']}`), "
+                    f"max(`{dedup['version']}`) FROM `{db}`.`{table}` GROUP BY {keys})")
+        return f"`{db}`.`{table}`"
+    return f"`{db}`.`{table}`"
+
+
+def _deduped_count(ch, ref, dedup):
+    """COUNT of a ref, applying overlay dedup when set."""
+    db, table, _ = _parse_ref(ref)
+    if dedup and dedup["key"]:
+        keys = ", ".join(f"`{k}`" for k in dedup["key"])
+        if dedup["version"] and dedup["delete"]:
+            inner = (f"SELECT {keys} FROM `{db}`.`{table}` GROUP BY {keys} "
+                     f"HAVING argMax(`{dedup['delete']}`, `{dedup['version']}`) = 0")
+        else:
+            inner = f"SELECT DISTINCT {keys} FROM `{db}`.`{table}`"
+        sql = f"SELECT count() FROM ({inner})"
+    else:
+        sql = f"SELECT count() FROM `{db}`.`{table}`"
+    return float(ch.query(sql).result_rows[0][0] or 0)
+
+
+def _deduped_sum(ch, ref, dedup):
+    """SUM of a measure column (from ref's ::measure), deduped. This is what makes a
+    gross-vs-net gap visible — a summed measure, not a row count."""
+    db, table, measure = _parse_ref(ref)
+    if not measure:
+        return _deduped_count(ch, ref, dedup)  # no measure → fall back to count
+    q = f"toFloat64OrNull(toString(`{measure}`))"
+    # dedup on business key: sum the latest non-deleted version per key
+    if dedup and dedup["key"] and dedup["version"] and dedup["delete"]:
+        keys = ", ".join(f"`{k}`" for k in dedup["key"])
+        sql = (f"SELECT sum(m) FROM (SELECT argMax({q}, `{dedup['version']}`) AS m "
+               f"FROM `{db}`.`{table}` GROUP BY {keys} "
+               f"HAVING argMax(`{dedup['delete']}`, `{dedup['version']}`) = 0)")
+    else:
+        sql = f"SELECT sum({q}) FROM `{db}`.`{table}`"
+    return float(ch.query(sql).result_rows[0][0] or 0)
+
+
+def run_reconciliation(ch, pg_cur, target):
+    """Execute recon rules anchored on this table. Returns list of (rule_id, status,
+    observed) results; caller writes check_results + handles incidents/promotion."""
+    db, table = target["database_name"], target["table_name"]
+    src_prefix = f"{db}.{table}"
+    pg_cur.execute(
+        """SELECT rule_id, concept, metric, source_a, source_b, dimension,
+                  tolerance_pct, direction, status, stable_runs
+           FROM sentinel.reconciliation_rules
+           WHERE status IN ('observe', 'active')
+             AND (source_a = %s OR source_a LIKE %s OR source_a LIKE %s)""",
+        (src_prefix, src_prefix + "#%", src_prefix + "::%"),
+    )
+    rules = pg_cur.fetchall()
+    results = []
+    for rule_id, concept, metric, src_a, src_b, dim, tol, direction, rstatus, stable in rules:
+        try:
+            a_db, a_tbl, _ = _parse_ref(src_a)
+            b_db, b_tbl, _ = _parse_ref(src_b)
+            dedup_a = _overlay_dedup(pg_cur, a_db, a_tbl)
+            dedup_b = _overlay_dedup(pg_cur, b_db, b_tbl)
+            # cross-source agreement compares SUMMED MEASURE (gross vs net); others count
+            if metric == "cross_source_agreement":
+                a = _deduped_sum(ch, src_a, dedup_a)
+                b = _deduped_sum(ch, src_b, dedup_b)
+            else:
+                a = _deduped_count(ch, src_a, dedup_a)
+                b = _deduped_count(ch, src_b, dedup_b)
+        except Exception as e:
+            results.append((rule_id, rstatus, "warn", {"error": str(e)}, stable))
+            continue
+
+        if direction == "subset":
+            ok = a <= b  # a's values ⊆ b (count proxy)
+            diff_pct = 0.0 if b == 0 else max(0.0, (a - b) / b * 100.0)
+        else:  # a≈b / a≥b
+            base = max(b, 1)
+            diff_pct = abs(a - b) / base * 100.0
+            ok = (a >= b) if direction == "a≥b" else (diff_pct <= float(tol))
+        verdict = "ok" if ok else ("warn" if rstatus == "observe" else "fail")
+        observed = {"a": a, "b": b, "diff_pct": round(diff_pct, 2), "tolerance_pct": float(tol),
+                    "direction": direction, "rule_status": rstatus}
+        results.append((rule_id, rstatus, verdict, observed, stable))
+    return results
+
+
+# observe→active promotion: N consecutive in-tolerance runs promotes; any breach
+# resets stable_runs to 0 (and keeps the rule in observe — flagged, not paging).
+RECON_PROMOTE_AFTER = 3
+
+
+def apply_recon_promotion(pg_cur, rule_id, rstatus, verdict, stable):
+    if rstatus != "observe":
+        return
+    if verdict == "ok":
+        new_stable = stable + 1
+        if new_stable >= RECON_PROMOTE_AFTER:
+            pg_cur.execute(
+                "UPDATE sentinel.reconciliation_rules SET status='active', stable_runs=%s, "
+                "updated_at=now() WHERE rule_id=%s", (new_stable, rule_id))
+        else:
+            pg_cur.execute(
+                "UPDATE sentinel.reconciliation_rules SET stable_runs=%s, updated_at=now() "
+                "WHERE rule_id=%s", (new_stable, rule_id))
+    else:
+        pg_cur.execute(
+            "UPDATE sentinel.reconciliation_rules SET stable_runs=0, updated_at=now() "
+            "WHERE rule_id=%s", (rule_id,))
+
+
+# ─── check_results + incidents + alert bridge ────────────────────────────────────
+
+def write_check_result(pg_cur, target, check_type, status, observed, rule_id=None):
+    pg_cur.execute(
+        """INSERT INTO sentinel.check_results
+           (run_ts, database_name, table_name, variable, check_type, status,
+            observed, monitor_frequency_weeks, rule_id)
+           VALUES (now(), %s, %s, %s, %s, %s, %s, %s, %s)
+           RETURNING id""",
+        (target["database_name"], target["table_name"], target.get("variable", ""),
+         check_type, status, Json(observed), target["monitor_frequency_weeks"], rule_id),
+    )
+    return pg_cur.fetchone()[0]
+
+
+SEVERITY = {"warn": "warn", "fail": "critical"}
+
+
+def open_or_update_incident(pg_cur, target, check_type, status, observed, check_result_id):
+    """Open an incident if none open for this scope; bridge to control_tower.alerts
+    on first open. Dedup: one open incident per (db, table, variable, check_type)."""
+    db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
+    scope = {"database_name": db, "table": table, "variable": variable, "check_type": check_type}
+    pg_cur.execute(
+        """SELECT id FROM sentinel.incidents
+           WHERE resolved_at IS NULL AND check_type = %s
+             AND scope->>'database_name' = %s AND scope->>'table' = %s
+             AND COALESCE(scope->>'variable','') = %s""",
+        (check_type, db, table, variable),
+    )
+    existing = pg_cur.fetchone()
+    if existing:
+        return existing[0]  # already open — dedup, no re-fire
+
+    severity = SEVERITY.get(status, "warn")
+    message = f"{check_type} {status} on {db}.{table}" + (f" [{variable}]" if variable else "")
+
+    # Bridge: insert control_tower.alerts row → live ct-alerter emails it
+    pg_cur.execute(
+        """INSERT INTO control_tower.alerts
+           (alert_type, severity, service_name, message, context_json, fired_at)
+           VALUES (%s, %s, %s, %s, %s, now())
+           RETURNING alert_id""",
+        (f"sentinel_{check_type}", severity, f"{db}.{table}", message,
+         Json({"scope": scope, "observed": observed})),
+    )
+    alert_id = pg_cur.fetchone()[0]
+
+    pg_cur.execute(
+        """INSERT INTO sentinel.incidents
+           (opened_at, scope, scope_level, check_type, severity, message,
+            check_result_id, alert_id)
+           VALUES (now(), %s, %s, %s, %s, %s, %s, %s)
+           RETURNING id""",
+        (Json(scope), "variable" if variable else "table", check_type, severity,
+         message, check_result_id, alert_id),
+    )
+    return pg_cur.fetchone()[0]
+
+
+def resolve_incident_if_open(pg_cur, target, check_type):
+    db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
+    pg_cur.execute(
+        """UPDATE sentinel.incidents SET resolved_at = now()
+           WHERE resolved_at IS NULL AND check_type = %s
+             AND scope->>'database_name' = %s AND scope->>'table' = %s
+             AND COALESCE(scope->>'variable','') = %s""",
+        (check_type, db, table, variable),
+    )
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def due_targets(pg_cur):
+    pg_cur.execute("""
+        SELECT t.id, t.database_name, t.table_name, t.variable,
+               t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
+               t.is_static, t.event_date_column, w.freshness_column
+        FROM sentinel.monitor_targets t
+        LEFT JOIN control_tower.watched_tables w
+               ON w.database_name = t.database_name AND w.table_name = t.table_name
+        WHERE t.status = 'active' AND (t.next_due_at IS NULL OR t.next_due_at <= now())
+        ORDER BY t.next_due_at NULLS FIRST
+    """)
+    return [
+        {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
+         "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
+         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
+         "freshness_column": r[9]}
+        for r in pg_cur.fetchall()
+    ]
+
+
+# Two kinds of check:
+#  TABLE-level  — a property of the TABLE (freshness, volume, schema drift). Runs ONCE
+#                 per table, regardless of how many variable targets it has. Written with
+#                 variable='' so the incident scope is the table, not a variable.
+#  VARIABLE-level — coverage of one segmentation dimension. Runs per variable target.
+# Running table-level checks per variable target (as before) fired N duplicate incidents
+# and N duplicate alert emails for a single table with N tracked variables — a table with
+# 4 variables sent 4 identical "freshness stale" emails. Split them.
+TABLE_CHECKS = [
+    ("freshness", lambda ch, cur, t: check_freshness(ch, t)),
+    ("volume", check_volume),
+    ("schema_drift", check_schema_drift),
+]
+VARIABLE_CHECKS = [
+    ("variable_coverage", check_variable_coverage),
+]
+
+
+def _run_checks(cur, ch, target, checks):
+    for check_type, fn in checks:
+        t0 = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            status, observed = fn(ch, cur, target)
+        except Exception as e:
+            status, observed = "warn", {"error": str(e)}
+        observed["duration_ms"] = int(
+            (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds() * 1000)
+        crid = write_check_result(cur, target, check_type, status, observed)
+        if status in ("warn", "fail"):
+            open_or_update_incident(cur, target, check_type, status, observed, crid)
+        else:
+            resolve_incident_if_open(cur, target, check_type)
+
+
+def run_table_checks(cur, ch, target):
+    """Freshness/volume/schema_drift — table properties. Force variable='' so the
+    check_result + incident scope is the TABLE (one per table, not one per variable)."""
+    _run_checks(cur, ch, {**target, "variable": ""}, TABLE_CHECKS)
+
+
+def run_variable_checks(cur, ch, target):
+    """Coverage — genuinely per variable. No-op for the table-level ('') target."""
+    if not target.get("variable"):
+        return
+    _run_checks(cur, ch, target, VARIABLE_CHECKS)
+
+
+def run_recon_checks(cur, ch, target):
+    """Reconciliation is per-rule: run, write a result per rule, drive observe→active
+    promotion, and only page for ACTIVE rules that fail (observe rules log + flag)."""
+    for rule_id, rstatus, verdict, observed, stable in run_reconciliation(ch, cur, target):
+        crid = write_check_result(cur, target, "reconciliation", verdict, observed, rule_id=rule_id)
+        apply_recon_promotion(cur, rule_id, rstatus, verdict, stable)
+        if verdict == "fail" and rstatus == "active":
+            open_or_update_incident(cur, {**target, "variable": f"rule:{rule_id}"},
+                                    "reconciliation", verdict, observed, crid)
+        elif verdict == "ok":
+            resolve_incident_if_open(cur, {**target, "variable": f"rule:{rule_id}"}, "reconciliation")
+
+
+def _recon_priority(cur, table_keys):
+    """Order the given (db, table) keys so the tables whose recon rules were checked
+    longest ago come first (round-robin across capped ticks). Tables with no anchoring
+    rules — nothing to reconcile — sort last and are effectively skipped by the cap."""
+    if not table_keys:
+        return []
+    keys = list(table_keys)
+    # min(updated_at) over rules anchored on each table; NULL (no rules) sorts last.
+    cur.execute(
+        """SELECT split_part(split_part(source_a,'#',1),'::',1) AS src, min(updated_at) AS oldest
+           FROM sentinel.reconciliation_rules
+           WHERE status IN ('observe','active')
+           GROUP BY 1""")
+    oldest = {}
+    for src, ts in cur.fetchall():
+        # src is 'db.table' — map back to the (db, table) tuple form
+        d, _, t = src.partition(".")
+        oldest[(d, t)] = ts
+    from datetime import timezone as _tz
+    far_future = datetime.datetime.max.replace(tzinfo=_tz.utc)
+    return sorted(keys, key=lambda k: oldest.get(k) or far_future)
+
+
+def roll_up_incidents(cur):
+    """Suppress floods: when >=3 open, unparented table-level incidents share a
+    database_name, group them under a synthetic per-database parent so the alert
+    bridge/consumer sees one cluster instead of N. Parent carries rolled_up_children."""
+    cur.execute("""
+        SELECT scope->>'database_name' AS db, array_agg(id) AS ids
+        FROM sentinel.incidents
+        WHERE resolved_at IS NULL AND parent_incident_id IS NULL
+          AND scope_level = 'table'
+        GROUP BY scope->>'database_name'
+        HAVING count(*) >= 3
+    """)
+    for db, ids in cur.fetchall():
+        # Reuse an already-open rollup parent for this db — else every run that finds
+        # ≥3 fresh unparented incidents spawns ANOTHER parent, and the parents pile up
+        # (seen in prod: same db, multiple open 'rollup' incidents). One parent per db.
+        cur.execute(
+            """SELECT id, rolled_up_children FROM sentinel.incidents
+               WHERE resolved_at IS NULL AND check_type = 'rollup'
+                 AND scope->>'database_name' = %s
+               ORDER BY opened_at LIMIT 1""",
+            (db,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            parent_id, prior = existing[0], existing[1] or 0
+            cur.execute(
+                """UPDATE sentinel.incidents
+                   SET rolled_up_children = %s, message = %s
+                   WHERE id = %s""",
+                (prior + len(ids), f"{prior + len(ids)} open incidents in {db}", parent_id),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO sentinel.incidents
+                   (opened_at, scope, scope_level, check_type, severity, message, rolled_up_children)
+                   VALUES (now(), %s, 'schema', 'rollup', 'warn', %s, %s)
+                   RETURNING id""",
+                (Json({"database_name": db}), f"{len(ids)} open incidents in {db}", len(ids)),
+            )
+            parent_id = cur.fetchone()[0]
+        cur.execute(
+            "UPDATE sentinel.incidents SET parent_incident_id = %s WHERE id = ANY(%s)",
+            (parent_id, ids),
+        )
+
+
+def main():
+    log.info("Sentinel check engine starting @ %s", NOW)
+    pg = pg_connect()
+    ch = ch_connect()
+    ran = 0
+
+    try:
+        with pg.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+            if not cur.fetchone()[0]:
+                log.warning("Another check run holds the lock. Exiting.")
+                return
+
+            targets = due_targets(cur)
+            log.info("%d due targets", len(targets))
+
+            # ── PHASE 1: fast checks (freshness/volume/schema/coverage) ──
+            # These are cheap metadata reads (system.parts, system.columns) — a few ms
+            # each. Run them for ALL due targets first and advance their schedule, so a
+            # tick ALWAYS completes the freshness/volume story even if reconciliation
+            # (phase 2) is slow. freshness/volume/schema anchor on the TABLE (run once
+            # per table, variable=''); coverage runs per variable target.
+            table_done = set()
+            for target in targets:
+                tbl_key = (target["database_name"], target["table_name"])
+                if tbl_key not in table_done:
+                    run_table_checks(cur, ch, target)
+                    table_done.add(tbl_key)
+                run_variable_checks(cur, ch, target)
+                cur.execute(
+                    """UPDATE sentinel.monitor_targets
+                       SET last_checked_at = now(),
+                           next_due_at = now() + (monitor_frequency_weeks || ' weeks')::interval
+                       WHERE id = %s""",
+                    (target["id"],),
+                )
+                ran += 1
+                pg.commit()   # per-target: live + timeout-safe (lock survives commits)
+
+            # ── PHASE 2: reconciliation (expensive) ──
+            # Recon sums/counts whole tables in ClickHouse (dedup'd), sometimes dozens of
+            # scans per table — orders of magnitude slower than phase 1. Running it inline
+            # per target (as before) let one heavy table's recon block the per-target
+            # commit and starve every remaining table's freshness check — the whole daily
+            # tick wedged with zero results. So: run it AFTER phase 1 (checks already
+            # durable), bound it to MAX_RECON_TABLES_PER_RUN tables/tick, and commit per
+            # table. Remaining tables' recon is picked up over subsequent ticks; the
+            # per-query CH timeout in ch_connect() caps any single slow scan.
+            # Rotate: reconcile the tables whose rules were checked longest ago first, so
+            # over successive capped ticks every table's recon runs (rather than always
+            # re-doing the same first 40). Rule updated_at advances when recon runs.
+            recon_order = _recon_priority(cur, table_done)
+            recon_ran = 0
+            for tbl_key in recon_order:
+                if recon_ran >= MAX_RECON_TABLES_PER_RUN:
+                    log.info("Recon cap reached (%d tables); rest next tick.",
+                             MAX_RECON_TABLES_PER_RUN)
+                    break
+                run_recon_checks(cur, ch, {"database_name": tbl_key[0], "table_name": tbl_key[1],
+                                           "monitor_frequency_weeks": 1})
+                recon_ran += 1
+                pg.commit()
+
+            roll_up_incidents(cur)
+
+            cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+            pg.commit()
+            log.info("Check engine committed. Ran %d targets.", ran)
+
+    except Exception as e:
+        pg.rollback()
+        log.error("Check engine failed: %s", e)
+        raise
+    finally:
+        pg.close()
+        ch.close()
+
+    if HEALTHCHECK_URL:
+        try:
+            import requests
+            requests.get(HEALTHCHECK_URL, timeout=10)
+        except Exception as e:
+            log.warning("Healthcheck ping failed: %s", e)
+    log.info("Sentinel check engine complete.")
+
+
+if __name__ == "__main__":
+    main()

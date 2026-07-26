@@ -8,3 +8,6 @@ node_modules/
 .DS_Store
 credentials*.json
 service-account*.json
+__pycache__/
+sentinel/resolver/discovery_lib.py
+sentinel/resolver/llm.py

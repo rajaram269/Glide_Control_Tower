@@ -1,0 +1,456 @@
+"""
+Sentinel discovery — LLM module.
+
+Provider cascade (maker):   OpenAI → Gemini → Claude  (on error/timeout).
+Maker-checker:              for low-confidence or authority/dedup decisions, a
+                            *different* provider re-derives the same fields; agree
+                            → confirm, disagree → needs_review (non-blocking, §7.4).
+
+All calls are structured JSON output, validated against OVERLAY_SCHEMA before use.
+The prompt builder receives only a PII-safe payload (schema + stats + low-card
+DISTINCT samples). It has no path to raw rows; recruitment_hr is schema+stats only,
+asserted by the caller (see sample.py / main.py). — DATA_MONITOR_SPEC §10.3, §7.4
+"""
+import os, json, logging
+
+log = logging.getLogger(__name__)
+
+CONFIRM_THRESHOLD = float(os.environ.get("SENTINEL_CONFIRM_THRESHOLD", "0.80"))
+# Org default currency for money measures. The LLM cannot know currency from schema —
+# it must NOT guess (it hallucinated "USD" for Meta ad spend). Assume this unless a
+# column name/sample explicitly says otherwise (e.g. a currencyCode column, a *_usd name).
+DEFAULT_CURRENCY = os.environ.get("SENTINEL_DEFAULT_CURRENCY", "INR")
+
+# Provider order for the maker cascade. Each entry: (name, callable factory).
+# Checker uses the *next* provider in this list (different from the maker).
+_PROVIDER_ORDER = ["openai", "gemini", "anthropic"]
+
+# Fields the LLM fills. Deterministic source_type heuristics (main.py) may pre-fill
+# source_type; the LLM confirms/overrides only when the heuristic abstains.
+OVERLAY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "description": {"type": "object", "properties": {
+            "what_it_is":         {"type": "string"},
+            "purpose":            {"type": "string"},
+            "key_facts":          {"type": "array", "items": {"type": "string"}},
+            "when_to_use":        {"type": "string"},
+            "when_not_to_use":    {"type": "string"},
+            "computable_metrics": {"type": "array", "items": {"type": "string"}},
+            "not_computable":     {"type": "array", "items": {"type": "string"}},
+        }},
+        "summary":     {"type": "string"},
+        "grain":       {"type": "string"},
+        "concept":     {"type": "string"},
+        "source_type": {"type": "string"},
+        "scope":       {"type": ["string", "null"]},
+        "variables":   {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "column": {"type": "string"},
+                "role":   {"type": "string"},
+                "note":   {"type": ["string", "null"]},
+            },
+            "required": ["column", "role"],
+        }},
+        "relationships": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "to":      {"type": "string"},
+                "on":      {"type": "string"},
+                "purpose": {"type": ["string", "null"]},
+            },
+            "required": ["to", "on"],
+        }},
+        "quirks":       {"type": "array", "items": {"type": "string"}},
+        "monitor_frequency_weeks": {"type": "integer", "minimum": 1, "maximum": 4},
+        # How often the DATA is expected to update, in decimal weeks. Drives the
+        # freshness verdict (fresh <= this, stale <= 3x, dead beyond). Sub-week is
+        # expressible: daily = 0.1428, 2h = 0.0119, weekly = 1.0, monthly = 4.0.
+        "expected_cadence_weeks": {"type": "number", "minimum": 0.001, "maximum": 8},
+        "requires_dedup": {"type": "boolean"},
+        "dedup_method":   {"type": "string", "enum": ["argmax", "final", "none"]},
+        "dedup_key":      {"type": "array", "items": {"type": "string"}},
+        "authority_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "is_static":      {"type": "boolean"},
+        # The BUSINESS/event date column (SalesDate, order_date, posting_date, txn Date)
+        # — distinct from sync/CDC columns (_peerdb_synced_at, created_at-of-load). Drives
+        # DATA freshness ("is the data itself current", e.g. May data in July) as opposed
+        # to SYNC freshness ("is the pipeline running"). null if the table has no such
+        # business/event date (dimension/reference/snapshot tables).
+        "event_date_column": {"type": ["string", "null"]},
+    },
+    "required": [
+        "description", "summary", "grain", "concept", "source_type", "variables",
+        "monitor_frequency_weeks", "expected_cadence_weeks", "requires_dedup",
+        "dedup_method", "dedup_key", "authority_confidence", "is_static",
+    ],
+}
+
+_SYSTEM = (
+    "You are a data-catalog analyst. Given a ClickHouse table's schema, engine, and "
+    "PII-safe stats/samples, infer non-derivable metadata. Never invent column names "
+    "not present. If a name is fixable at source, still describe meaning. Return ONLY "
+    "JSON matching the given schema.\n"
+    "CRITICAL — trust EVIDENCE over column NAMES. A column's name is a claim, not a "
+    "fact; verify it against the aggregate stats before believing it:\n"
+    "  • A column named 'net'/'net_sales' with negatives≈0 (no returns represented) is "
+    "NOT true net — it is unadjusted GROSS mislabeled. Put this in not_computable "
+    "('net sales: <col> named net but negatives≈0, no returns/discount breakup, so true "
+    "net is NOT derivable') and do NOT list net in computable_metrics.\n"
+    "  • Net sales is only computable when returns/discounts are actually represented "
+    "(a returns/refund transaction type AND signed negatives, or an explicit discount "
+    "column). Cite the specific columns/stats that make it possible.\n"
+    "  • If the same-named measure has a very different magnitude than typical (e.g. an "
+    "avg orders-of-magnitude off), say so — it signals the column means something else.\n"
+    f"  • CURRENCY: money measures are in {DEFAULT_CURRENCY} by DEFAULT. Do NOT guess a "
+    f"currency from the platform or table name (e.g. do not assume Meta/ad spend is USD). "
+    f"State '{DEFAULT_CURRENCY}' unless a column name or sample explicitly indicates another "
+    f"currency (a currencyCode column, a name ending _usd/_eur, a currency symbol in "
+    f"samples). If a currencyCode column exists, say amounts are in the currency it "
+    f"specifies rather than naming one.\n"
+    "Be conservative with authority_confidence: it is "
+    "how sure you are this table is the single canonical source for its "
+    "(concept, scope, source_type). Set expected_cadence_weeks to how often the DATA "
+    "in this table is expected to update — infer from the table's purpose (a live "
+    "orders/inventory feed updates daily or faster ~0.02-0.14; a reference/lookup "
+    "table monthly ~4; marketing insight tables daily ~0.14). Decimal weeks: "
+    "daily=0.1428, hourly=0.006, weekly=1.0, monthly=4.0. This is the freshness "
+    "expectation, NOT how often to run the check."
+)
+
+
+# Exact output contract given to the model. Field names MUST match OVERLAY_SCHEMA —
+# without this the model invents its own keys (short_description, table_id, …) and
+# every validation fails, so discovery would skip every table.
+_OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact names):
+  "description": object — a CONCRETE, actionable description for a downstream
+      consumer (an LLM or service that must decide whether to query this table and
+      how to query it correctly). Be specific to THIS table's columns and data —
+      never generic. Object shape:
+        {
+          "what_it_is": string — one precise line naming exactly what a row represents
+                        and its origin system (e.g. "ERP accounts-payable ledger from
+                        Business Central, one row per posted AP entry"). Not "a table
+                        of records".
+          "purpose": string — the concrete business questions this table answers
+                     (e.g. "what we owe vendors, invoice aging, payables by vendor").
+          "key_facts": array of strings — the things a query author MUST know: the
+                       grain, update cadence, unit/currency of measures, dedup
+                       requirement, and any surprising column semantics. 3-6 bullets,
+                       each specific (e.g. "amounts are in INR", "requires dedup on
+                       (id,entryNo) via ReplacingMergeTree or rows double-count",
+                       "status columns are booleans, not lifecycle stages").
+          "when_to_use": string — the questions/joins this table is the RIGHT source for.
+          "when_not_to_use": string — concrete traps: wrong-source cases, what breaks
+                       if you skip dedup, columns that look useful but aren't.
+          "computable_metrics": array of strings — metrics this table CAN correctly
+                       compute, each with WHY it's possible from the actual columns/stats
+                       (e.g. "net sales: has Transaction_type/Final_Transaction_type
+                       returns and signed negatives, so returns/discounts net out"; or
+                       "gross sales, quantity, MRP"). MAY be empty [] for a pure
+                       reference/lookup/dimension table that holds no measures.
+          "not_computable": array of strings — metrics that CANNOT be correctly computed
+                       here and WHY, especially where a column NAME is misleading (e.g.
+                       "net sales: the 'Net sales' column is unadjusted gross — no return
+                       or discount breakup (negatives ~0), so true net is NOT derivable").
+                       Empty array if none. This is the most important field for choosing
+                       between two same-concept tables — be precise and evidence-based.
+        }
+      Ground every field in the actual columns/engine/samples/measure-stats provided.
+      Use the measure stats to decide computable vs not_computable (negatives present =
+      returns representable = net derivable; magnitude tells gross from net). If you are
+      unsure of a fact, say so briefly rather than inventing specifics.
+  "summary": string — ONE line, derived from description.what_it_is, for compact lists
+  "grain": string — precise "one row per ..." (name the business key, e.g.
+      "one row per AP entry, keyed by (id, entryNo)")
+  "concept": string — business concept (sales, inventory, spend, orders, ...)
+  "source_type": string — one of: erp, sales_channel, perf_marketing, web_analytics, warehouse_ops, finance, reference, derived
+  "scope": string or null — business subset (B2B, B2C, a brand) or null
+  "variables": array of {"column": string, "role": string, "note": string or null}.
+      role is one of: segment, measure, key, timestamp, other.
+      Label "segment" GENEROUSLY for any categorical dimension a stakeholder would
+      group/filter reporting by, with a small stable value set (~2-50 distinct). This
+      includes not just brand/channel/region/category/division/customer_type but also
+      ERP dimension codes: document_type, currency_code, posting_group, source_code,
+      payment_method_code, transaction_type, account_type/category, dimension1/2 code,
+      state/jurisdiction, status/type enums with a few values. When unsure whether a
+      low-cardinality categorical is a segment, LABEL IT segment — under-labelling
+      leaves useful tables with zero monitored variables (a real problem on ERP/ledger
+      tables). Aim to surface the 3 most monitoring-worthy segments even on wide tables.
+      Do NOT label as segment: unique identifiers (id, entryNo, sku, order_name,
+      customer_id, document_no), free-text or high-cardinality strings (names, titles,
+      city, postal_code, narration), monetary/numeric measures, timestamps, or
+      CDC/technical columns (_peerdb*, _sign, _version).
+      Those get role measure / key / timestamp / other.
+      ORDER variables by monitoring priority — most important business segments FIRST
+      (brand/channel/region/currency before minor enums). Only the top few are monitored.
+  "relationships": array of {"to": "db.table", "on": "column", "purpose": string or null}
+  "quirks": array of strings (may be empty)
+  "monitor_frequency_weeks": integer 1-4 — how often to RUN the check
+  "expected_cadence_weeks": number — how often the DATA updates (decimal: daily=0.1428, hourly=0.006, weekly=1.0, monthly=4.0)
+  "requires_dedup": boolean — true for ReplacingMergeTree / CDC tables
+  "dedup_method": string — one of: argmax, final, none
+  "dedup_key": array of strings — business key columns (empty if none)
+  "authority_confidence": number 0.0-1.0
+  "is_static": boolean — true if this table is INTENTIONALLY frozen: a fixed
+      reference/lookup/master loaded once and rarely or never refreshed (e.g. a pincode
+      master, country list, chart-of-accounts), with no event/transaction timestamp that
+      should keep advancing. false for any table that receives ongoing rows (sales,
+      orders, marketing insights, inventory snapshots). When true, freshness will not be
+      alarmed on this table.
+  "event_date_column": string or null — the column holding the BUSINESS/EVENT DATE of
+      each row (SalesDate, order_date, posting_date, invoice_date, transaction Date, the
+      period a marketing-insight row is for). This is the date the DATA is ABOUT — used
+      to detect stale business data (e.g. a sales table whose newest SalesDate is May
+      even though it synced today). It is DIFFERENT from sync/load columns
+      (_peerdb_synced_at, created_at/updated_at that record when the row was loaded, not
+      when the business event happened). Pick the single most representative event date.
+      Use null if the table has no such business/event date (dimension/reference/master/
+      snapshot tables). Must be an actual column name present in the schema.
+Do not add, rename, or omit keys. Do not wrap in markdown."""
+
+
+def _evidence_block(payload):
+    """The table facts (schema/samples/stats) — shared by discovery + adjudicator."""
+    return (
+        f"Table: {payload['database_name']}.{payload['table_name']}\n"
+        f"Engine: {payload.get('engine')}\n"
+        f"ORDER BY / sorting key: {payload.get('sorting_key')}\n"
+        f"Approx rows: {payload.get('total_rows')}\n"
+        f"Columns (name: type):\n"
+        + "\n".join(f"  {c['name']}: {c['type']}" for c in payload["columns"])
+        + "\n\nLow-cardinality sample values (PII-safe only):\n"
+        + json.dumps(payload.get("samples", {}), ensure_ascii=False)
+        + "\n\nAggregate stats for measure columns (sum/avg/min/max/negatives over the "
+          "whole column — use these to judge WHAT a measure really is and what can be "
+          "computed). A 'negatives' count > 0 means returns/refunds are represented, so "
+          "a net figure is derivable; negatives ~0 means returns are absent (likely "
+          "gross-only). Very different magnitudes for a same-named measure across tables "
+          "mean they are NOT the same metric.\n"
+        + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+    )
+
+
+def _prompt(payload, system=None, output_spec=None):
+    """Discovery prompt by default. Pass system+output_spec to build a different task
+    (the adjudicator) over the SAME evidence, without the discovery output schema
+    leaking in (which made the model return discovery keys, not adjudication keys)."""
+    return (f"{system or _SYSTEM}\n\n" + _evidence_block(payload)
+            + "\n\n" + (output_spec or _OUTPUT_SPEC))
+
+
+# ─── Provider callables ───────────────────────────────────────────────────────
+# Each returns a dict (parsed JSON) or raises. Lazy imports so a missing SDK for
+# one provider doesn't break the others.
+
+def _call_openai(prompt):
+    from openai import OpenAI
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    resp = client.chat.completions.create(
+        model=os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0,
+        timeout=60,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+def _call_gemini(prompt):
+    from google import genai
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    resp = client.models.generate_content(
+        model=os.environ.get("SENTINEL_GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=prompt + "\n\nRespond with a single JSON object only, no markdown.",
+        config={"response_mime_type": "application/json", "temperature": 0},
+    )
+    return json.loads(resp.text)
+
+
+def _call_anthropic(prompt):
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    msg = client.messages.create(
+        model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        max_tokens=2048,   # 1024 truncated the full discovery JSON → unterminated string
+        temperature=0,
+        messages=[{"role": "user", "content": prompt + "\n\nReturn a single JSON object only."}],
+    )
+    text = msg.content[0].text.strip()
+    # strip a ```json fence if present
+    if text.startswith("```"):
+        text = text.split("```", 2)[1].lstrip("json").strip()
+    return json.loads(text)
+
+
+_CALLERS = {"openai": _call_openai, "gemini": _call_gemini, "anthropic": _call_anthropic}
+
+
+def _validate(obj):
+    """Minimal structural validation — required keys present + basic types.
+    Kept dependency-free (no jsonschema) to match the repo's thin style."""
+    for k in OVERLAY_SCHEMA["required"]:
+        if k not in obj:
+            raise ValueError(f"missing required field: {k}")
+    desc = obj["description"]
+    if not isinstance(desc, dict):
+        raise ValueError("description must be an object")
+    for dk in ("what_it_is", "purpose", "when_to_use", "when_not_to_use"):
+        if not (isinstance(desc.get(dk), str) and desc.get(dk).strip()):
+            raise ValueError(f"description.{dk} must be a non-empty string")
+    if not isinstance(desc.get("key_facts"), list) or not desc["key_facts"]:
+        raise ValueError("description.key_facts must be a non-empty array")
+    # both may be empty: a pure reference/lookup table has no computable metrics,
+    # and a complete table has nothing in not_computable. Only require the arrays exist.
+    if not isinstance(desc.get("computable_metrics"), list):
+        raise ValueError("description.computable_metrics must be an array")
+    if not isinstance(desc.get("not_computable"), list):
+        raise ValueError("description.not_computable must be an array")
+    if not isinstance(obj["variables"], list):
+        raise ValueError("variables must be a list")
+    if obj["dedup_method"] not in ("argmax", "final", "none"):
+        raise ValueError(f"bad dedup_method: {obj['dedup_method']}")
+    w = obj["monitor_frequency_weeks"]
+    if not (isinstance(w, int) and 1 <= w <= 4):
+        raise ValueError(f"monitor_frequency_weeks out of range: {w}")
+    ec = obj["expected_cadence_weeks"]
+    if not (isinstance(ec, (int, float)) and 0.001 <= ec <= 8):
+        raise ValueError(f"expected_cadence_weeks out of range: {ec}")
+    if not isinstance(obj["is_static"], bool):
+        raise ValueError(f"is_static must be boolean: {obj['is_static']}")
+    edc = obj.get("event_date_column")  # optional; null when no business date
+    if edc is not None and not isinstance(edc, str):
+        raise ValueError(f"event_date_column must be string or null: {edc}")
+    obj.setdefault("event_date_column", None)
+    return obj
+
+
+def _run(provider, prompt):
+    """One provider call + validation, retrying invalid JSON once."""
+    caller = _CALLERS[provider]
+    for attempt in (1, 2):
+        try:
+            return _validate(caller(prompt))
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning("%s returned invalid output (attempt %d): %s", provider, attempt, e)
+    raise RuntimeError(f"{provider} failed validation twice")
+
+
+def infer_overlay(payload):
+    """Maker: try providers in order; return (result, maker_provider).
+    Raises RuntimeError only if ALL providers fail."""
+    last_err = None
+    for provider in _PROVIDER_ORDER:
+        try:
+            return _run(provider, _prompt(payload)), provider
+        except Exception as e:
+            last_err = e
+            log.warning("maker %s failed, falling through: %s", provider, e)
+    raise RuntimeError(f"all LLM providers failed: {last_err}")
+
+
+def check(payload, maker_result, maker_provider, skip_source_type=False):
+    """Maker-checker: a DIFFERENT provider re-derives the fields. Returns
+    (agree: bool, checker_provider|None, reason:str).
+
+    Only MATERIAL disagreements matter — the two things that actually make a
+    consumer's answer wrong: source_type (drives which table is picked) and the
+    dedup requirement (drives correctness). Concept/scope WORDING and exact
+    dedup_key column lists differ harmlessly between models ('finance' vs 'spend')
+    and must NOT flag review. When skip_source_type is set (a deterministic name
+    heuristic already fixed source_type authoritatively), source_type is excluded
+    too — else the checker's free guess always 'disagrees' and flags every table.
+    Returns (True, None, '') when no other provider is available."""
+    # ERP-family source types are selection-equivalent for a consumer (all ERP origin);
+    # two models picking different labels within the family is not a material conflict.
+    _ERP_FAMILY = {"erp", "finance", "warehouse_ops"}
+    def _same_source(a, b):
+        return a == b or ({a, b} <= _ERP_FAMILY)
+
+    checkers = [p for p in _PROVIDER_ORDER if p != maker_provider]
+    for provider in checkers:
+        try:
+            other = _run(provider, _prompt(payload))
+        except Exception as e:
+            log.warning("checker %s failed: %s", provider, e)
+            continue
+        reasons = []
+        if not skip_source_type and not _same_source(other["source_type"], maker_result["source_type"]):
+            reasons.append(f"source_type: {maker_provider}={maker_result['source_type']} "
+                           f"vs {provider}={other['source_type']}")
+        if bool(other["requires_dedup"]) != bool(maker_result["requires_dedup"]):
+            reasons.append(f"requires_dedup: {maker_provider}={maker_result['requires_dedup']} "
+                           f"vs {provider}={other['requires_dedup']}")
+        return (not reasons), provider, "; ".join(reasons)
+    return True, None, ""
+
+
+def needs_review(maker_result, checker_agreed):
+    """Confidence gate (§7.4): needs_review if low confidence OR the checker
+    materially disagreed (source_type / dedup — see check())."""
+    conf = float(maker_result.get("authority_confidence") or 0)
+    return conf < CONFIRM_THRESHOLD or not checker_agreed
+
+
+# ─── Adjudicator (auto-resolver) ──────────────────────────────────────────────
+
+RESOLVE_THRESHOLD = float(os.environ.get("SENTINEL_RESOLVE_THRESHOLD", "0.75"))
+
+_ADJUDICATE_SCHEMA_KEYS = ("source_type", "requires_dedup", "dedup_method", "dedup_key",
+                           "concept", "confidence", "reasoning")
+
+
+def adjudicate(payload, current, review_reason):
+    """A THIRD model re-examines a needs_review table with the disagreement made
+    explicit + the actual evidence, and decides the correctness-critical fields.
+    Uses the provider NOT already reflected in `current` when possible (adjudicator
+    diversity). Returns a dict {source_type, requires_dedup, dedup_method, dedup_key,
+    concept, confidence, reasoning} or raises. The caller auto-confirms only when
+    confidence >= RESOLVE_THRESHOLD."""
+    system = (
+        "You are adjudicating a data-catalog disagreement. Two earlier analyses were not "
+        "fully certain about this table. Re-examine it from the schema, engine, PII-safe "
+        "samples and measure stats below, and decide the CORRECTNESS-CRITICAL fields. "
+        "Trust evidence over names.\n"
+        f"Why this was flagged: {review_reason or 'the two models were not fully certain'}\n"
+        f"Earlier best guess: source_type={current.get('source_type')}, "
+        f"concept={current.get('concept')}, requires_dedup={current.get('requires_dedup')}, "
+        f"dedup_key={current.get('dedup_key')}.\n"
+        "Note: erp / finance / warehouse_ops are all ERP-origin and often interchangeable "
+        "for selection — only distinguish them if the evidence is clear."
+    )
+    output_spec = (
+        "Return ONLY a JSON object with EXACTLY these keys (no others, no markdown):\n"
+        '  "source_type": one of erp, sales_channel, perf_marketing, web_analytics, '
+        "warehouse_ops, finance, reference, derived\n"
+        '  "concept": business concept (sales, spend, inventory, orders, reference, ...)\n'
+        '  "requires_dedup": boolean (true for ReplacingMergeTree/CDC tables)\n'
+        '  "dedup_method": one of argmax, final, none\n'
+        '  "dedup_key": array of business-key column names present in the schema\n'
+        '  "confidence": number 0.0-1.0 — how sure you are; be honest, low if ambiguous\n'
+        '  "reasoning": one or two SHORT sentences citing the evidence (keep it brief to '
+        "avoid truncation)."
+    )
+    prompt = _prompt(payload, system=system, output_spec=output_spec)
+
+    # prefer a provider that is likely NOT the maker/checker of the original
+    for provider in _PROVIDER_ORDER:
+        try:
+            caller = _CALLERS[provider]
+            for attempt in (1, 2):
+                try:
+                    obj = caller(prompt)
+                    # light validation
+                    if not isinstance(obj.get("source_type"), str) or "confidence" not in obj:
+                        raise ValueError("missing required adjudication keys")
+                    obj["dedup_key"] = obj.get("dedup_key") or []
+                    obj["confidence"] = float(obj.get("confidence") or 0)
+                    obj["_adjudicator"] = provider
+                    return obj
+                except (json.JSONDecodeError, ValueError) as e:
+                    log.warning("adjudicator %s bad output (try %d): %s", provider, attempt, e)
+        except Exception as e:
+            log.warning("adjudicator %s failed: %s", provider, e)
+    raise RuntimeError("all adjudicator providers failed")

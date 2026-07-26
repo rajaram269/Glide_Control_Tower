@@ -39,13 +39,15 @@ def pg_connect():
 def collect_gcp_costs(bq_client):
     """Queries GCP BigQuery billing export for yesterday's costs per service."""
     rows = []
+    # Billing account currency is INR; currency_conversion_rate is USD→local,
+    # so divide to get USD. Table is the detailed/resource export.
     query = f"""
         SELECT
             service.description AS service_name,
-            SUM(cost) AS cost_usd,
+            SUM(cost / currency_conversion_rate) AS cost_usd,
             SUM(usage.amount) AS units,
             MAX(usage.unit) AS unit_type
-        FROM `{BQ_BILLING_DATASET}.gcp_billing_export_v1_*`
+        FROM `{BQ_BILLING_DATASET}.gcp_billing_export_resource_v1_*`
         WHERE DATE(usage_start_time) = '{YESTERDAY}'
           AND cost > 0
         GROUP BY service.description
@@ -103,7 +105,8 @@ def collect_aws_costs():
 
 
 def collect_clickhouse_costs():
-    """ClickHouse Cloud organization API for daily usage."""
+    """ClickHouse Cloud organization API — /usageCost endpoint (verified live).
+    Returns cost in CHC (ClickHouse Credits, ≈1 USD each on standard contracts)."""
     rows = []
     if not CH_CLOUD_API_KEY:
         return rows
@@ -118,81 +121,95 @@ def collect_clickhouse_costs():
         org_id = resp.json()["result"][0]["id"]
 
         usage_resp = requests.get(
-            f"https://api.clickhouse.cloud/v1/organizations/{org_id}/usages",
+            f"https://api.clickhouse.cloud/v1/organizations/{org_id}/usageCost",
             auth=(CH_CLOUD_API_KEY, CH_CLOUD_API_SECRET),
-            params={"from": str(YESTERDAY), "to": str(TODAY)},
+            params={"from_date": str(YESTERDAY), "to_date": str(YESTERDAY)},
             timeout=15,
         )
         usage_resp.raise_for_status()
-        data = usage_resp.json()
-        total_cost = data.get("result", {}).get("totalCostUSD", 0)
+        data = usage_resp.json().get("result", {})
+        total = float(data.get("grandTotalCHC", 0))
         rows.append({
             "cost_source": "clickhouse_cloud",
             "resource_name": "*",
-            "cost_usd": float(total_cost),
-            "units_consumed": None,
-            "unit_type": "USD",
+            "cost_usd": total,
+            "units_consumed": total,
+            "unit_type": "CHC",
         })
-        log.info("ClickHouse Cloud cost: $%.4f", total_cost)
+        log.info("ClickHouse Cloud cost: %.3f CHC", total)
     except Exception as e:
         log.warning("ClickHouse Cloud API failed: %s", e)
     return rows
 
 
 def collect_openai_costs():
+    """OpenAI costs endpoint — requires an ADMIN API key (sk-admin...).
+    Project keys return empty/403 on org endpoints; skip with a clear log."""
     rows = []
     if not OPENAI_API_KEY:
         return rows
     try:
+        start_ts = int(datetime.datetime.combine(
+            YESTERDAY, datetime.time.min, tzinfo=datetime.timezone.utc).timestamp())
         resp = requests.get(
-            "https://api.openai.com/v1/usage",
+            "https://api.openai.com/v1/organization/costs",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            params={"date": str(YESTERDAY)},
+            params={"start_time": start_ts, "limit": 1},
             timeout=15,
         )
+        if resp.status_code in (401, 403):
+            log.info("OpenAI costs skipped: needs Admin API key with api.usage.read scope "
+                     "(platform.openai.com → Settings → Admin keys). Current key lacks access.")
+            return rows
         resp.raise_for_status()
         data = resp.json()
-        # Aggregate by model
-        model_costs = {}
-        for item in data.get("data", []):
-            model = item.get("snapshot_id", "unknown")
-            cost = float(item.get("cost", 0)) / 100  # OpenAI returns in cents
-            model_costs[model] = model_costs.get(model, 0) + cost
-        for model, cost in model_costs.items():
-            if cost > 0:
-                rows.append({
-                    "cost_source": "openai",
-                    "resource_name": model,
-                    "cost_usd": cost,
-                    "units_consumed": None,
-                    "unit_type": "USD",
-                })
-        log.info("OpenAI costs: %d models", len(rows))
+        total_cost = 0.0
+        for bucket in data.get("data", []):
+            for item in bucket.get("results", []):
+                total_cost += float(item.get("amount", {}).get("value", 0))
+        if total_cost > 0:
+            rows.append({
+                "cost_source": "openai",
+                "resource_name": "*",
+                "cost_usd": total_cost,
+                "units_consumed": None,
+                "unit_type": "USD",
+            })
+        log.info("OpenAI cost: $%.4f", total_cost)
     except Exception as e:
-        log.warning("OpenAI usage API failed: %s", e)
+        log.warning("OpenAI costs API failed: %s", e)
     return rows
 
 
 def collect_anthropic_costs():
+    """Anthropic cost report — requires an ADMIN API key (sk-ant-admin...).
+    Regular API keys (sk-ant-api...) cannot read org usage; skip with a clear log."""
     rows = []
     if not ANTHROPIC_API_KEY:
         return rows
+    if not ANTHROPIC_API_KEY.startswith("sk-ant-admin"):
+        log.info("Anthropic costs skipped: needs Admin API key (sk-ant-admin...), "
+                 "current key is a regular API key. Create one at console.anthropic.com → Settings → Admin keys.")
+        return rows
     try:
         resp = requests.get(
-            "https://api.anthropic.com/v1/usage",
+            "https://api.anthropic.com/v1/organizations/cost_report",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
             },
-            params={"start_date": str(YESTERDAY), "end_date": str(TODAY)},
+            params={
+                "starting_at": f"{YESTERDAY}T00:00:00Z",
+                "ending_at": f"{TODAY}T00:00:00Z",
+            },
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
-        total_cost = sum(
-            float(item.get("cost_usd", 0))
-            for item in data.get("usage", [])
-        )
+        total_cost = 0.0
+        for bucket in data.get("data", []):
+            for item in bucket.get("results", []):
+                total_cost += float(item.get("amount", 0))
         if total_cost > 0:
             rows.append({
                 "cost_source": "anthropic",
@@ -203,7 +220,7 @@ def collect_anthropic_costs():
             })
         log.info("Anthropic cost: $%.4f", total_cost)
     except Exception as e:
-        log.warning("Anthropic usage API failed: %s", e)
+        log.warning("Anthropic cost report failed: %s", e)
     return rows
 
 
