@@ -32,14 +32,32 @@ FRESHNESS_MECHANISM = os.environ.get("SENTINEL_FRESHNESS", "auto")  # auto|syste
 NOW = datetime.datetime.now(datetime.timezone.utc)
 ADVISORY_LOCK_KEY = 0x53454E43  # "SENC"
 
+# Reconciliation is the expensive phase (whole-table dedup'd scans in ClickHouse). Cap
+# how many tables' recon we run per tick so a big backlog can't run the job past its
+# task-timeout; the rest are picked up on later ticks. Phase-1 checks are uncapped
+# (they're cheap metadata reads).
+MAX_RECON_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_RECON_TABLES_PER_RUN", "40"))
+
 
 def pg_connect():
     return psycopg2.connect(PG_CONN)
 
 
+# Hard per-query ceilings. Without these, one slow reconciliation query (a big table,
+# a bad join) leaves the Python client blocked on the ClickHouse socket while holding
+# an open Postgres transaction — the whole daily check wedges (seen in prod: a single
+# recon query on a large table hung the run for minutes with zero progress). A query
+# that exceeds the ceiling raises, we log + mark that check 'warn', and move on.
+CH_MAX_EXECUTION_SECONDS = int(os.environ.get("SENTINEL_CH_QUERY_TIMEOUT", "45"))
+
+
 def ch_connect():
     return clickhouse_connect.get_client(
-        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True
+        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True,
+        # server-side wall-clock cap + client socket read timeout (a touch higher so the
+        # server's own timeout error surfaces instead of a bare socket timeout)
+        settings={"max_execution_time": CH_MAX_EXECUTION_SECONDS},
+        send_receive_timeout=CH_MAX_EXECUTION_SECONDS + 15,
     )
 
 
@@ -562,6 +580,29 @@ def run_recon_checks(cur, ch, target):
             resolve_incident_if_open(cur, {**target, "variable": f"rule:{rule_id}"}, "reconciliation")
 
 
+def _recon_priority(cur, table_keys):
+    """Order the given (db, table) keys so the tables whose recon rules were checked
+    longest ago come first (round-robin across capped ticks). Tables with no anchoring
+    rules — nothing to reconcile — sort last and are effectively skipped by the cap."""
+    if not table_keys:
+        return []
+    keys = list(table_keys)
+    # min(updated_at) over rules anchored on each table; NULL (no rules) sorts last.
+    cur.execute(
+        """SELECT split_part(split_part(source_a,'#',1),'::',1) AS src, min(updated_at) AS oldest
+           FROM sentinel.reconciliation_rules
+           WHERE status IN ('observe','active')
+           GROUP BY 1""")
+    oldest = {}
+    for src, ts in cur.fetchall():
+        # src is 'db.table' — map back to the (db, table) tuple form
+        d, _, t = src.partition(".")
+        oldest[(d, t)] = ts
+    from datetime import timezone as _tz
+    far_future = datetime.datetime.max.replace(tzinfo=_tz.utc)
+    return sorted(keys, key=lambda k: oldest.get(k) or far_future)
+
+
 def roll_up_incidents(cur):
     """Suppress floods: when >=3 open, unparented table-level incidents share a
     database_name, group them under a synthetic per-database parent so the alert
@@ -625,18 +666,19 @@ def main():
             targets = due_targets(cur)
             log.info("%d due targets", len(targets))
 
-            # Freshness/volume/schema_drift and reconciliation all anchor on a TABLE,
-            # not a variable — run each once per table even when several of that table's
-            # variable targets are due this pass. Only coverage runs per variable target.
+            # ── PHASE 1: fast checks (freshness/volume/schema/coverage) ──
+            # These are cheap metadata reads (system.parts, system.columns) — a few ms
+            # each. Run them for ALL due targets first and advance their schedule, so a
+            # tick ALWAYS completes the freshness/volume story even if reconciliation
+            # (phase 2) is slow. freshness/volume/schema anchor on the TABLE (run once
+            # per table, variable=''); coverage runs per variable target.
             table_done = set()
             for target in targets:
                 tbl_key = (target["database_name"], target["table_name"])
                 if tbl_key not in table_done:
                     run_table_checks(cur, ch, target)
-                    run_recon_checks(cur, ch, target)
                     table_done.add(tbl_key)
                 run_variable_checks(cur, ch, target)
-                # advance schedule
                 cur.execute(
                     """UPDATE sentinel.monitor_targets
                        SET last_checked_at = now(),
@@ -645,9 +687,30 @@ def main():
                     (target["id"],),
                 )
                 ran += 1
-                # Commit per target: results/incidents show live and a timeout never
-                # loses completed checks (next_due_at is advanced so they aren't re-run
-                # this cycle). Advisory lock is session-scoped, survives commits.
+                pg.commit()   # per-target: live + timeout-safe (lock survives commits)
+
+            # ── PHASE 2: reconciliation (expensive) ──
+            # Recon sums/counts whole tables in ClickHouse (dedup'd), sometimes dozens of
+            # scans per table — orders of magnitude slower than phase 1. Running it inline
+            # per target (as before) let one heavy table's recon block the per-target
+            # commit and starve every remaining table's freshness check — the whole daily
+            # tick wedged with zero results. So: run it AFTER phase 1 (checks already
+            # durable), bound it to MAX_RECON_TABLES_PER_RUN tables/tick, and commit per
+            # table. Remaining tables' recon is picked up over subsequent ticks; the
+            # per-query CH timeout in ch_connect() caps any single slow scan.
+            # Rotate: reconcile the tables whose rules were checked longest ago first, so
+            # over successive capped ticks every table's recon runs (rather than always
+            # re-doing the same first 40). Rule updated_at advances when recon runs.
+            recon_order = _recon_priority(cur, table_done)
+            recon_ran = 0
+            for tbl_key in recon_order:
+                if recon_ran >= MAX_RECON_TABLES_PER_RUN:
+                    log.info("Recon cap reached (%d tables); rest next tick.",
+                             MAX_RECON_TABLES_PER_RUN)
+                    break
+                run_recon_checks(cur, ch, {"database_name": tbl_key[0], "table_name": tbl_key[1],
+                                           "monitor_frequency_weeks": 1})
+                recon_ran += 1
                 pg.commit()
 
             roll_up_incidents(cur)

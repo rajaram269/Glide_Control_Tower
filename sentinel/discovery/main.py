@@ -66,9 +66,17 @@ def pg_connect():
     return psycopg2.connect(PG_CONN)
 
 
+# Hard per-query ceiling so one slow introspection/stat query can't wedge the run
+# (see check_engine for the failure mode). Discovery already commits per table, so a
+# raised query just skips that table; the next run retries it.
+CH_MAX_EXECUTION_SECONDS = int(os.environ.get("SENTINEL_CH_QUERY_TIMEOUT", "45"))
+
+
 def ch_connect():
     return clickhouse_connect.get_client(
-        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True
+        host=CH_HOST, user=CH_USER, password=CH_PASS, port=8443, secure=True,
+        settings={"max_execution_time": CH_MAX_EXECUTION_SECONDS},
+        send_receive_timeout=CH_MAX_EXECUTION_SECONDS + 15,
     )
 
 
