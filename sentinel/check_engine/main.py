@@ -502,19 +502,26 @@ def due_targets(pg_cur):
     ]
 
 
-# Table-level checks (run once per target). Reconciliation is per-rule (handled
-# separately). Coverage only fires for variable targets. Each entry: (check_type, fn)
-# where fn(ch, pg_cur, target) -> (status, observed).
-SINGLE_CHECKS = [
+# Two kinds of check:
+#  TABLE-level  — a property of the TABLE (freshness, volume, schema drift). Runs ONCE
+#                 per table, regardless of how many variable targets it has. Written with
+#                 variable='' so the incident scope is the table, not a variable.
+#  VARIABLE-level — coverage of one segmentation dimension. Runs per variable target.
+# Running table-level checks per variable target (as before) fired N duplicate incidents
+# and N duplicate alert emails for a single table with N tracked variables — a table with
+# 4 variables sent 4 identical "freshness stale" emails. Split them.
+TABLE_CHECKS = [
     ("freshness", lambda ch, cur, t: check_freshness(ch, t)),
     ("volume", check_volume),
     ("schema_drift", check_schema_drift),
+]
+VARIABLE_CHECKS = [
     ("variable_coverage", check_variable_coverage),
 ]
 
 
-def run_single_checks(cur, ch, target):
-    for check_type, fn in SINGLE_CHECKS:
+def _run_checks(cur, ch, target, checks):
+    for check_type, fn in checks:
         t0 = datetime.datetime.now(datetime.timezone.utc)
         try:
             status, observed = fn(ch, cur, target)
@@ -527,6 +534,19 @@ def run_single_checks(cur, ch, target):
             open_or_update_incident(cur, target, check_type, status, observed, crid)
         else:
             resolve_incident_if_open(cur, target, check_type)
+
+
+def run_table_checks(cur, ch, target):
+    """Freshness/volume/schema_drift — table properties. Force variable='' so the
+    check_result + incident scope is the TABLE (one per table, not one per variable)."""
+    _run_checks(cur, ch, {**target, "variable": ""}, TABLE_CHECKS)
+
+
+def run_variable_checks(cur, ch, target):
+    """Coverage — genuinely per variable. No-op for the table-level ('') target."""
+    if not target.get("variable"):
+        return
+    _run_checks(cur, ch, target, VARIABLE_CHECKS)
 
 
 def run_recon_checks(cur, ch, target):
@@ -555,14 +575,34 @@ def roll_up_incidents(cur):
         HAVING count(*) >= 3
     """)
     for db, ids in cur.fetchall():
+        # Reuse an already-open rollup parent for this db — else every run that finds
+        # ≥3 fresh unparented incidents spawns ANOTHER parent, and the parents pile up
+        # (seen in prod: same db, multiple open 'rollup' incidents). One parent per db.
         cur.execute(
-            """INSERT INTO sentinel.incidents
-               (opened_at, scope, scope_level, check_type, severity, message, rolled_up_children)
-               VALUES (now(), %s, 'schema', 'rollup', 'warn', %s, %s)
-               RETURNING id""",
-            (Json({"database_name": db}), f"{len(ids)} open incidents in {db}", len(ids)),
+            """SELECT id, rolled_up_children FROM sentinel.incidents
+               WHERE resolved_at IS NULL AND check_type = 'rollup'
+                 AND scope->>'database_name' = %s
+               ORDER BY opened_at LIMIT 1""",
+            (db,),
         )
-        parent_id = cur.fetchone()[0]
+        existing = cur.fetchone()
+        if existing:
+            parent_id, prior = existing[0], existing[1] or 0
+            cur.execute(
+                """UPDATE sentinel.incidents
+                   SET rolled_up_children = %s, message = %s
+                   WHERE id = %s""",
+                (prior + len(ids), f"{prior + len(ids)} open incidents in {db}", parent_id),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO sentinel.incidents
+                   (opened_at, scope, scope_level, check_type, severity, message, rolled_up_children)
+                   VALUES (now(), %s, 'schema', 'rollup', 'warn', %s, %s)
+                   RETURNING id""",
+                (Json({"database_name": db}), f"{len(ids)} open incidents in {db}", len(ids)),
+            )
+            parent_id = cur.fetchone()[0]
         cur.execute(
             "UPDATE sentinel.incidents SET parent_incident_id = %s WHERE id = ANY(%s)",
             (parent_id, ids),
@@ -585,15 +625,17 @@ def main():
             targets = due_targets(cur)
             log.info("%d due targets", len(targets))
 
-            # Reconciliation rules anchor on a table, not a variable — run them once
-            # per table even when several of its variable targets are due this pass.
-            recon_done = set()
+            # Freshness/volume/schema_drift and reconciliation all anchor on a TABLE,
+            # not a variable — run each once per table even when several of that table's
+            # variable targets are due this pass. Only coverage runs per variable target.
+            table_done = set()
             for target in targets:
-                run_single_checks(cur, ch, target)
                 tbl_key = (target["database_name"], target["table_name"])
-                if tbl_key not in recon_done:
+                if tbl_key not in table_done:
+                    run_table_checks(cur, ch, target)
                     run_recon_checks(cur, ch, target)
-                    recon_done.add(tbl_key)
+                    table_done.add(tbl_key)
+                run_variable_checks(cur, ch, target)
                 # advance schedule
                 cur.execute(
                     """UPDATE sentinel.monitor_targets

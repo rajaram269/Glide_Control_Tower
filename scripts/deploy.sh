@@ -5,7 +5,7 @@
 #
 # What it does:
 #   1. Preflight — verify required secrets exist (LLM keys; SES optional)
-#   2. Migrations — apply 011–014 (sentinel schema) via cloud-sql-proxy
+#   2. Migrations — apply 011–017 (sentinel schema) via cloud-sql-proxy
 #   3. Build + deploy the two Sentinel Cloud Run jobs
 #   4. Create the two Cloud Scheduler triggers
 #   5. Redeploy the UI (Atlas-styled, new /api/sentinel/* endpoints)
@@ -51,7 +51,7 @@ done
 
 # ── 2. Migrations 011–014 ─────────────────────────────────────────────────
 echo ""
-echo "[2/6] Applying migrations (011–014, sentinel schema)..."
+echo "[2/6] Applying migrations (011–017, sentinel schema)..."
 PG_CONN=$(gcloud secrets versions access latest --secret=ct-pg-connection-string --project="$PROJECT")
 PG_PW=$(echo "$PG_CONN" | grep -oE '(:)[^:@]+(@)' | head -1 | tr -d ':@')
 
@@ -74,7 +74,8 @@ LOCAL="postgresql://agenteye_app:${PG_PW}@127.0.0.1:${PROXY_PORT}/control_tower"
 # sanity: confirm we're actually on control_tower via the proxy before mutating
 psql "$LOCAL" -tc "SELECT current_database()" | grep -q control_tower \
   || { echo "ERROR: not connected to control_tower via proxy" >&2; exit 1; }
-for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql; do
+for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql \
+         migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql; do
   echo "  → $m"
   psql "$LOCAL" -v ON_ERROR_STOP=1 -qf "$m"
 done
