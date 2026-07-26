@@ -251,7 +251,7 @@ def sentinel_summary():
             SELECT
                 (SELECT COUNT(*) FROM sentinel.catalog_overlay WHERE retired = false) AS tables_cataloged,
                 (SELECT COUNT(*) FROM sentinel.catalog_overlay
-                 WHERE retired = false AND (conflict_type <> 'none' OR review_status = 'needs_review')) AS needs_review,
+                 WHERE retired = false AND review_status = 'needs_review') AS needs_review,
                 (SELECT COUNT(*) FROM sentinel.incidents WHERE resolved_at IS NULL) AS open_incidents,
                 (SELECT COUNT(*) FROM sentinel.reconciliation_rules WHERE status = 'active') AS active_rules,
                 (SELECT COUNT(*) FROM sentinel.monitor_targets WHERE status = 'active') AS active_targets
@@ -300,7 +300,11 @@ def sentinel_catalog():
 
 @app.get("/api/sentinel/review-queue")
 def sentinel_review_queue():
-    """The §7.2.5 safety gate made visible: conflicts + needs_review rows."""
+    """Rows that still need a human decision. A CONFIRMED row is resolved — even if it
+    carries an informational conflict_type — so it is NOT in the queue. Only unresolved
+    reviews appear: review_status='needs_review', plus genuinely broken conflicts that
+    make a table unusable (dangling/broken pointer, unresolved dedup) regardless of
+    review_status (those are correctness blockers, not just ambiguity)."""
     with get_db() as cur:
         cur.execute("""
             SELECT database_name, table_name, concept, scope, source_type,
@@ -308,8 +312,10 @@ def sentinel_review_queue():
                    use_instead, authority_confidence, updated_by, is_static
             FROM sentinel.catalog_overlay
             WHERE retired = false
-              AND (conflict_type <> 'none' OR review_status = 'needs_review')
-            ORDER BY conflict_type DESC, authority_confidence NULLS FIRST
+              AND (review_status = 'needs_review'
+                   OR conflict_type IN ('dangling_pointer','broken_pointer',
+                                        'unresolved_dedup','broken_join'))
+            ORDER BY (review_status='needs_review') DESC, authority_confidence NULLS FIRST
         """)
         return cur.fetchall()
 

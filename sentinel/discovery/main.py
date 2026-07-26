@@ -359,12 +359,18 @@ def reconcile_authority(pg_cur, touched_keys):
             # Re-flag needs_review on a real authority conflict — but NEVER un-confirm a
             # row a human or the resolver already confirmed (their confirmation stands;
             # an authority conflict is surfaced via conflict_type, not by reopening review).
+            # A human- or resolver-confirmed row is settled: update authority pointers
+            # but do NOT touch its conflict_type or review_status (else a re-computed
+            # conflict reopens a row that was already decided → the review queue never
+            # drains). For llm/unreviewed rows, flag conflicts + review as before.
             pg_cur.execute(
                 """UPDATE sentinel.catalog_overlay
                    SET authoritative = %s,
                        use_instead = %s,
-                       conflict_type = CASE WHEN conflict_type = 'unresolved_dedup'
-                                            THEN conflict_type ELSE %s END,
+                       conflict_type = CASE
+                           WHEN updated_by IN ('human','resolver') THEN conflict_type
+                           WHEN conflict_type = 'unresolved_dedup' THEN conflict_type
+                           ELSE %s END,
                        review_status = CASE
                            WHEN updated_by IN ('human','resolver') THEN review_status
                            WHEN %s <> 'none' THEN 'needs_review'
