@@ -165,7 +165,11 @@ _NUMERIC_TYPE_HINTS = ("Int", "UInt", "Float", "Decimal")
 # money/measure-looking names worth profiling (keeps the stat query cheap + targeted)
 _MEASURE_NAME_HINTS = ("sales", "mrp", "amount", "revenue", "value", "price",
                        "qty", "quantity", "net", "gross", "discount", "disc",
-                       "tax", "margin", "bfd", "total", "cost")
+                       "tax", "margin", "bfd", "total", "cost",
+                       # discount/markdown breakup columns — presence of these next to a
+                       # gross measure is what makes net computable; profile them so the
+                       # LLM sees they exist and hold real numbers.
+                       "markdown", "rebate", "promo", "coupon", "gmv")
 
 
 def _looks_numeric_measure(col):
