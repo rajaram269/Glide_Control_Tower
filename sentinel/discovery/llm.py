@@ -256,6 +256,69 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
 Do not add, rename, or omit keys. Do not wrap in markdown."""
 
 
+# Max characters of view SQL sent to the model. A view definition is normally well under
+# this; the cap only stops a pathological generated view from blowing the context window.
+MAX_VIEW_SQL_CHARS = 6000
+
+
+def _view_block(payload):
+    """For a VIEW, its defining SELECT is the strongest evidence available — it states
+    the grain, the joins (= real lineage), the filters (= scope), and how derived columns
+    are computed. Views also carry no measure stats (they are not sampled — see main.py),
+    so this block replaces that evidence rather than merely supplementing it."""
+    if not payload.get("is_view"):
+        return ""
+    sql = (payload.get("create_query") or "").strip()
+    if not sql:
+        return ""
+    if len(sql) > MAX_VIEW_SQL_CHARS:
+        sql = sql[:MAX_VIEW_SQL_CHARS] + "\n-- [truncated]"
+    return (
+        "\n\nTHIS OBJECT IS A VIEW, not a stored table. Its defining SQL is below and is "
+        "your PRIMARY evidence — read it rather than guessing from column names:\n"
+        "  • grain: derive from the GROUP BY (or the join grain if not aggregated).\n"
+        "  • relationships: every table in FROM/JOIN is real, verified lineage — list them "
+        "in \"relationships\" as db.table with the join column in \"on\".\n"
+        "  • scope: a WHERE clause that restricts to a brand/channel/date-range IS the "
+        "scope, and belongs in when_not_to_use (the view cannot answer outside it).\n"
+        "  • computable_metrics: read how each measure is actually computed. If the SELECT "
+        "subtracts discounts/returns from a gross amount, net sales IS computable here — "
+        "say so and name the expression. Do not require negatives/measure-stats evidence: "
+        "views are not stat-sampled, so the SQL is the evidence.\n"
+        "  • requires_dedup: TRUE only if the view reads a CDC/ReplacingMergeTree source "
+        "WITHOUT resolving it (no FINAL, no argMax, no dedup GROUP BY, no filter on "
+        "_peerdb_is_deleted). If the SQL already applies FINAL/argMax/deleted-row filtering, "
+        "the dedup is handled inside the view: set requires_dedup=false, dedup_method=none. "
+        "Note which it is in key_facts, since a consumer cannot see this SQL.\n"
+        "  • A view is the curated, business-facing interface over raw tables, so it is "
+        "usually the RIGHT thing to query. Judge it on its own merits, not as a duplicate.\n"
+        f"View definition SQL:\n{sql}"
+    )
+
+
+def _stats_block(payload):
+    """Measure-stat evidence. Views are deliberately not stat-sampled (main.py), so for a
+    view this must NOT present an empty stats object as evidence: the standard wording
+    ("negatives ~0 means returns are absent → gross-only") would read absence-of-sampling
+    as proof-of-absence and push every view's metrics into not_computable. For views, the
+    defining SQL in _view_block carries this burden instead."""
+    if payload.get("is_view"):
+        return (
+            "\n\nAggregate measure stats: NOT COLLECTED for views (a view stores no rows). "
+            "Their absence is NOT evidence that returns/discounts are missing — judge "
+            "computability from the view's SQL above and from the base tables it reads."
+        )
+    return (
+        "\n\nAggregate stats for measure columns (sum/avg/min/max/negatives over the "
+        "whole column — use these to judge WHAT a measure really is and what can be "
+        "computed). A 'negatives' count > 0 means returns/refunds are represented, so "
+        "a net figure is derivable; negatives ~0 means returns are absent (likely "
+        "gross-only). Very different magnitudes for a same-named measure across tables "
+        "mean they are NOT the same metric.\n"
+        + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+    )
+
+
 def _evidence_block(payload):
     """The table facts (schema/samples/stats) — shared by discovery + adjudicator."""
     return (
@@ -265,15 +328,10 @@ def _evidence_block(payload):
         f"Approx rows: {payload.get('total_rows')}\n"
         f"Columns (name: type):\n"
         + "\n".join(f"  {c['name']}: {c['type']}" for c in payload["columns"])
+        + _view_block(payload)
         + "\n\nLow-cardinality sample values (PII-safe only):\n"
         + json.dumps(payload.get("samples", {}), ensure_ascii=False)
-        + "\n\nAggregate stats for measure columns (sum/avg/min/max/negatives over the "
-          "whole column — use these to judge WHAT a measure really is and what can be "
-          "computed). A 'negatives' count > 0 means returns/refunds are represented, so "
-          "a net figure is derivable; negatives ~0 means returns are absent (likely "
-          "gross-only). Very different magnitudes for a same-named measure across tables "
-          "mean they are NOT the same metric.\n"
-        + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+        + _stats_block(payload)
         + "\n\nDate column profile (real data: min/max date, non-null rows, rows dated in "
           "the FUTURE, distinct active days in the last 90). Choose event_date_column "
           "from THESE: the business date whose max is recent, not future-dated, and has "

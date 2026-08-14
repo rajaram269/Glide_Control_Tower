@@ -121,20 +121,38 @@ def ch_connect():
 # ─── 2. Enumerate ─────────────────────────────────────────────────────────────
 # Same universe the legacy collector uses (gcp_collector auto_discover_watched_tables):
 # skip raw-mirror staging, backups, and system databases.
+#
+# Plain Views ARE catalogued: they are the curated, business-facing interface over the
+# raw tables and are what consumers should query. Excluded engine classes:
+#   MaterializedView — an MV is a trigger, not a dataset; its rows live in a separate
+#     target table (.inner.* or an explicit TO table) which enumeration picks up on its
+#     own. Cataloguing both would double-count one dataset as two competing sources.
+#   LiveView / WindowView — experimental, stateful, not a stable catalog subject.
+
+_VIEW_ENGINES = ("View",)   # plain view only (MaterializedView is excluded at the query)
+
+
+def is_view(meta):
+    return (meta.get("engine") or "") in _VIEW_ENGINES
+
 
 def enumerate_tables(ch):
     result = ch.query("""
-        SELECT database, name, engine, sorting_key, total_rows
+        SELECT database, name, engine, sorting_key, total_rows, create_table_query
         FROM system.tables
         WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema', 'default')
           AND name NOT LIKE '\\_peerdb\\_raw\\_mirror%'
           AND name NOT LIKE '%\\_backup\\_2%'
-          AND engine NOT LIKE '%View%'
+          AND engine NOT IN ('MaterializedView', 'LiveView', 'WindowView')
         ORDER BY database, name
     """)
     return [
         {"database_name": r[0], "table_name": r[1], "engine": r[2],
-         "sorting_key": r[3], "total_rows": r[4]}
+         "sorting_key": r[3], "total_rows": r[4],
+         # Only meaningful for views — the SELECT that defines them. For a plain table
+         # this is the CREATE TABLE DDL, which adds nothing over the column list, so it
+         # is carried only for views (see the payload build in main()).
+         "create_query": r[5]}
         for r in result.result_rows
     ]
 
@@ -505,6 +523,15 @@ def build_overlay_row(meta, columns, inferred, review):
     conflict = "none"
     if requires_dedup and not dedup_key:
         conflict = "unresolved_dedup"
+    # Views: the engine string is 'View' regardless of what the view reads, so the
+    # "Replacing" test above can never fire — the LLM's verdict (made from the view's
+    # actual SQL) is the only signal, and it is the correct one either way: a view that
+    # already applies FINAL/argMax needs no further dedup, while one that selects from a
+    # CDC source raw does. Treating a missing dedup_key as an I3 violation would be wrong
+    # here: dedup inside the view is resolved WITHOUT the consumer supplying a key, so
+    # flagging it unresolved would raise a permanent false conflict on every clean view.
+    if is_view(meta) and conflict == "unresolved_dedup":
+        conflict = "none"
     desc = {**(inferred.get("description") or {}), "_cls_v": CLASSIFIER_VERSION}
     # summary is a compact derivative; prefer the model's, else what_it_is
     summary = inferred.get("summary") or desc.get("what_it_is")
@@ -881,6 +908,13 @@ def populate_variable_values(pg_cur, ch, meta, inferred):
                  AND lifecycle = 'active' AND value <> ALL(%s)""",
             (db, tbl, col, list(seen_now)),
         )
+        # Views: snapshot the value set above (useful catalog metadata, and the probe has
+        # already run) but do NOT create a coverage TARGET. Same reasoning as the
+        # table-level target in main(): a view's values are its base tables' values, which
+        # are monitored in their own right, so a target here re-executes the whole view
+        # definition on every check to re-derive coverage that is already being watched.
+        if is_view(meta):
+            continue
         pg_cur.execute(
             """INSERT INTO sentinel.monitor_targets
                (database_name, table_name, variable, monitor_frequency_weeks,
@@ -1110,10 +1144,16 @@ def main():
                                         dprof, columns, False)
             samples = pii_safe_samples(ch, db, tbl, columns, prior_edc)
             sprof = segment_profile(ch, db, tbl, columns, prior_edc)
-            mstats = measure_stats(ch, db, tbl, columns)
+            # Views: a view has no stored rows, so every stat query re-executes the
+            # whole view definition. measure_stats issues one such query PER measure
+            # column, which reliably hits CH_MAX_EXECUTION_SECONDS on a non-trivial
+            # view. The base tables carry those stats; the view's SELECT (fed to the
+            # LLM) is stronger evidence anyway. So: skip measure stats on views.
+            viewish = is_view(meta)
+            mstats = {} if viewish else measure_stats(ch, db, tbl, columns)
             payload = {**meta, "columns": columns, "samples": samples,
                        "measure_stats": mstats, "date_profile": dprof,
-                       "segment_profile": sprof}
+                       "segment_profile": sprof, "is_view": viewish}
 
             # 6. LLM pass + heuristic pre-fill for source_type. This cascades across up
             # to 3 providers (maker + checker) with retries on a bad response — a single
@@ -1164,7 +1204,13 @@ def main():
             # than losing the whole run's remaining tables over one slow table's writes.
             try:
                 upsert_overlay(cur, overlay_row)
-                upsert_target(cur, meta, inferred)
+                # Views are catalogued but NOT monitored. A view stores nothing, so it has
+                # no rows in system.parts and _parts_freshness would return null on every
+                # check, forever. More fundamentally a view cannot be stale independently
+                # of its sources — its freshness IS its base tables' freshness, and those
+                # are monitored on their own. Monitoring both would double-alert one fault.
+                if not viewish:
+                    upsert_target(cur, meta, inferred)
                 tracked_vars = populate_variable_values(cur, ch, meta, inferred)
                 # authority (use_instead) is set later in reconcile_authority, so
                 # duplicate-concept rules for this run use the prior authority state;
