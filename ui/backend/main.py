@@ -3,7 +3,8 @@ Control Tower UI — FastAPI backend
 Serves React dashboard at GET / and REST API at /api/*.
 Connects directly to PostgreSQL (same Cloud SQL instance as collectors).
 """
-import os, json
+import os, json, re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -98,18 +99,82 @@ def jobs():
 
 @app.get("/api/scheduler-jobs")
 def scheduler_jobs():
-    """Cloud Scheduler jobs whose target is a plain HTTP endpoint on a Cloud
-    Run service (cron logic living inside the service, not a real Cloud Run
-    Job) — the scheduler's own last-attempt status is the only signal for these."""
+    """Every Cloud Scheduler job in the project (all regions, all target types),
+    auto-discovered by the GCP collector. target_type/target_name say what each
+    one triggers (a Cloud Run Job, an HTTP endpoint, Pub/Sub, App Engine)."""
     with get_db() as cur:
         cur.execute("""
             SELECT scheduler_name, schedule, target_uri, region,
+                   target_type, target_name, state,
                    last_attempt_at, last_attempt_status, checked_at
             FROM control_tower.scheduler_jobs
             WHERE active = true
             ORDER BY scheduler_name
         """)
         return cur.fetchall()
+
+
+# ─── Logs (read live from Cloud Logging) ──────────────────────────────────────
+#
+# Lets developers without GCP console access read a job's / service's logs
+# from the dashboard. Uses the UI's own service account (roles/logging.viewer).
+# Jobs: entries of the latest execution (last 7 days). Services: last 24 hours.
+
+LOG_PROJECT = os.environ.get("GCP_PROJECT", "seoai-479305")
+_LOG_TARGETS = {
+    "job":     ("cloud_run_job",      "job_name",     timedelta(days=7)),
+    "service": ("cloud_run_revision", "service_name", timedelta(hours=24)),
+}
+# Cloud Run naming rules — also keeps the name from injecting into the filter.
+_RUN_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_EXEC_LABEL = "run.googleapis.com/execution_name"
+
+
+def _log_line(entry):
+    p = entry.payload
+    if isinstance(p, dict):
+        msg = p.get("message") or p.get("msg") or json.dumps(p, default=str)
+    else:
+        msg = "" if p is None else str(p)
+    req = entry.http_request or {}
+    if req:   # Cloud Run request log: show which request, its status and latency
+        msg = (f'{req.get("requestMethod", "")} {req.get("requestUrl", "")} → '
+               f'{req.get("status", "")} ({req.get("latency", "")}) {msg}').strip()
+    return {"timestamp": entry.timestamp, "severity": entry.severity or "DEFAULT",
+            "message": msg[:4000]}
+
+
+@app.get("/api/logs/{kind}/{name}")
+def logs(kind: str, name: str, errors_only: bool = False, limit: int = 200):
+    if kind not in _LOG_TARGETS or not _RUN_NAME.match(name):
+        raise HTTPException(400, "unknown log target")
+    resource_type, label, window = _LOG_TARGETS[kind]
+    limit = max(1, min(limit, 500))
+    since = (datetime.now(timezone.utc) - window).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = (f'resource.type="{resource_type}" AND resource.labels.{label}="{name}" '
+            f'AND timestamp>="{since}"')
+
+    try:
+        from google.cloud import logging as gcp_logging
+        client = gcp_logging.Client(project=LOG_PROJECT)
+        execution = None
+        if kind == "job":
+            newest = next(iter(client.list_entries(
+                filter_=base, order_by=gcp_logging.DESCENDING, max_results=1)), None)
+            execution = newest.labels.get(_EXEC_LABEL) if newest and newest.labels else None
+            if execution:
+                base += f' AND labels."{_EXEC_LABEL}"="{execution}"'
+        flt = base + (" AND severity>=ERROR" if errors_only else "")
+        entries = client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
+                                      max_results=limit, page_size=limit)
+        lines = [_log_line(e) for e in entries]
+    except Exception as e:
+        # Typically no GCP credentials (local run) or a Logging API quota hit.
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Logs unavailable: {type(e).__name__}: {first_line}")
+
+    return {"kind": kind, "name": name, "execution": execution,
+            "since": since, "lines": lines}
 
 
 @app.get("/api/providers")

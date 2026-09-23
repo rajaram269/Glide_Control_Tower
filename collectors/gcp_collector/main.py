@@ -364,30 +364,49 @@ def auto_discover(pg_cur):
         log.info("Discovered %d new services/jobs: %s", len(new_rows), notifications)
 
 
-# ─── Cloud Scheduler jobs (HTTP-direct targets only) ──────────────────────────
+# ─── Cloud Scheduler jobs (all targets, all regions) ──────────────────────────
 #
-# Schedulers that call a Cloud Run Job's :run endpoint are already covered —
-# their execution status shows up via job_last_execution_at in service_health.
-# This covers the other kind: schedulers that hit a plain HTTP endpoint on a
-# Cloud Run *service* (cron logic living inside the service's own code, e.g.
-# agenteye's /api/cron/* routes). Those have no Cloud Run Job execution to
-# inspect — the scheduler's own last-attempt status is the only signal.
+# Every Cloud Scheduler job in the project, auto-discovered each run — new
+# schedulers appear on their own, deleted ones are marked inactive. Regions are
+# listed from the API (not MONITORED_REGIONS) so a scheduler created in any
+# region is picked up. target_type/target_name record what each one triggers:
+# a Cloud Run Job (:run endpoint), a plain HTTP endpoint (cron logic inside a
+# service, e.g. agenteye's /api/cron/* routes), Pub/Sub, or App Engine.
 
-_RUN_JOB_TARGET = re.compile(r"run\.googleapis\.com.*?/jobs/[^/:]+:run$")
+_RUN_JOB_TARGET = re.compile(r"run\.googleapis\.com.*?/jobs/([^/:]+):run$")
+
+
+def _scheduler_target(job):
+    if job.http_target and job.http_target.uri:
+        uri = job.http_target.uri
+        m = _RUN_JOB_TARGET.search(uri)
+        return ("cloud_run_job", m.group(1), uri) if m else ("http", None, uri)
+    if job.pubsub_target and job.pubsub_target.topic_name:
+        topic = job.pubsub_target.topic_name
+        return "pubsub", topic.split("/")[-1], topic
+    if job.app_engine_http_target and job.app_engine_http_target.relative_uri:
+        return "app_engine", None, job.app_engine_http_target.relative_uri
+    return None, None, None
 
 
 def collect_scheduler_status(pg_cur):
-    log.info("Checking Cloud Scheduler jobs (HTTP-direct targets)...")
+    log.info("Checking Cloud Scheduler jobs (all targets, all regions)...")
     client = scheduler_v1.CloudSchedulerClient()
     rows = []
+    listing_complete = True
 
-    for region in MONITORED_REGIONS:
+    try:
+        regions = [loc.location_id for loc in
+                   client.list_locations({"name": f"projects/{PROJECT}"}).locations]
+    except Exception as e:
+        log.warning("Scheduler location listing failed, falling back to monitored regions: %s", e)
+        regions, listing_complete = MONITORED_REGIONS, False
+
+    for region in regions:
         parent = f"projects/{PROJECT}/locations/{region}"
         try:
             for job in client.list_jobs(parent=parent):
-                uri = job.http_target.uri if job.http_target else ""
-                if not uri or _RUN_JOB_TARGET.search(uri):
-                    continue  # targets a Cloud Run Job — already covered elsewhere
+                target_type, target_name, uri = _scheduler_target(job)
                 name = job.name.split("/")[-1]
                 last_attempt = job.last_attempt_time if job.last_attempt_time else None
                 if last_attempt is None:
@@ -396,8 +415,10 @@ def collect_scheduler_status(pg_cur):
                     status = "ok"
                 else:
                     status = f"error (code {job.status.code})"
-                rows.append((name, job.schedule, uri, region, True, last_attempt, status, NOW))
+                rows.append((name, job.schedule, uri, region, True, last_attempt, status, NOW,
+                             target_type, target_name, job.state.name))
         except Exception as e:
+            listing_complete = False
             log.warning("Scheduler job listing failed for %s: %s", region, e)
 
     if rows:
@@ -405,16 +426,34 @@ def collect_scheduler_status(pg_cur):
             pg_cur,
             """INSERT INTO control_tower.scheduler_jobs
                (scheduler_name, schedule, target_uri, region, active,
-                last_attempt_at, last_attempt_status, checked_at)
+                last_attempt_at, last_attempt_status, checked_at,
+                target_type, target_name, state)
                VALUES %s
                ON CONFLICT (scheduler_name) DO UPDATE SET
                    schedule = EXCLUDED.schedule,
+                   target_uri = EXCLUDED.target_uri,
+                   region = EXCLUDED.region,
+                   active = true,
                    last_attempt_at = EXCLUDED.last_attempt_at,
                    last_attempt_status = EXCLUDED.last_attempt_status,
-                   checked_at = EXCLUDED.checked_at""",
+                   checked_at = EXCLUDED.checked_at,
+                   target_type = EXCLUDED.target_type,
+                   target_name = EXCLUDED.target_name,
+                   state = EXCLUDED.state""",
             rows,
         )
-        log.info("Upserted %d HTTP-direct scheduler jobs", len(rows))
+        log.info("Upserted %d scheduler jobs across %d regions", len(rows), len(regions))
+
+    # Only retire schedulers when every region listed cleanly — a transient API
+    # error must not make live schedulers vanish from the dashboard.
+    if listing_complete:
+        pg_cur.execute(
+            """UPDATE control_tower.scheduler_jobs SET active = false
+               WHERE active AND NOT (scheduler_name = ANY(%s))""",
+            ([r[0] for r in rows],),
+        )
+        if pg_cur.rowcount:
+            log.info("Marked %d deleted scheduler jobs inactive", pg_cur.rowcount)
 
 
 # ─── Data freshness checker ──────────────────────────────────────────────────
