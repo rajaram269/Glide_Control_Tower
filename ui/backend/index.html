@@ -321,7 +321,7 @@ function LogsPanel({ kind, name, colSpan }) {
   useEffect(load, [load]);
 
   const scope = kind === 'job'
-    ? (data?.execution ? `latest execution ${data.execution}` : 'last 7 days')
+    ? (data?.execution ? `latest execution ${data.execution}` : 'last 2 days')
     : 'last 24 hours';
   return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
     <div class="logs-bar">
