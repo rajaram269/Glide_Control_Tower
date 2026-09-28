@@ -122,7 +122,7 @@ def scheduler_jobs():
 
 LOG_PROJECT = os.environ.get("GCP_PROJECT", "seoai-479305")
 _LOG_TARGETS = {
-    "job":     ("cloud_run_job",      "job_name",     timedelta(days=7)),
+    "job":     ("cloud_run_job",      "job_name",     timedelta(days=2)),
     "service": ("cloud_run_revision", "service_name", timedelta(hours=24)),
 }
 # Cloud Run naming rules — also keeps the name from injecting into the filter.

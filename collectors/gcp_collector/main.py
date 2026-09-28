@@ -830,29 +830,39 @@ def main():
                 for r in cur.fetchall()
             ]
             log.info("Monitoring %d active GCP services/jobs", len(services))
+            # Commit (closes this SELECT's transaction) before each phase below —
+            # phases spend minutes making external API calls with no DB activity in
+            # between, and idle_in_transaction_session_timeout=60s on this instance
+            # kills the connection if that gap happens inside a still-open transaction.
+            pg.commit()
 
             # 2. Collect service health metrics
             collect_service_health(cur, services)
+            pg.commit()
 
             # 3. Poll status pages
             poll_status_pages(cur)
+            pg.commit()
 
             # 4. Auto-discover new services
             auto_discover(cur)
+            pg.commit()
 
             # 4b. Cloud Scheduler jobs with HTTP-direct targets (cron logic inside services)
             collect_scheduler_status(cur)
+            pg.commit()
 
             # 5. Data freshness: auto-discover PeerDB tables, then check all watched
             auto_discover_watched_tables(cur, ch)
             check_data_freshness(cur, ch)
+            pg.commit()
 
             # 6. API health from Cloud Logging
             collect_api_health(cur)
+            pg.commit()
 
             # 7. Pipeline processing metrics (CT_METRICS convention)
             collect_pipeline_metrics(cur, services)
-
             pg.commit()
             log.info("All data committed to PostgreSQL.")
 
