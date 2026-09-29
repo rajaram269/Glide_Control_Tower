@@ -100,7 +100,7 @@ The app code is identical to production; only the data is fake.
 |---|---|
 | Jobs | 30 sample jobs + 5 sample Cloud Schedulers (job / http / pubsub targets, one paused, one failing) |
 | Job / service logs (click a row) | Shows *"Logs unavailable…"* — logs are read live from Google Cloud Logging, which needs GCP credentials. Works on the deployed dashboard (it uses its service account). Locally it only works if `gcloud auth application-default login` is done with an account that can read logs in `seoai-479305` |
-| Services, Alerts, Pipeline, Costs, Freshness, Providers | Empty |
+| Services, Alerts, Costs, Freshness, Providers | Empty |
 | Sentinel pages (Catalog, Review, Coverage, Reconcile, Incidents) | Empty |
 
 Empty pages are expected — they load (HTTP 200) but nothing has collected data.

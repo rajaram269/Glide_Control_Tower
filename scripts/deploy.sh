@@ -76,7 +76,7 @@ psql "$LOCAL" -tc "SELECT current_database()" | grep -q control_tower \
   || { echo "ERROR: not connected to control_tower via proxy" >&2; exit 1; }
 for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql \
          migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql \
-         migrations/018_*.sql; do
+         migrations/018_*.sql migrations/019_*.sql; do
   echo "  → $m"
   psql "$LOCAL" -v ON_ERROR_STOP=1 -qf "$m"
 done

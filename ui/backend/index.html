@@ -147,7 +147,7 @@
     tr.logs-row > td { padding: 12px 14px 16px; }
     .logs-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
                 font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-    .logs-bar button { font: inherit; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+    .logs-bar button, .logs-bar select { font: inherit; padding: 3px 10px; border-radius: 6px; cursor: pointer;
                        border: 1px solid var(--border-strong); background: var(--surface); color: var(--fg-2); }
     .logs-box { max-height: 420px; overflow: auto; background: var(--surface);
                 border: 1px solid var(--border); border-radius: 8px;
@@ -159,6 +159,10 @@
     .log-line.sev-ERROR, .log-line.sev-CRITICAL, .log-line.sev-ALERT, .log-line.sev-EMERGENCY {
       background: var(--critical-bg); color: var(--critical-fg); }
     .log-line.sev-WARNING { background: var(--medium-bg); color: var(--medium-fg); }
+    /* Full raw log entry, shown when a summarized line is clicked open */
+    .log-raw { margin: 0 10px 6px; padding: 8px 10px; background: var(--sunken);
+               border-radius: 6px; font-size: 11px; white-space: pre-wrap; word-break: break-word;
+               color: var(--muted); max-height: 300px; overflow: auto; }
 
     /* Provider cards */
     .provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
@@ -171,11 +175,6 @@
     .ack-btn { padding: 4px 12px; border: 1px solid var(--border); border-radius: 8px;
                background: var(--surface); color: var(--fg-2); cursor: pointer; font-size: 12px; transition: all .12s; }
     .ack-btn:hover { background: var(--raised); border-color: var(--border-strong); }
-
-    /* Pipeline number chips */
-    .num-badge { padding: 2px 8px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, monospace; }
-    .num-ok   { background: var(--success-bg); color: var(--success-fg); }
-    .num-fail { background: var(--critical-bg); color: var(--critical-fg); }
 
     /* wide tables get a comfortable min-width and scroll inside the card */
     .table-scroll table { min-width: 640px; }
@@ -266,6 +265,50 @@ function agoColor(ts, { freshHours = 2, staleHours = 26 } = {}) {
   return 'var(--medium-fg)';
 }
 
+// Generic 3-way column sort, reusable by any table: click cycles
+// ascending -> descending -> back to the table's own default order.
+// `getters[key]` maps a column key to a comparable value from a row; missing
+// values always sort last regardless of direction (e.g. "never run").
+function useSort() {
+  const [sort, setSort] = useState(null); // { key, dir: 'asc'|'desc' } | null
+  const cycle = (key) => setSort(s =>
+    !s || s.key !== key ? { key, dir: 'asc' }
+    : s.dir === 'asc' ? { key, dir: 'desc' }
+    : null);
+  const apply = (rows, getters) => {
+    if (!sort) return rows;
+    const get = getters[sort.key] || (r => r[sort.key]);
+    const sorted = [...rows].sort((a, b) => {
+      const av = get(a), bv = get(b);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return av < bv ? -1 : av > bv ? 1 : 0;
+    });
+    return sort.dir === 'asc' ? sorted : sorted.reverse();
+  };
+  const Th = ({ label, k, title }) => html`<th style="cursor:pointer;user-select:none"
+      onClick=${() => cycle(k)} title=${title || 'Click to sort'}>
+      ${label} ${sort?.key === k ? (sort.dir === 'asc' ? '▲' : '▼') : '⇅'}
+    </th>`;
+  return { apply, Th };
+}
+
+// Cloud Run job statuses beyond plain succeeded/failed: a run still in progress
+// ("running", or "stuck" if it's well past how long this job normally takes),
+// a run Cloud Run itself cancelled, and "missed" — the job's own cron schedule
+// says it should have fired again by now but hasn't (see detect_missed_schedules
+// in the collector). Badge color = how urgent it is; label text = the reason.
+const JOB_STATUS_BADGE = {
+  succeeded: ['operational', 'succeeded'],
+  running:   ['info', 'running'],
+  stuck:     ['warn', 'stuck'],
+  cancelled: ['high', 'cancelled'],
+  failed:    ['major_outage', 'major outage'],
+  missed:    ['major_outage', 'missed'],
+};
+const jobBadge = (status) => JOB_STATUS_BADGE[status] || ['unknown', status || 'no data'];
+
 const StatusBadge = ({ status }) => {
   const label = (status || 'unknown').replace(/_/g, ' ');
   return html`<span class=${`badge ${status || 'unknown'}`}>${label}</span>`;
@@ -307,25 +350,53 @@ function SearchBox({ value, onInput, placeholder, count }) {
 // ─── Logs panel ────────────────────────────────────────────────────────────────
 // Rendered as an extra table row under a clicked job/service. Logs are read live
 // from Cloud Logging by the backend, so developers don't need GCP console access.
-function LogsPanel({ kind, name, colSpan }) {
+function LogsPanel({ kind, name, region, colSpan }) {
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
+  const [executions, setExecutions] = useState(null);   // job runs, for the picker
+  const [execution, setExecution] = useState('');       // '' = latest (server default)
+  const [expanded, setExpanded] = useState(() => new Set()); // line indices showing raw JSON
+
+  // A job can run more than once a day — list its recent runs so a specific one
+  // can be picked instead of always seeing only the latest.
+  useEffect(() => {
+    if (kind !== 'job') return;
+    fetch(`/api/logs/job/${encodeURIComponent(name)}/executions?region=${encodeURIComponent(region)}`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setExecutions)
+      .catch(() => setExecutions([]));
+  }, [kind, name, region]);
+
   const load = useCallback(() => {
-    setData(null); setErr(null);
-    fetch(`/api/logs/${kind}/${encodeURIComponent(name)}?errors_only=${errorsOnly}`)
+    setData(null); setErr(null); setExpanded(new Set());
+    const execParam = execution ? `&execution=${encodeURIComponent(execution)}` : '';
+    fetch(`/api/logs/${kind}/${encodeURIComponent(name)}?errors_only=${errorsOnly}${execParam}`)
       .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
       .then(setData)
       .catch(e => setErr(String(e.message || e)));
-  }, [kind, name, errorsOnly]);
+  }, [kind, name, errorsOnly, execution]);
   useEffect(load, [load]);
 
+  const toggleLine = (i) => setExpanded(s => {
+    const next = new Set(s);
+    next.has(i) ? next.delete(i) : next.add(i);
+    return next;
+  });
+
   const scope = kind === 'job'
-    ? (data?.execution ? `latest execution ${data.execution}` : 'last 2 days')
+    ? (execution ? `execution ${execution}` : data?.execution ? `latest execution ${data.execution}` : 'last 2 days')
     : 'last 24 hours';
   return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
     <div class="logs-bar">
       <b style="color:var(--fg-2)">Logs</b><span>${scope} · newest first</span>
+      ${kind === 'job' && executions && executions.length > 0 && html`
+        <select value=${execution} onChange=${e => setExecution(e.target.value)}>
+          <option value="">Latest run</option>
+          ${executions.map((ex, i) => html`<option value=${ex.execution}>
+            Execution ${executions.length - i} — ${ex.status}${ex.started_at ? ' · ' + new Date(ex.started_at).toLocaleString() : ''}
+          </option>`)}
+        </select>`}
       <label style="cursor:pointer"><input type="checkbox" checked=${errorsOnly}
         onChange=${e => setErrorsOnly(e.target.checked)}/> errors only</label>
       <button onClick=${load}>Refresh</button>
@@ -333,11 +404,14 @@ function LogsPanel({ kind, name, colSpan }) {
     ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
       : !data ? html`<div style="color:var(--muted);font-size:12px">Loading logs…</div>`
       : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No log entries${errorsOnly ? ' at ERROR or above' : ''}.</div>`
-      : html`<div class="logs-box">${data.lines.map(l => html`
-          <div class=${`log-line sev-${l.severity}`}>
+      : html`<div class="logs-box">${data.lines.map((l, i) => html`
+          <div class=${`log-line sev-${l.severity}`} style=${l.raw ? 'cursor:pointer' : ''}
+               onClick=${() => l.raw && toggleLine(i)} title=${l.raw ? 'Click for full log entry' : ''}>
             <span class="ts">${new Date(l.timestamp).toLocaleString()}</span>
-            <span>${l.severity}</span><span>${l.message}</span>
-          </div>`)}</div>`}
+            <span>${l.severity}</span>
+            <span>${l.raw ? (expanded.has(i) ? '▾ ' : '▸ ') : ''}${l.message}</span>
+          </div>
+          ${l.raw && expanded.has(i) && html`<pre class="log-raw">${l.raw}</pre>`}`)}</div>`}
   </td></tr>`;
 }
 
@@ -347,9 +421,15 @@ function ServicesView() {
   const [rows] = useApi('/api/services');
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(null);   // service whose logs are expanded
+  const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No Cloud Run services registered.</div>`;
-  const shown = rows.filter(r => rowMatches(r, q));
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    request_count: r => r.request_count,
+    error_rate_pct: r => r.error_rate_pct,
+    instance_count: r => r.instance_count,
+    p95_latency_ms: r => r.p95_latency_ms,
+  });
   return html`
     <div class="view-head">
       <div class="section-title">Services — ${rows.length} request-driven, always-listening · click a row for logs</div>
@@ -357,9 +437,9 @@ function ServicesView() {
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Service</th><th>Requests (1h)</th>
-        <th>Err%</th><th>Instances</th>
-        <th>P95 Latency</th><th>Checked</th>
+        <th>Service</th><${Th} label="Requests (1h)" k="request_count"/>
+        <${Th} label="Err%" k="error_rate_pct"/><${Th} label="Instances" k="instance_count"/>
+        <${Th} label="P95 Latency" k="p95_latency_ms"/><th>Checked</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => html`<${Fragment} key=${r.service_name}>
@@ -380,26 +460,27 @@ function ServicesView() {
 function JobsView() {
   const [rows] = useApi('/api/jobs');
   const [q, setQ] = useState('');
-  // Last-outcome sort: null = default order, 'fail' = failures first, 'ok' = successes first
-  const [outcomeSort, setOutcomeSort] = useState(null);
+  const { apply: applySort, Th } = useSort();
   const [open, setOpen] = useState(null);   // job whose logs are expanded
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No Cloud Run jobs registered.</div>`;
 
-  const shown = rows.filter(r => rowMatches(r, q));
-  if (outcomeSort) {
-    const rank = r => r.job_status === 'failed' ? 0 : r.job_status === 'succeeded' ? 2 : 1;
-    shown.sort((a, b) => outcomeSort === 'fail' ? rank(a) - rank(b) : rank(b) - rank(a));
-  }
-  const cycleOutcomeSort = () => setOutcomeSort(s => s === null ? 'fail' : s === 'fail' ? 'ok' : null);
-  const failing = shown.filter(r => r.job_status === 'failed').length;
+  // Problem statuses rank first when sorted ascending: a stuck/cancelled/missed
+  // run is just as much a problem as an outright failure, just for a different
+  // reason — running is normal/neutral, succeeded is last.
+  const PROBLEM_STATUSES = ['failed', 'missed', 'cancelled', 'stuck'];
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    region: r => r.region,
+    job_status: r => PROBLEM_STATUSES.includes(r.job_status) ? 0 : r.job_status === 'succeeded' ? 2 : 1,
+  });
+  const failing = shown.filter(r => PROBLEM_STATUSES.includes(r.job_status)).length;
   const neverRun = shown.filter(r => !r.job_last_execution_at).length;
 
   return html`
     <div class="view-head">
       <div class="section-title">
         Jobs — ${rows.length} scheduled/batch
-        ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} failing</span>`}
+        ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} need attention</span>`}
         ${neverRun > 0 && html`<span style="color:var(--medium-fg)"> · ${neverRun} no execution data</span>`}
         <span style="color:var(--faint);font-weight:400"> · click a row for logs</span>
       </div>
@@ -407,11 +488,8 @@ function JobsView() {
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Job</th><th>Region</th>
-        <th style="cursor:pointer;user-select:none" onClick=${cycleOutcomeSort}
-            title="Click to sort: failures first → successes first → default">
-          Last outcome ${outcomeSort === 'fail' ? '▲ failures' : outcomeSort === 'ok' ? '▼ successes' : '⇅'}
-        </th>
+        <th>Job</th><${Th} label="Region" k="region"/>
+        <${Th} label="Last outcome" k="job_status" title="Click to sort: problems first → succeeded first"/>
         <th>Last run</th><th>Duration</th><th>Checked</th>
       </tr></thead>
       <tbody>
@@ -419,16 +497,14 @@ function JobsView() {
           <tr class="clickable" onClick=${() => setOpen(open === r.service_name ? null : r.service_name)}>
           <td class="mono">${open === r.service_name ? '▾' : '▸'} ${r.service_name}</td>
           <td style="color:var(--muted);font-size:12px">${r.region}</td>
-          <td>${r.job_status
-            ? html`<${StatusBadge} status=${r.job_status === 'succeeded' ? 'operational' : 'major_outage'}/>`
-            : html`<span class="badge unknown">no data</span>`}</td>
+          <td>${(([cls, label]) => html`<span class="badge ${cls}">${label}</span>`)(jobBadge(r.job_status))}</td>
           <td style=${`color:${agoColor(r.job_last_execution_at)}`}>
             ${r.job_last_execution_at ? fmt.ago(r.job_last_execution_at) : 'never seen'}
           </td>
-          <td>${fmt.ms(r.job_duration_ms)}</td>
+          <td>${fmt.ms(r.job_duration_ms)}${['running','stuck'].includes(r.job_status) ? ' so far' : ''}</td>
           <td style="color:var(--faint);font-size:12px">${fmt.ago(r.collected_at)}</td>
           </tr>
-          ${open === r.service_name && html`<${LogsPanel} kind="job" name=${r.service_name} colSpan=${6}/>`}
+          ${open === r.service_name && html`<${LogsPanel} kind="job" name=${r.service_name} region=${r.region} colSpan=${6}/>`}
         <//>`)}
       </tbody>
     </table></div>
@@ -436,6 +512,8 @@ function JobsView() {
       <b style="color:var(--muted)">Last run</b> = when the job itself finished executing (green ≤2h, gray ≤26h, amber older).
       <b style="color:var(--muted)">Checked</b> = when Control Tower last scraped this job's status — can be more recent
       than the job's actual last run if it's on an infrequent schedule.
+      <b style="color:var(--muted)">stuck</b> = still running, well past how long it normally takes.
+      <b style="color:var(--muted)">missed</b> = its own schedule says it should have run again by now, but hasn't.
     </div>
     <${SchedulerJobsView}/>`;
 }
@@ -443,10 +521,19 @@ function JobsView() {
 function SchedulerJobsView() {
   const [rows] = useApi('/api/scheduler-jobs');
   const [q, setQ] = useState('');
+  const { apply: applySort, Th } = useSort();
   if (!rows) return null;
   if (!rows.length) return null;
-  const shown = rows.filter(r => rowMatches(r, q));
-  const failing = shown.filter(r => r.last_attempt_status && !['ok', 'never run'].includes(r.last_attempt_status)).length;
+  const filtered = rows.filter(r => rowMatches(r, q));
+  // Problems first when sorted ascending: paused/disabled before enabled, failing
+  // before never-run before ok.
+  const shown = applySort(filtered, {
+    region: r => r.region,
+    state: r => (!r.state || r.state === 'ENABLED') ? 1 : 0,
+    last_attempt_at: r => r.last_attempt_at ? new Date(r.last_attempt_at).getTime() : null,
+    last_attempt_status: r => r.last_attempt_status === 'ok' ? 2 : r.last_attempt_status === 'never run' ? 1 : 0,
+  });
+  const failing = filtered.filter(r => r.last_attempt_status && !['ok', 'never run'].includes(r.last_attempt_status)).length;
   const paused = shown.filter(r => r.state && r.state !== 'ENABLED').length;
   const target = r =>
     r.target_type === 'cloud_run_job' ? html`<span class="badge info">job</span> <span class="mono">${r.target_name}</span>`
@@ -465,8 +552,11 @@ function SchedulerJobsView() {
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Scheduler</th><th>Region</th><th>Schedule</th><th>Target</th><th>State</th>
-        <th>Last attempt</th><th>Outcome</th><th>Checked</th>
+        <th>Scheduler</th><${Th} label="Region" k="region"/><th>Schedule</th><th>Target</th>
+        <${Th} label="State" k="state" title="Click to sort: paused/disabled first → enabled first"/>
+        <${Th} label="Last attempt" k="last_attempt_at"/>
+        <${Th} label="Outcome" k="last_attempt_status" title="Click to sort: failing first → ok first"/>
+        <th>Checked</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => html`<tr key=${r.scheduler_name}>
@@ -493,23 +583,42 @@ function SchedulerJobsView() {
     </table></div>`;
 }
 
+// Providers we know we depend on but don't have live monitoring wired up for yet.
+// Shows as a placeholder card so they aren't forgotten — swapped for a real card
+// automatically once /api/providers starts returning a row with this name.
+const PLACEHOLDER_PROVIDERS = ['BrightData', 'Capsolver', 'Gemini'];
+// Account this token/login belongs to — shown so it's clear which account is
+// being checked. Static (not fetched from the API), so it can only ever show
+// what was actually given, never guessed.
+const PROVIDER_ACCOUNT = { brightdata: 'ai@holistique.in' };
+
 function ProvidersView() {
   const [rows] = useApi('/api/providers');
   if (!rows) return html`<div class="loading">Loading…</div>`;
   const borderColor = { operational:'var(--success-bd)', degraded:'var(--medium-bd)', partial_outage:'var(--high-bd)', major_outage:'var(--critical-bd)' };
+  const known = new Set(rows.map(r => r.provider.toLowerCase()));
+  const placeholders = PLACEHOLDER_PROVIDERS.filter(p => !known.has(p.toLowerCase()));
   return html`
     <div class="section-title">Third-Party Provider Status</div>
     <div class="provider-grid">
       ${rows.map(r => {
         const comps = Array.isArray(r.affected_components) ? r.affected_components : [];
+        const account = PROVIDER_ACCOUNT[r.provider.toLowerCase()];
         return html`<div key=${r.provider} class="provider-card"
           style=${`border-color:${borderColor[r.overall_status]||'var(--border)'}`}>
           <div class="provider-name">${r.provider}</div>
+          ${account && html`<div style="font-size:11px;color:var(--faint);margin:-4px 0 6px">${account}</div>`}
           <${StatusBadge} status=${r.overall_status}/>
           ${comps.length > 0 && html`<div class="provider-components">${comps.slice(0,3).join(', ')}${comps.length>3?` +${comps.length-3} more`:''}</div>`}
           <div style="font-size:11px;color:var(--faint);margin-top:8px">${fmt.ago(r.polled_at)}</div>
         </div>`;
       })}
+      ${placeholders.map(name => html`<div key=${name} class="provider-card"
+        style="border:1px dashed var(--border);filter:grayscale(1);opacity:.6">
+        <div class="provider-name" style="color:var(--faint)">${name}</div>
+        <span class="badge unknown">not monitored yet</span>
+        <div style="font-size:11px;color:var(--faint);margin-top:8px">awaiting monitoring setup</div>
+      </div>`)}
     </div>`;
 }
 
@@ -526,6 +635,10 @@ function alertTitle(t) {
     idle_sink: 'A data table went idle',
     third_party_degradation: 'A provider is degraded',
     ec2_resource_pressure: 'A server is under pressure',
+    job_failed: 'A job failed',
+    job_missed: 'A job missed its schedule',
+    job_cancelled: 'A job run was cancelled',
+    job_stuck: 'A job is stuck running',
   };
   return map[t] || (t || 'Alert').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
@@ -539,6 +652,10 @@ function alertAdvice(t) {
     sentinel_reconciliation: 'Two tables that should roughly agree on a metric are diverging. One may be wrong or stale.',
     idle_sink: 'This ClickHouse table has not received new data recently. The job that feeds it likely failed.',
     third_party_degradation: 'An external API (OpenAI, Anthropic, etc.) is degraded. Errors here may be transient — check the provider status.',
+    job_failed: 'Open the job\'s logs (click it on the Jobs page) to see the actual error, then decide whether to just rerun it or fix the underlying cause.',
+    job_missed: 'Its own cron schedule says it should have run again by now. Check the Cloud Scheduler trigger for this job — it may have been deleted, paused, or lost permission to run it.',
+    job_cancelled: 'Someone or something cancelled this run before it finished. If nobody did this on purpose, check for a deploy, quota limit, or manual stop around that time.',
+    job_stuck: 'Still running well past how long it normally takes. It may finish on its own — if not, check its logs for a hang (e.g. waiting on a slow external call) and consider cancelling and rerunning it.',
   };
   return map[t] || 'Review the details and the affected service.';
 }
@@ -589,48 +706,6 @@ function AlertsView() {
           <div style="margin-top:16px"><button class="ack-btn" onClick=${()=>ack(sel.alert_id)}>✓ Dismiss this alert</button></div>`;
       })()}
     </${Drawer}>`;
-}
-
-function PipelineView() {
-  const [rows] = useApi('/api/pipeline');
-  if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`
-    <div class="empty">
-      <p>No pipeline events yet.</p>
-      <p style="margin-top:8px;font-size:12px;color:var(--border)">
-        Add <code style="background:var(--sunken);padding:2px 6px;border-radius:4px">CT_METRICS:</code> log lines to your Cloud Run jobs to track processing metrics.
-      </p>
-    </div>`;
-
-  return html`
-    <div class="section-title">Pipeline Processing Metrics — last run per job</div>
-    <div class="table-scroll"><table>
-      <thead><tr>
-        <th>Job</th><th>Step</th><th>Status</th>
-        <th>Processed</th><th>Failed</th><th>Duration</th>
-        <th>24h runs</th><th>24h total processed</th><th>Last run</th>
-      </tr></thead>
-      <tbody>
-        ${rows.map(r => {
-          const h24 = r.history_24h || {};
-          return html`<tr key=${r.pipeline_id}>
-            <td class="mono">${r.pipeline_id}</td>
-            <td style="color:var(--muted)">${r.step_name}</td>
-            <td><${StatusBadge} status=${r.status}/></td>
-            <td><span class="num-badge num-ok">${fmt.num(r.rows_written)}</span></td>
-            <td>${r.rows_failed ? html`<span class="num-badge num-fail">${fmt.num(r.rows_failed)}</span>` : '—'}</td>
-            <td>${fmt.ms(r.duration_ms)}</td>
-            <td>${fmt.num(h24.runs_24h)}</td>
-            <td>${fmt.num(h24.total_processed_24h)}</td>
-            <td style="color:var(--muted)">${fmt.ago(r.occurred_at)}</td>
-          </tr>`;
-        })}
-      </tbody>
-    </table></div>
-    <div style="margin-top:16px;padding:14px;background:var(--bg);border-radius:8px;font-size:12px;color:var(--faint);line-height:1.8">
-      <b style="color:var(--muted)">How to add metrics to a service:</b><br/>
-      <code style="color:var(--success-fg)">log.info("CT_METRICS: " + json.dumps({"records_processed": 1234, "records_failed": 5, "step": "main"}))</code>
-    </div>`;
 }
 
 function CostsView() {
@@ -1165,7 +1240,6 @@ const NAV_GROUPS = [
     { id: 'services',   icon: '▦', label: 'Services'   },
     { id: 'jobs',       icon: '⚙', label: 'Jobs'       },
     { id: 'providers',  icon: '⚡', label: 'Providers'  },
-    { id: 'pipeline',   icon: '⇌', label: 'Pipeline'   },
     { id: 'alerts',     icon: '◈', label: 'Alerts'     },
     { id: 'costs',      icon: '₹', label: 'Costs'      },
   ]},
@@ -1330,7 +1404,6 @@ function App() {
           ${view === 'services'  && html`<${ServicesView}/>`}
           ${view === 'jobs'      && html`<${JobsView}/>`}
           ${view === 'providers' && html`<${ProvidersView}/>`}
-          ${view === 'pipeline'  && html`<${PipelineView}/>`}
           ${view === 'freshness' && html`<${FreshnessView}/>`}
           ${view === 'alerts'    && html`<${AlertsView}/>`}
           ${view === 'costs'     && html`<${CostsView}/>`}

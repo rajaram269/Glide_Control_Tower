@@ -98,7 +98,6 @@ Everything is stored in one Postgres database, split into two sections:
 | Services | Always-on apps: traffic, speed, error rate |
 | Jobs | Scheduled/batch jobs: did they run, did they succeed, click a row for its logs |
 | Providers | Is OpenAI/Anthropic/GCP itself having an outage right now |
-| Pipeline | Row counts some jobs report about themselves ("processed 10,000 rows") |
 | Alerts | History of every problem found, with a button to mark it handled |
 | Costs | Money spent vs budget |
 | Catalog | The AI's description of every business-data table |

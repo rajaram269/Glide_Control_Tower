@@ -1,7 +1,7 @@
 """
 Anomaly Detector — Control Tower
 Hourly Cloud Run job (at :30, offset from collector at :00).
-Reads PostgreSQL only, runs 5 anomaly checks, writes alerts to PostgreSQL.
+Reads PostgreSQL only, runs 6 anomaly checks, writes alerts to PostgreSQL.
 Deduplicates: skips if identical (alert_type, service_name) alert fired < 4h ago.
 
 All checks run against Postgres directly (control_tower schema is the source
@@ -231,6 +231,50 @@ def check_ec2_pressure(pg_cur):
     return alerts
 
 
+_JOB_PROBLEM_SEVERITY = {"failed": "critical", "missed": "critical", "cancelled": "warn", "stuck": "warn"}
+_JOB_PROBLEM_TEXT = {
+    "failed": "failed its last run",
+    "missed": "hasn't run when its own schedule says it should have",
+    "cancelled": "had its last run cancelled",
+    "stuck": "has been running far longer than usual",
+}
+
+
+def check_job_problems(pg_cur):
+    """Check 6: a Cloud Run job's CURRENT status (its latest check, not any
+    older one) is failed / missed / cancelled / stuck (see gcp_collector's
+    fetch_run_job_metrics + detect_missed_schedules for how these are set).
+    Restricted to active registered jobs — a deleted job shouldn't alert."""
+    pg_cur.execute("""
+        WITH latest AS (
+            SELECT DISTINCT ON (h.service_name)
+                   h.service_name, h.job_status, h.job_last_execution_at, h.job_duration_ms
+            FROM control_tower.service_health h
+            JOIN control_tower.registered_services r
+                ON r.service_name = h.service_name AND r.active = true
+            WHERE h.platform = 'cloud_run_job'
+            ORDER BY h.service_name, h.collected_at DESC
+        )
+        SELECT service_name, job_status, job_last_execution_at, job_duration_ms
+        FROM latest
+        WHERE job_status IN ('failed', 'missed', 'cancelled', 'stuck')
+    """)
+    alerts = []
+    for service, status, last_exec, duration_ms in pg_cur.fetchall():
+        alerts.append({
+            "alert_type": f"job_{status}",
+            "severity": _JOB_PROBLEM_SEVERITY[status],
+            "service_name": service,
+            "message": f"{service} {_JOB_PROBLEM_TEXT[status]}",
+            "context_json": {
+                "job_status": status,
+                "job_last_execution_at": last_exec.isoformat() if last_exec else None,
+                "job_duration_ms": duration_ms,
+            },
+        })
+    return alerts
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -248,6 +292,7 @@ def main():
                 check_idle_sinks,
                 check_api_degradation,
                 check_ec2_pressure,
+                check_job_problems,
             ]
             for check_fn in checks:
                 try:

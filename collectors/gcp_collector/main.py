@@ -197,11 +197,19 @@ def fetch_run_service_metrics(client, service_name, region):
     return result
 
 
-def fetch_run_job_metrics(executions_client, job_name, region):
-    """Returns dict of metrics for a Cloud Run job — last completed execution
-    via the Cloud Run Admin API. Deterministic regardless of when the job last ran
+def fetch_run_job_metrics(executions_client, job_name, region, duration_baseline_ms=None):
+    """Returns dict of metrics for a Cloud Run job — its most recent execution via
+    the Cloud Run Admin API. Deterministic regardless of when the job last ran
     (the old Cloud Monitoring window approach returned NULLs for any job that
-    didn't complete within the past hour)."""
+    didn't complete within the past hour).
+
+    job_status is one of: succeeded, failed, cancelled, running, stuck.
+    A still-running execution used to be skipped here entirely, silently falling
+    back to whatever the PREVIOUS execution reported — so a job stuck running for
+    hours looked identical to "ran fine a while ago" on the dashboard. Now it's
+    classified as "running" normally, or "stuck" if it's gone well past how long
+    this job normally takes (duration_baseline_ms — its own 14-day p95, so the
+    threshold is specific to each job rather than one guessed global cutoff)."""
     result = {
         "job_exit_code": None, "job_duration_ms": None, "job_status": None,
         "job_last_execution_at": None,
@@ -209,26 +217,43 @@ def fetch_run_job_metrics(executions_client, job_name, region):
 
     try:
         parent = f"projects/{PROJECT}/locations/{region}/jobs/{job_name}"
-        # API returns executions newest-first; only need the most recent completed one.
+        # API returns executions newest-first; only need the most recent one.
         # Empty result (0 executions) here usually means job_name/region is wrong —
         # log so mis-registered jobs (see registered_services) surface instead of
         # silently staying blank forever.
         found_any = False
         for execution in executions_client.list_executions(parent=parent):
             found_any = True
-            if not execution.completion_time:
-                continue  # still running
-            failed = execution.failed_count or 0
-            result["job_status"] = "failed" if failed > 0 else "succeeded"
-            result["job_exit_code"] = 1 if failed > 0 else 0
-            # Actual time the job finished running — distinct from collected_at
-            # (when Control Tower scraped this), which can be much more recent
-            # than the job's own last run for infrequently-scheduled jobs.
-            result["job_last_execution_at"] = execution.completion_time
             start = execution.start_time or execution.create_time
-            if start and execution.completion_time:
-                duration = execution.completion_time - start
-                result["job_duration_ms"] = int(duration.total_seconds() * 1000)
+            if execution.completion_time:
+                if execution.cancelled_count:
+                    result["job_status"] = "cancelled"
+                elif execution.failed_count:
+                    result["job_status"] = "failed"
+                else:
+                    result["job_status"] = "succeeded"
+                result["job_exit_code"] = 0 if result["job_status"] == "succeeded" else 1
+                # Actual time the job finished running — distinct from collected_at
+                # (when Control Tower scraped this), which can be much more recent
+                # than the job's own last run for infrequently-scheduled jobs.
+                result["job_last_execution_at"] = execution.completion_time
+                if start:
+                    result["job_duration_ms"] = int(
+                        (execution.completion_time - start).total_seconds() * 1000)
+            else:
+                # Still running (or queued to start). Floor of 15 minutes so a job
+                # with little/no history, or one that normally finishes in seconds,
+                # isn't flagged "stuck" the moment it takes a couple of minutes.
+                # NOW is captured once at script start, but this collection loop runs
+                # for several minutes — a job that started after NOW (but before its
+                # turn in the loop) would otherwise show a nonsensical negative value.
+                elapsed_ms = max(0, int((NOW - start).total_seconds() * 1000)) if start else None
+                stuck_threshold_ms = max(900_000, (duration_baseline_ms or 0) * 3)
+                result["job_status"] = (
+                    "stuck" if elapsed_ms is not None and elapsed_ms > stuck_threshold_ms
+                    else "running")
+                result["job_duration_ms"] = elapsed_ms       # how long it's been running so far
+                result["job_last_execution_at"] = start      # when this (unfinished) run started
             break
         if not found_any:
             log.warning(
@@ -312,13 +337,75 @@ def poll_status_pages(pg_cur):
         log.info("Wrote %d provider_status rows", len(rows))
 
 
+# ─── BrightData account health ────────────────────────────────────────────────
+#
+# BrightData has no public status page like the STATUSPAGE_PROVIDERS above, so
+# this checks our own account directly instead: confirms the API key still
+# works and lists active zones (proxy/SERP/unlocker products on the account).
+# NOT balance/quota — the account's API token doesn't have that permission
+# (BrightData returns "API key lacks the required permissions" on the balance
+# endpoint). Shown as unmonitored on the dashboard rather than guessed at.
+_BRIGHTDATA_BALANCE_URL = "https://api.brightdata.com/customer/balance"
+
+
+def check_brightdata(pg_cur):
+    api_key = os.environ.get("BRIGHTDATA_API_KEY")
+    if not api_key:
+        return  # not configured — leave BrightData showing as unmonitored
+    try:
+        r = requests.get(_BRIGHTDATA_BALANCE_URL,
+                          headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        balance = data.get("balance")
+        # major_outage covers both "can't reach/auth to the API" and "account is
+        # out of money" — both mean BrightData calls will start failing.
+        status = "major_outage" if balance is not None and balance <= 0 else "operational"
+        components = [f"Balance: ${balance:,.2f}" if balance is not None else "Balance: unknown"]
+        log.info("BrightData: balance=%s", balance)
+    except Exception as e:
+        status, components = "major_outage", [f"API check failed: {e}"[:200]]
+        log.warning("BrightData health check failed: %s", e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        ("brightdata", _BRIGHTDATA_BALANCE_URL, status, json.dumps(components), NOW),
+    )
+
+
 # ─── Auto-discovery ──────────────────────────────────────────────────────────
 
+# Historical default kept only as a last-resort fallback (see below) — discovery
+# itself no longer limits to these regions.
 MONITORED_REGIONS = ["asia-south1", "us-central1", "us-west1"]
+
+# Every region Cloud Run Jobs is available in (per Google's published region
+# list). The Jobs API has no "list all regions" or wildcard-location method
+# (unlike Services — see below), so this is checked in full every run instead
+# of a short hand-picked list. Missing a region here would silently make
+# Control Tower blind to any job deployed there, the exact problem this list
+# replaces. A new Google Cloud region is a rare, deliberate rollout, so a
+# static list is low-maintenance; staleness only means a brand-new region takes
+# a code update to pick up — it can never cause a *real* job to look deleted.
+ALL_RUN_REGIONS = [
+    "asia-east1", "asia-east2", "asia-northeast1", "asia-northeast2", "asia-northeast3",
+    "asia-south1", "asia-south2", "asia-southeast1", "asia-southeast2",
+    "australia-southeast1", "australia-southeast2",
+    "europe-central2", "europe-north1", "europe-southwest1",
+    "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+    "europe-west6", "europe-west8", "europe-west9", "europe-west12",
+    "me-central1", "me-central2", "me-west1",
+    "northamerica-northeast1", "northamerica-northeast2",
+    "southamerica-east1", "southamerica-west1",
+    "us-central1", "us-east1", "us-east4", "us-east5", "us-south1",
+    "us-west1", "us-west2", "us-west3", "us-west4",
+]
 
 
 def auto_discover(pg_cur):
-    log.info("Auto-discovering Cloud Run services and jobs...")
+    log.info("Auto-discovering Cloud Run services and jobs (all regions)...")
     run_client = run_v2.ServicesClient()
     jobs_client = run_v2.JobsClient()
 
@@ -328,30 +415,45 @@ def auto_discover(pg_cur):
 
     new_rows = []
     notifications = []
+    seen_names = set()       # every service/job name actually listed this run
+    listing_complete = True  # false if any listing call failed — see below
 
-    for region in MONITORED_REGIONS:
-        parent = f"projects/{PROJECT}/locations/{region}"
+    # Services — auto-activated: newly deployed services should show up in
+    # Control Tower immediately, not sit invisibly until someone flips a flag.
+    # locations/- is a documented wildcard: one call lists every region at once,
+    # so this can never miss a region the way a hand-picked list could.
+    try:
+        for svc in run_client.list_services(parent=f"projects/{PROJECT}/locations/-"):
+            name = svc.name.split("/")[-1]
+            region = svc.name.split("/")[-3]
+            seen_names.add(name)
+            if name not in known and not name.startswith("ct-"):
+                new_rows.append((name, "cloud_run_service", region, "gcp", True))
+                notifications.append(f"service:{name} ({region})")
+    except Exception as e:
+        listing_complete = False
+        log.warning("Service discovery failed: %s", e)
 
-        # Services — auto-activated: newly deployed services should show up in
-        # Control Tower immediately, not sit invisibly until someone flips a flag.
+    # Jobs — no wildcard support on this API, so every real Cloud Run region is
+    # checked individually.
+    for region in ALL_RUN_REGIONS:
         try:
-            for svc in run_client.list_services(parent=parent):
-                name = svc.name.split("/")[-1]
-                if name not in known and not name.startswith("ct-"):
-                    new_rows.append((name, "cloud_run_service", region, "gcp", True))
-                    notifications.append(f"service:{name} ({region})")
-        except Exception as e:
-            log.warning("Service discovery failed for %s: %s", region, e)
-
-        # Jobs
-        try:
-            for job in jobs_client.list_jobs(parent=parent):
+            for job in jobs_client.list_jobs(parent=f"projects/{PROJECT}/locations/{region}"):
                 name = job.name.split("/")[-1]
+                seen_names.add(name)
                 if name not in known and not name.startswith("ct-"):
                     new_rows.append((name, "cloud_run_job", region, "gcp", True))
                     notifications.append(f"job:{name} ({region})")
         except Exception as e:
-            log.warning("Job discovery failed for %s: %s", region, e)
+            # Some regions are permanently off-limits to this org (a resource-
+            # location org policy) — that's an expected "no jobs here", not a
+            # failure, and must not disable the cleanup step below every single
+            # run forever. Anything else is treated as a real failure.
+            if getattr(e, "reason", None) == "LOCATION_POLICY_VIOLATED":
+                log.info("Region %s unavailable (org location policy) — skipping", region)
+            else:
+                listing_complete = False
+                log.warning("Job discovery failed for %s: %s", region, e)
 
     if new_rows:
         execute_values(
@@ -362,6 +464,24 @@ def auto_discover(pg_cur):
             new_rows,
         )
         log.info("Discovered %d new services/jobs: %s", len(new_rows), notifications)
+
+    # Retire services/jobs deleted from GCP so they stop showing on the dashboard.
+    # Only when EVERY listing call above succeeded — services (one wildcard call)
+    # and jobs (every region in ALL_RUN_REGIONS) — so real, live resources can
+    # never be marked inactive off incomplete information. A transient API error
+    # anywhere just skips cleanup for this run; the next hourly run retries.
+    if listing_complete:
+        pg_cur.execute(
+            """UPDATE control_tower.registered_services SET active = false
+               WHERE active = true AND cloud = 'gcp'
+                 AND platform IN ('cloud_run_service', 'cloud_run_job')
+                 AND NOT (service_name = ANY(%s))""",
+            (list(seen_names),),
+        )
+        if pg_cur.rowcount:
+            log.info("Marked %d deleted services/jobs inactive", pg_cur.rowcount)
+    else:
+        log.warning("Skipping deleted-service/job cleanup this run — listing was incomplete")
 
 
 # ─── Cloud Scheduler jobs (all targets, all regions) ──────────────────────────
@@ -416,7 +536,7 @@ def collect_scheduler_status(pg_cur):
                 else:
                     status = f"error (code {job.status.code})"
                 rows.append((name, job.schedule, uri, region, True, last_attempt, status, NOW,
-                             target_type, target_name, job.state.name))
+                             target_type, target_name, job.state.name, job.time_zone or None))
         except Exception as e:
             listing_complete = False
             log.warning("Scheduler job listing failed for %s: %s", region, e)
@@ -427,7 +547,7 @@ def collect_scheduler_status(pg_cur):
             """INSERT INTO control_tower.scheduler_jobs
                (scheduler_name, schedule, target_uri, region, active,
                 last_attempt_at, last_attempt_status, checked_at,
-                target_type, target_name, state)
+                target_type, target_name, state, time_zone)
                VALUES %s
                ON CONFLICT (scheduler_name) DO UPDATE SET
                    schedule = EXCLUDED.schedule,
@@ -439,7 +559,8 @@ def collect_scheduler_status(pg_cur):
                    checked_at = EXCLUDED.checked_at,
                    target_type = EXCLUDED.target_type,
                    target_name = EXCLUDED.target_name,
-                   state = EXCLUDED.state""",
+                   state = EXCLUDED.state,
+                   time_zone = EXCLUDED.time_zone""",
             rows,
         )
         log.info("Upserted %d scheduler jobs across %d regions", len(rows), len(regions))
@@ -454,6 +575,56 @@ def collect_scheduler_status(pg_cur):
         )
         if pg_cur.rowcount:
             log.info("Marked %d deleted scheduler jobs inactive", pg_cur.rowcount)
+
+
+# ─── Missed-schedule detection ────────────────────────────────────────────────
+#
+# A Cloud Run job whose triggering schedule silently stopped firing (deleted
+# trigger, wrong IAM role, quota, etc.) otherwise looks identical on the
+# dashboard to a job that simply "hasn't run yet" — nothing distinguishes
+# "not due" from "should have fired and didn't". This compares each job's own
+# cron schedule to when it actually last ran and flags the gap.
+#
+# Grace period is one full collector cycle (this job runs hourly) so ordinary
+# scheduling jitter or a slightly-late collector run never gets misread as a
+# broken schedule.
+CRON_GRACE_MINUTES = 60
+
+
+def detect_missed_schedules(pg_cur):
+    from croniter import croniter
+    from zoneinfo import ZoneInfo
+
+    pg_cur.execute("""
+        SELECT s.target_name, s.schedule, s.time_zone, h.job_last_execution_at
+        FROM control_tower.scheduler_jobs s
+        JOIN control_tower.service_health h
+            ON h.service_name = s.target_name AND h.collected_at = %s
+        WHERE s.active AND s.target_type = 'cloud_run_job' AND s.schedule IS NOT NULL
+          AND h.job_status NOT IN ('running', 'stuck')
+    """, (NOW,))
+
+    missed = []
+    for job_name, cron_expr, tz_name, last_exec in pg_cur.fetchall():
+        if not last_exec:
+            continue  # never having run at all is already flagged separately
+        try:
+            tz = ZoneInfo(tz_name) if tz_name else datetime.timezone.utc
+            expected_next = croniter(cron_expr, last_exec.astimezone(tz)).get_next(datetime.datetime)
+        except Exception as e:
+            log.warning("Cron parse failed for %s (%r, tz=%r): %s", job_name, cron_expr, tz_name, e)
+            continue
+        overdue_by = NOW - expected_next.astimezone(datetime.timezone.utc)
+        if overdue_by > datetime.timedelta(minutes=CRON_GRACE_MINUTES):
+            missed.append(job_name)
+
+    if missed:
+        pg_cur.execute(
+            """UPDATE control_tower.service_health SET job_status = 'missed'
+               WHERE service_name = ANY(%s) AND collected_at = %s""",
+            (missed, NOW),
+        )
+        log.info("Flagged %d job(s) as missed (schedule overdue): %s", len(missed), missed)
 
 
 # ─── Data freshness checker ──────────────────────────────────────────────────
@@ -630,129 +801,28 @@ def collect_api_health(pg_cur):
         log.info("Wrote %d third_party_api_health rows", len(rows))
 
 
-# ─── Pipeline processing metrics from Cloud Logging ──────────────────────────
-#
-# Services opt in by emitting a single log line:
-#   import json, logging
-#   logging.getLogger(__name__).info(
-#       "CT_METRICS: " + json.dumps({
-#           "records_processed": 1234,   # total attempted
-#           "records_success":   1230,   # successfully written/indexed
-#           "records_failed":    4,      # errors / skipped
-#           "step":              "main", # optional step name
-#           "duration_ms":       45000,  # optional wall-clock ms
-#       })
-#   )
-#
-# The GCP collector queries for these lines every hour per Cloud Run job.
-# Results land in control_tower.pipeline_events.
-
-def collect_pipeline_metrics(pg_cur, services):
-    log.info("Collecting pipeline processing metrics from Cloud Logging...")
-    log_client = gcp_logging.Client(project=PROJECT)
-
-    job_names = [s["service_name"] for s in services if s["platform"] == "cloud_run_job"]
-    if not job_names:
-        log.info("No Cloud Run jobs registered, skipping pipeline metrics.")
-        return
-
-    window_start_str = WINDOW_START.strftime("%Y-%m-%dT%H:%M:%SZ")
-    window_end_str = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Single query covering all jobs — OR is more efficient than N round trips
-    job_filter = " OR ".join(f'resource.labels.job_name="{j}"' for j in job_names)
-    filter_str = (
-        f'resource.type="cloud_run_job" '
-        f'AND ({job_filter}) '
-        f'AND textPayload =~ "CT_METRICS:" '
-        f'AND timestamp>="{window_start_str}" '
-        f'AND timestamp<="{window_end_str}"'
-    )
-
-    try:
-        entries = list(log_client.list_entries(
-            filter_=filter_str,
-            max_results=500,
-            order_by=gcp_logging.DESCENDING,
-        ))
-    except Exception as e:
-        log.warning("Pipeline metrics Cloud Logging query failed: %s", e)
-        return
-
-    if not entries:
-        log.info("No CT_METRICS lines found in this window.")
-        return
-
-    # Avoid re-inserting rows for executions already recorded
-    execution_ids = [
-        (e.labels or {}).get("run.googleapis.com/execution_name", "")
-        for e in entries
-    ]
-    execution_ids = [eid for eid in execution_ids if eid]
-    seen = set()
-    if execution_ids:
-        pg_cur.execute(
-            "SELECT execution_id FROM control_tower.pipeline_events "
-            "WHERE execution_id = ANY(%s)",
-            (execution_ids,),
-        )
-        seen = {r[0] for r in pg_cur.fetchall()}
-
-    rows = []
-    for entry in entries:
-        labels = entry.labels or {}
-        execution_id = labels.get("run.googleapis.com/execution_name", "") or None
-        if execution_id and execution_id in seen:
-            continue
-
-        job_name = (entry.resource.labels or {}).get("job_name", "")
-        payload = str(entry.payload)
-        ct_idx = payload.find("CT_METRICS:")
-        if ct_idx == -1:
-            continue
-        try:
-            metrics = json.loads(payload[ct_idx + len("CT_METRICS:"):].strip())
-        except json.JSONDecodeError:
-            continue
-
-        records_processed = metrics.get("records_processed") or metrics.get("records_success")
-        records_failed = metrics.get("records_failed", 0)
-        extra = {k: v for k, v in metrics.items()
-                 if k not in ("step", "records_processed", "records_success",
-                              "records_failed", "duration_ms")}
-        rows.append((
-            job_name,
-            metrics.get("step", "main"),
-            execution_id,
-            "run_complete",
-            "error" if records_failed else "ok",
-            records_processed,
-            records_failed or None,
-            None,           # rows_expected_min
-            metrics.get("duration_ms"),
-            None,           # error_message
-            json.dumps(extra) if extra else None,
-            entry.timestamp,
-        ))
-
-    if rows:
-        execute_values(
-            pg_cur,
-            """INSERT INTO control_tower.pipeline_events
-               (pipeline_id, step_name, execution_id, event_type, status,
-                rows_written, rows_failed, rows_expected_min, duration_ms,
-                error_message, metadata_json, occurred_at)
-               VALUES %s""",
-            rows,
-        )
-        log.info("Wrote %d pipeline_events rows", len(rows))
-
-
 # ─── Main collection loop ────────────────────────────────────────────────────
+
+def _job_duration_baselines(pg_cur):
+    """Each job's own 14-day p95 duration, used as the "how long does this job
+    normally take" yardstick for stuck-run detection — a per-job baseline rather
+    than one guessed global cutoff, since a 3-minute sync job and a 45-minute
+    reconciliation job have very different definitions of "running too long"."""
+    pg_cur.execute("""
+        SELECT service_name, percentile_cont(0.95) WITHIN GROUP (ORDER BY job_duration_ms)
+        FROM control_tower.service_health
+        WHERE platform = 'cloud_run_job' AND job_duration_ms IS NOT NULL
+          AND job_status NOT IN ('running', 'stuck')
+          AND collected_at >= NOW() - INTERVAL '14 days'
+        GROUP BY service_name
+    """)
+    return {r[0]: r[1] for r in pg_cur.fetchall()}
+
 
 def collect_service_health(pg_cur, services):
     monitoring_client = monitoring_v3.MetricServiceClient()
     executions_client = run_v2.ExecutionsClient()
+    duration_baselines = _job_duration_baselines(pg_cur)
     rows = []
 
     for svc in services:
@@ -764,7 +834,8 @@ def collect_service_health(pg_cur, services):
         if platform == "cloud_run_service":
             metrics = fetch_run_service_metrics(monitoring_client, service_name, region)
         elif platform == "cloud_run_job":
-            metrics = fetch_run_job_metrics(executions_client, service_name, region)
+            metrics = fetch_run_job_metrics(executions_client, service_name, region,
+                                             duration_baselines.get(service_name))
         else:
             continue
 
@@ -842,6 +913,7 @@ def main():
 
             # 3. Poll status pages
             poll_status_pages(cur)
+            check_brightdata(cur)
             pg.commit()
 
             # 4. Auto-discover new services
@@ -852,6 +924,10 @@ def main():
             collect_scheduler_status(cur)
             pg.commit()
 
+            # 4c. Flag jobs whose own schedule says they should have run again by now
+            detect_missed_schedules(cur)
+            pg.commit()
+
             # 5. Data freshness: auto-discover PeerDB tables, then check all watched
             auto_discover_watched_tables(cur, ch)
             check_data_freshness(cur, ch)
@@ -859,10 +935,6 @@ def main():
 
             # 6. API health from Cloud Logging
             collect_api_health(cur)
-            pg.commit()
-
-            # 7. Pipeline processing metrics (CT_METRICS convention)
-            collect_pipeline_metrics(cur, services)
             pg.commit()
             log.info("All data committed to PostgreSQL.")
 

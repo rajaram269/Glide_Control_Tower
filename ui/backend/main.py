@@ -51,7 +51,7 @@ def summary():
                     FROM control_tower.service_health
                     WHERE platform = 'cloud_run_job'
                     ORDER BY service_name, collected_at DESC
-                 ) j WHERE job_status = 'failed') AS jobs_failing,
+                 ) j WHERE job_status IN ('failed', 'missed', 'cancelled', 'stuck')) AS jobs_failing,
                 (SELECT COUNT(*) FROM control_tower.alerts WHERE acknowledged_at IS NULL) AS open_alerts,
                 (SELECT COUNT(*) FROM control_tower.alerts WHERE acknowledged_at IS NULL AND severity = 'critical') AS critical_alerts,
                 (SELECT COALESCE(SUM(cost_usd), 0) FROM control_tower.cost_metrics
@@ -74,6 +74,8 @@ def services():
                 collected_at
             FROM control_tower.service_health
             WHERE platform = 'cloud_run_service'
+              AND service_name IN (
+                  SELECT service_name FROM control_tower.registered_services WHERE active = true)
             ORDER BY service_name, collected_at DESC
         """)
         return cur.fetchall()
@@ -92,6 +94,8 @@ def jobs():
                 job_last_execution_at, collected_at
             FROM control_tower.service_health
             WHERE platform = 'cloud_run_job'
+              AND service_name IN (
+                  SELECT service_name FROM control_tower.registered_services WHERE active = true)
             ORDER BY service_name, collected_at DESC
         """)
         return cur.fetchall()
@@ -118,7 +122,8 @@ def scheduler_jobs():
 #
 # Lets developers without GCP console access read a job's / service's logs
 # from the dashboard. Uses the UI's own service account (roles/logging.viewer).
-# Jobs: entries of the latest execution (last 7 days). Services: last 24 hours.
+# Jobs: entries of a chosen execution, defaulting to the latest (last 2 days).
+# Services: last 24 hours.
 
 LOG_PROJECT = os.environ.get("GCP_PROJECT", "seoai-479305")
 _LOG_TARGETS = {
@@ -132,8 +137,19 @@ _EXEC_LABEL = "run.googleapis.com/execution_name"
 
 def _log_line(entry):
     p = entry.payload
+    raw = None
     if isinstance(p, dict):
-        msg = p.get("message") or p.get("msg") or json.dumps(p, default=str)
+        status = p.get("status") if isinstance(p.get("status"), dict) else None
+        # Plain app logs have "message"/"msg". Cloud Run execution audit-log entries
+        # (job started/failed/etc.) instead carry it at status.message — e.g.
+        # "Execution my-job-abcd has failed to complete, 0/1 tasks were a success."
+        # Without this, these render as one unreadable multi-hundred-field JSON dump
+        # (the raw audit record) instead of the one line Cloud Console shows.
+        msg = p.get("message") or p.get("msg") or (status and status.get("message"))
+        if msg:
+            raw = json.dumps(p, default=str)[:4000]  # kept so the full record can be inspected
+        else:
+            msg = json.dumps(p, default=str)
     else:
         msg = "" if p is None else str(p)
     req = entry.http_request or {}
@@ -141,13 +157,49 @@ def _log_line(entry):
         msg = (f'{req.get("requestMethod", "")} {req.get("requestUrl", "")} → '
                f'{req.get("status", "")} ({req.get("latency", "")}) {msg}').strip()
     return {"timestamp": entry.timestamp, "severity": entry.severity or "DEFAULT",
-            "message": msg[:4000]}
+            "message": msg[:4000], "raw": raw}
+
+
+@app.get("/api/logs/job/{name}/executions")
+def job_executions(name: str, region: str):
+    """Every execution of this job from the same 2-day window the logs themselves
+    use — not a fixed count. A job that runs every 10 minutes should list all of
+    today's and yesterday's runs, however many that is; a job that runs weekly
+    should list just the one or two that fall in that window."""
+    if not _RUN_NAME.match(name) or not _RUN_NAME.match(region):
+        raise HTTPException(400, "invalid job name or region")
+    cutoff = datetime.now(timezone.utc) - _LOG_TARGETS["job"][2]
+    SAFETY_CAP = 200  # guards only against a pathological once-a-minute job; not a normal limit
+    try:
+        from google.cloud import run_v2
+        client = run_v2.ExecutionsClient()
+        parent = f"projects/{LOG_PROJECT}/locations/{region}/jobs/{name}"
+        execs = []
+        for e in client.list_executions(parent=parent):  # API returns newest-first
+            start = e.start_time or e.create_time
+            if start and start < cutoff:
+                break  # everything from here on is even older than the window
+            execs.append({
+                "execution": e.name.split("/")[-1],
+                "started_at": start.isoformat() if start else None,
+                "completed_at": e.completion_time.isoformat() if e.completion_time else None,
+                "status": "running" if not e.completion_time
+                          else ("failed" if e.failed_count else "succeeded"),
+            })
+            if len(execs) >= SAFETY_CAP:
+                break
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Executions unavailable: {type(e).__name__}: {first_line}")
+    return execs
 
 
 @app.get("/api/logs/{kind}/{name}")
-def logs(kind: str, name: str, errors_only: bool = False, limit: int = 200):
+def logs(kind: str, name: str, execution: str = None, errors_only: bool = False, limit: int = 200):
     if kind not in _LOG_TARGETS or not _RUN_NAME.match(name):
         raise HTTPException(400, "unknown log target")
+    if execution is not None and not _RUN_NAME.match(execution):
+        raise HTTPException(400, "invalid execution name")
     resource_type, label, window = _LOG_TARGETS[kind]
     limit = max(1, min(limit, 500))
     since = (datetime.now(timezone.utc) - window).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -157,13 +209,18 @@ def logs(kind: str, name: str, errors_only: bool = False, limit: int = 200):
     try:
         from google.cloud import logging as gcp_logging
         client = gcp_logging.Client(project=LOG_PROJECT)
-        execution = None
         if kind == "job":
-            newest = next(iter(client.list_entries(
-                filter_=base, order_by=gcp_logging.DESCENDING, max_results=1)), None)
-            execution = newest.labels.get(_EXEC_LABEL) if newest and newest.labels else None
             if execution:
+                # A specific run was picked from the execution dropdown.
                 base += f' AND labels."{_EXEC_LABEL}"="{execution}"'
+            else:
+                # No run picked (first load) — default to whichever one logged most
+                # recently, same as before the dropdown existed.
+                newest = next(iter(client.list_entries(
+                    filter_=base, order_by=gcp_logging.DESCENDING, max_results=1)), None)
+                execution = newest.labels.get(_EXEC_LABEL) if newest and newest.labels else None
+                if execution:
+                    base += f' AND labels."{_EXEC_LABEL}"="{execution}"'
         flt = base + (" AND severity>=ERROR" if errors_only else "")
         entries = client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
                                       max_results=limit, page_size=limit)
@@ -226,41 +283,6 @@ def ack_alert(alert_id: str):
         if not cur.fetchone():
             raise HTTPException(404, "Alert not found or already acknowledged")
     return {"ok": True}
-
-
-@app.get("/api/pipeline")
-def pipeline(limit: int = 100):
-    with get_db() as cur:
-        cur.execute("""
-            SELECT DISTINCT ON (pipeline_id)
-                pipeline_id, step_name, execution_id, event_type, status,
-                rows_written, rows_failed, duration_ms, error_message,
-                metadata_json, occurred_at
-            FROM control_tower.pipeline_events
-            ORDER BY pipeline_id, occurred_at DESC
-        """)
-        latest = cur.fetchall()
-
-        # Last 24h history per job for trend
-        cur.execute("""
-            SELECT pipeline_id,
-                   COUNT(*) AS runs_24h,
-                   SUM(rows_written) AS total_processed_24h,
-                   SUM(rows_failed) AS total_failed_24h,
-                   SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_runs_24h
-            FROM control_tower.pipeline_events
-            WHERE occurred_at > NOW() - INTERVAL '24 hours'
-              AND event_type = 'run_complete'
-            GROUP BY pipeline_id
-        """)
-        history = {r["pipeline_id"]: dict(r) for r in cur.fetchall()}
-
-        result = []
-        for row in latest:
-            d = dict(row)
-            d["history_24h"] = history.get(d["pipeline_id"], {})
-            result.append(d)
-        return result
 
 
 @app.get("/api/costs")
