@@ -6,6 +6,7 @@ runs the data freshness checker, queries Cloud Logging for API health signals,
 then pings healthchecks.io.
 """
 import os, json, re, time, datetime, logging
+from urllib.parse import urlparse
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
@@ -31,7 +32,6 @@ WINDOW_START = NOW - datetime.timedelta(minutes=COLLECTION_WINDOW_MINUTES)
 STATUSPAGE_PROVIDERS = {
     "openai":     "https://status.openai.com/api/v2/status.json",
     "anthropic":  "https://status.anthropic.com/api/v2/status.json",
-    "replicate":  "https://www.replicatestatus.com/api/v2/status.json",
     "cloudflare": "https://www.cloudflarestatus.com/api/v2/status.json",
     "cohere":     "https://status.cohere.com/api/v2/status.json",
 }
@@ -59,7 +59,6 @@ GOOGLE_IMPACT_MAP = {
 API_LOG_FILTERS = {
     "openai":    'textPayload =~ "openai" AND (textPayload =~ "RateLimitError|APIError|Timeout")',
     "cohere":    'textPayload =~ "cohere" AND (textPayload =~ "429|TooManyRequestsError")',
-    "replicate": 'textPayload =~ "replicate" AND severity>="ERROR"',
     "anthropic": 'textPayload =~ "anthropic" AND severity>="ERROR"',
 }
 
@@ -107,7 +106,81 @@ def _list_series(client, project_name, filter_str, aggregation):
     return list(client.list_time_series(request=request))
 
 
-def fetch_run_service_metrics(client, service_name, region):
+# A URL path segment that's a dynamic ID (UUID, cuid, plain numeric, etc.) —
+# collapsed to "{id}" so e.g. /api/runs/<uuid> aggregates as one endpoint
+# instead of exploding into one bucket per distinct ID ever requested.
+_ID_SEGMENT = re.compile(
+    r'^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d+|[0-9a-zA-Z]{20,})$'
+)
+
+
+def _normalize_path(path):
+    return '/'.join('{id}' if _ID_SEGMENT.match(seg) else seg for seg in path.split('/'))
+
+
+# Endpoint counts as "broken" (not just an unlucky one-off request) once it has
+# at least this many requests and at least this fraction are erroring.
+_BAD_ENDPOINT_MIN_REQUESTS = 3
+_BAD_ENDPOINT_ERROR_FRACTION = 0.5
+
+
+def _service_log_signals(log_client, service_name):
+    """One Cloud Logging query per service, covering this collection window,
+    producing two "deeper than aggregate 5xx rate" signals:
+      - error_log_count: app-level ERROR+ log lines with no 5xx attached — the
+        service answered 200 but logged an internal error ("silent failure").
+      - bad_endpoints: specific URL paths failing badly even while the
+        service's overall error rate looks fine (one broken endpoint hiding
+        in otherwise-healthy traffic).
+    Cloud Run logs every request's URL/status on its own — no app change
+    needed for bad_endpoints. error_log_count only ever finds something for a
+    service that logs at ERROR severity itself; most don't today, but this
+    picks it up automatically the moment any service starts.
+    Returns (error_log_count, bad_endpoints) — (None, None) if the query fails.
+    """
+    since = WINDOW_START.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+    flt = (
+        f'resource.type="cloud_run_revision" '
+        f'AND resource.labels.service_name="{service_name}" '
+        f'AND (httpRequest.status>0 OR severity>=ERROR) '
+        f'AND timestamp>="{since}" AND timestamp<="{until}"'
+    )
+    error_log_count = 0
+    by_path = {}
+    try:
+        for entry in log_client.list_entries(filter_=flt, max_results=1000, page_size=500):
+            req = entry.http_request or {}
+            status = req.get("status") or 0
+            if status:
+                path = _normalize_path(urlparse(req.get("requestUrl") or "").path or "/")
+                d = by_path.setdefault(path, {"requests": 0, "errors": 0})
+                d["requests"] += 1
+                if status >= 500:
+                    d["errors"] += 1
+            # A log entry that's severity ERROR+ but not itself a 5xx request —
+            # covers both request logs with a non-5xx status and, more often,
+            # plain app log lines (no httpRequest at all, status stays 0).
+            if (entry.severity or "") in ("ERROR", "CRITICAL", "ALERT", "EMERGENCY") and status < 500:
+                error_log_count += 1
+    except Exception as e:
+        log.warning("Log signals query failed for %s: %s", service_name, e)
+        return None, None
+
+    bad_endpoints = sorted(
+        (
+            {"path": p, "requests": d["requests"], "errors": d["errors"],
+             "error_rate_pct": round(100 * d["errors"] / d["requests"], 1)}
+            for p, d in by_path.items()
+            if d["requests"] >= _BAD_ENDPOINT_MIN_REQUESTS
+            and d["errors"] / d["requests"] >= _BAD_ENDPOINT_ERROR_FRACTION
+        ),
+        key=lambda x: -x["errors"],
+    )
+    return error_log_count, bad_endpoints
+
+
+def fetch_run_service_metrics(client, service_name, region, log_client=None):
     """Returns dict of metrics for a Cloud Run service."""
     project_name = f"projects/{PROJECT}"
     rf = (
@@ -118,7 +191,7 @@ def fetch_run_service_metrics(client, service_name, region):
     result = {
         "request_count": None, "error_count": None,
         "p50_latency_ms": None, "p95_latency_ms": None, "p99_latency_ms": None,
-        "instance_count": None,
+        "instance_count": None, "error_log_count": None, "bad_endpoints": None,
     }
 
     # Request count — DELTA metric: use ALIGN_DELTA to get raw integer counts per period
@@ -193,6 +266,10 @@ def fetch_run_service_metrics(client, service_name, region):
         rc = result["request_count"]
         ec = result["error_count"] or 0
         result["error_rate_pct"] = round(ec / rc * 100, 3) if rc > 0 else 0.0
+
+    if log_client is not None:
+        result["error_log_count"], result["bad_endpoints"] = _service_log_signals(
+            log_client, service_name)
 
     return result
 
@@ -819,26 +896,71 @@ def _job_duration_baselines(pg_cur):
     return {r[0]: r[1] for r in pg_cur.fetchall()}
 
 
-def collect_service_health(pg_cur, services):
+def _write_service_health_rows(pg_cur, rows):
+    if not rows:
+        return
+    execute_values(
+        pg_cur,
+        """INSERT INTO control_tower.service_health (
+            service_name, platform, region, collected_at,
+            request_count, error_count, error_rate_pct,
+            p50_latency_ms, p95_latency_ms, p99_latency_ms,
+            instance_count, job_exit_code, job_duration_ms, job_status,
+            job_last_execution_at,
+            cpu_utilization_pct, memory_utilization_pct, disk_utilization_pct,
+            ec2_instance_id, ec2_instance_state,
+            error_log_count, bad_endpoints
+        ) VALUES %s
+        ON CONFLICT (service_name, collected_at) DO UPDATE SET
+            request_count = EXCLUDED.request_count,
+            error_count = EXCLUDED.error_count,
+            error_rate_pct = EXCLUDED.error_rate_pct,
+            p50_latency_ms = EXCLUDED.p50_latency_ms,
+            p95_latency_ms = EXCLUDED.p95_latency_ms,
+            p99_latency_ms = EXCLUDED.p99_latency_ms,
+            instance_count = EXCLUDED.instance_count,
+            job_exit_code = EXCLUDED.job_exit_code,
+            job_status = EXCLUDED.job_status,
+            job_last_execution_at = EXCLUDED.job_last_execution_at,
+            error_log_count = EXCLUDED.error_log_count,
+            bad_endpoints = EXCLUDED.bad_endpoints""",
+        rows,
+    )
+
+
+# Flush + commit after this many services rather than once at the very end.
+# Each cloud_run_service now makes an extra Cloud Logging call (_service_log_signals)
+# on top of the existing Monitoring calls, so the full loop can comfortably exceed
+# this instance's 60s idle_in_transaction_session_timeout before a single end-of-loop
+# write ever touches the DB — killing the connection (seen in production: repeated
+# "server closed the connection unexpectedly" on the final execute_values). Committing
+# every few services keeps the gap between DB touches well under that limit.
+_SERVICE_HEALTH_FLUSH_EVERY = 5
+
+
+def collect_service_health(pg, pg_cur, services):
     monitoring_client = monitoring_v3.MetricServiceClient()
     executions_client = run_v2.ExecutionsClient()
+    log_client = gcp_logging.Client(project=PROJECT)
     duration_baselines = _job_duration_baselines(pg_cur)
     rows = []
+    total_written = 0
 
-    for svc in services:
+    for i, svc in enumerate(services):
         service_name = svc["service_name"]
         platform = svc["platform"]
         region = svc["region"]
         log.info("Collecting %s (%s, %s)", service_name, platform, region)
 
         if platform == "cloud_run_service":
-            metrics = fetch_run_service_metrics(monitoring_client, service_name, region)
+            metrics = fetch_run_service_metrics(monitoring_client, service_name, region, log_client)
         elif platform == "cloud_run_job":
             metrics = fetch_run_job_metrics(executions_client, service_name, region,
                                              duration_baselines.get(service_name))
         else:
             continue
 
+        bad_endpoints = metrics.get("bad_endpoints")
         rows.append((
             service_name, platform, region, NOW,
             metrics.get("request_count"),
@@ -853,34 +975,17 @@ def collect_service_health(pg_cur, services):
             metrics.get("job_status"),
             metrics.get("job_last_execution_at"),
             None, None, None, None, None,  # cpu/mem/disk/ec2 fields (GCP-only)
+            metrics.get("error_log_count"),
+            json.dumps(bad_endpoints) if bad_endpoints is not None else None,
         ))
 
-    if rows:
-        execute_values(
-            pg_cur,
-            """INSERT INTO control_tower.service_health (
-                service_name, platform, region, collected_at,
-                request_count, error_count, error_rate_pct,
-                p50_latency_ms, p95_latency_ms, p99_latency_ms,
-                instance_count, job_exit_code, job_duration_ms, job_status,
-                job_last_execution_at,
-                cpu_utilization_pct, memory_utilization_pct, disk_utilization_pct,
-                ec2_instance_id, ec2_instance_state
-            ) VALUES %s
-            ON CONFLICT (service_name, collected_at) DO UPDATE SET
-                request_count = EXCLUDED.request_count,
-                error_count = EXCLUDED.error_count,
-                error_rate_pct = EXCLUDED.error_rate_pct,
-                p50_latency_ms = EXCLUDED.p50_latency_ms,
-                p95_latency_ms = EXCLUDED.p95_latency_ms,
-                p99_latency_ms = EXCLUDED.p99_latency_ms,
-                instance_count = EXCLUDED.instance_count,
-                job_exit_code = EXCLUDED.job_exit_code,
-                job_status = EXCLUDED.job_status,
-                job_last_execution_at = EXCLUDED.job_last_execution_at""",
-            rows,
-        )
-        log.info("Upserted %d service_health rows", len(rows))
+        if len(rows) >= _SERVICE_HEALTH_FLUSH_EVERY or i == len(services) - 1:
+            _write_service_health_rows(pg_cur, rows)
+            pg.commit()
+            total_written += len(rows)
+            rows = []
+
+    log.info("Upserted %d service_health rows", total_written)
 
 
 def main():
@@ -907,9 +1012,9 @@ def main():
             # kills the connection if that gap happens inside a still-open transaction.
             pg.commit()
 
-            # 2. Collect service health metrics
-            collect_service_health(cur, services)
-            pg.commit()
+            # 2. Collect service health metrics (commits internally every few
+            # services — see _SERVICE_HEALTH_FLUSH_EVERY)
+            collect_service_health(pg, cur, services)
 
             # 3. Poll status pages
             poll_status_pages(cur)

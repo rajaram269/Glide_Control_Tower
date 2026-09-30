@@ -1,7 +1,7 @@
 """
 Anomaly Detector — Control Tower
 Hourly Cloud Run job (at :30, offset from collector at :00).
-Reads PostgreSQL only, runs 6 anomaly checks, writes alerts to PostgreSQL.
+Reads PostgreSQL only, runs 8 anomaly checks, writes alerts to PostgreSQL.
 Deduplicates: skips if identical (alert_type, service_name) alert fired < 4h ago.
 
 All checks run against Postgres directly (control_tower schema is the source
@@ -275,6 +275,69 @@ def check_job_problems(pg_cur):
     return alerts
 
 
+def check_silent_failures(pg_cur):
+    """Check 7: a service is logging its own internal errors (no 5xx attached
+    to them) while its HTTP error rate looks fine — the work is failing but
+    hidden from a plain 5xx-based check. See gcp_collector's
+    _service_log_signals for how error_log_count is computed. Near-zero
+    services log at this level today, so this rarely fires yet — but it
+    activates automatically for any service the moment it starts."""
+    pg_cur.execute("""
+        SELECT DISTINCT ON (service_name) service_name, error_log_count, error_rate_pct
+        FROM control_tower.service_health
+        WHERE platform = 'cloud_run_service'
+        ORDER BY service_name, collected_at DESC
+    """)
+    alerts = []
+    for service, error_logs, error_rate in pg_cur.fetchall():
+        if error_logs and error_logs >= 3 and (error_rate or 0) < 5:
+            alerts.append({
+                "alert_type": "silent_failure",
+                "severity": "warn",
+                "service_name": service,
+                "message": (
+                    f"{service}: {error_logs} internal error log(s) in the last check, "
+                    f"but HTTP error rate is only {error_rate or 0:.1f}%"
+                ),
+                "context_json": {"error_log_count": error_logs, "error_rate_pct": error_rate},
+            })
+    return alerts
+
+
+def check_endpoint_failures(pg_cur):
+    """Check 8: at least one specific URL on a service is failing badly
+    (>=3 requests, >=50% erroring — see gcp_collector's
+    _BAD_ENDPOINT_MIN_REQUESTS/_ERROR_FRACTION) even though the service's
+    OVERALL error rate can look fine — one broken endpoint hiding inside
+    otherwise-healthy traffic."""
+    pg_cur.execute("""
+        SELECT DISTINCT ON (service_name) service_name, bad_endpoints
+        FROM control_tower.service_health
+        WHERE platform = 'cloud_run_service'
+          AND bad_endpoints IS NOT NULL
+          AND jsonb_array_length(bad_endpoints) > 0
+        ORDER BY service_name, collected_at DESC
+    """)
+    alerts = []
+    for service, bad in pg_cur.fetchall():
+        bad = json.loads(bad) if isinstance(bad, str) else (bad or [])
+        if not bad:
+            continue
+        worst = bad[0]
+        extra = f" (+{len(bad) - 1} more)" if len(bad) > 1 else ""
+        alerts.append({
+            "alert_type": "endpoint_failure",
+            "severity": "warn",
+            "service_name": service,
+            "message": (
+                f"{service}: {worst['path']} failing {worst['error_rate_pct']:.0f}% "
+                f"({worst['errors']}/{worst['requests']} requests){extra}"
+            ),
+            "context_json": {"bad_endpoints": bad},
+        })
+    return alerts
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -293,6 +356,8 @@ def main():
                 check_api_degradation,
                 check_ec2_pressure,
                 check_job_problems,
+                check_silent_failures,
+                check_endpoint_failures,
             ]
             for check_fn in checks:
                 try:

@@ -15,7 +15,7 @@ project overview yet.
 | 2 | Job status check — trigger alerts | 🟢 DONE |
 | 2 | Job status check — correction steps | 🟢 DONE (for these 4 alert types) |
 | 3 | Pipeline page redundancy | 🟢 DONE (removed) |
-| 4 | Deeper service monitoring (silent failures) | 🔴 PENDING |
+| 4 | Deeper service monitoring (silent failures) | 🟢 DONE |
 | 5 | Sentinel reconciliation alerting | 🔴 PENDING |
 | 6 | Sentinel freshness cleanup | 🔴 PENDING |
 
@@ -100,7 +100,7 @@ on the Jobs page rather than a separate page.
 
 ## 4. Service monitoring needs to go deeper — silent failures
 
-**STATUS: PENDING**
+**STATUS: DONE**
 
 **What it means:** today a service only counts as "broken" if it returns a hard
 server error (a 5xx). Two real failure patterns slip through that entirely:
@@ -110,9 +110,30 @@ server error (a 5xx). Two real failure patterns slip through that entirely:
   `/export`) always fails, but it's a small slice of total traffic, the overall error
   rate stays low enough that nothing turns red and no alert fires.
 
-**Ideas for "done":** read the service's own error-level logs (not just 5xx codes),
-break the error rate down per endpoint instead of one overall number, and consider a
-scheduled health-check ping to each service. Not started yet.
+**What was built:**
+- **Per-endpoint breakdown** — click any service on the Services page to see request
+  and error counts broken down by URL, not just one overall number. Uses data Cloud
+  Run already logs for every request — no changes needed to any service's own code.
+  Proven on a real example: `report-platform-api`'s "57% error rate" turned out to be
+  only 2 of 15 endpoints actually broken (`/api/runs/worker` at 76-84%,
+  `/api/schedules/dispatch` at ~20%) — the other 13 were completely healthy.
+- **Silent-failure alerting** — a new check counts each service's own internal error
+  logs; alerts if a service is logging real errors (≥3) while its HTTP error rate
+  still looks fine (<5%). Checked honestly before building: only 1 of 34 services
+  currently logs errors this way, so it won't catch anything *new* today — but it
+  needs no further work to start catching a service the moment it begins logging
+  errors.
+- **Broken-endpoint alerting** — alerts when one specific endpoint has ≥3 requests
+  and ≥50% failing, even while the service overall looks healthy.
+- **Real finding along the way:** while validating this, found that
+  `report-platform-api` is repeatedly hitting its container memory limit (4096 MiB
+  limit, actually using 4109-4212 MiB) — very likely the real root cause of its
+  worker failures. Worth fixing the memory limit or the underlying leak.
+- **A real bug found and fixed during this work:** the collector's per-service loop
+  got slower (one extra log check per service) and started tripping the same
+  60-second idle-database-connection limit fixed earlier this session, in a new
+  place. Fixed by committing every 5 services instead of only at the very end;
+  verified clean on 2 consecutive real runs afterward.
 
 ---
 

@@ -415,6 +415,43 @@ function LogsPanel({ kind, name, region, colSpan }) {
   </td></tr>`;
 }
 
+// Per-URL request/error breakdown for a service — an aggregate error rate can
+// hide one broken endpoint inside otherwise-healthy traffic; this is how
+// that's found. Read live from Cloud Logging (no app change needed — Cloud
+// Run logs every request's URL/status on its own).
+function EndpointBreakdownPanel({ name, colSpan }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const load = useCallback(() => {
+    setData(null); setErr(null);
+    fetch(`/api/services/${encodeURIComponent(name)}/endpoints`)
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(setData)
+      .catch(e => setErr(String(e.message || e)));
+  }, [name]);
+  useEffect(load, [load]);
+
+  return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
+    <div class="logs-bar">
+      <b style="color:var(--fg-2)">Endpoints</b><span>${data ? `last ${data.since_hours}h` : ''}</span>
+      <button onClick=${load}>Refresh</button>
+    </div>
+    ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
+      : !data ? html`<div style="color:var(--muted);font-size:12px">Loading endpoint breakdown…</div>`
+      : !data.endpoints.length ? html`<div style="color:var(--muted);font-size:12px">No requests in this window.</div>`
+      : html`<div class="table-scroll"><table>
+          <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th></tr></thead>
+          <tbody>${data.endpoints.map(e => html`<tr key=${e.path}>
+            <td class="mono clamp wide" title=${e.path} style="font-size:12px">${e.path}</td>
+            <td>${e.requests}</td>
+            <td style=${e.errors ? 'color:var(--critical-fg)' : ''}>${e.errors}</td>
+            <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
+                      : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
+          </tr>`)}</tbody>
+        </table></div>`}
+  </td></tr>`;
+}
+
 // ─── Views ────────────────────────────────────────────────────────────────────
 
 function ServicesView() {
@@ -432,7 +469,7 @@ function ServicesView() {
   });
   return html`
     <div class="view-head">
-      <div class="section-title">Services — ${rows.length} request-driven, always-listening · click a row for logs</div>
+      <div class="section-title">Services — ${rows.length} request-driven, always-listening · click a row for endpoint breakdown & logs</div>
       <${SearchBox} value=${q} onInput=${setQ} placeholder="Search services…" count=${shown.length}/>
     </div>
     <div class="table-scroll"><table>
@@ -451,6 +488,7 @@ function ServicesView() {
           <td>${fmt.ms(r.p95_latency_ms)}</td>
           <td style="color:var(--muted)">${fmt.ago(r.collected_at)}</td>
           </tr>
+          ${open === r.service_name && html`<${EndpointBreakdownPanel} name=${r.service_name} colSpan=${6}/>`}
           ${open === r.service_name && html`<${LogsPanel} kind="service" name=${r.service_name} colSpan=${6}/>`}
         <//>`)}
       </tbody>
@@ -639,6 +677,8 @@ function alertTitle(t) {
     job_missed: 'A job missed its schedule',
     job_cancelled: 'A job run was cancelled',
     job_stuck: 'A job is stuck running',
+    silent_failure: 'A service is failing silently',
+    endpoint_failure: 'One endpoint is broken',
   };
   return map[t] || (t || 'Alert').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
@@ -656,6 +696,8 @@ function alertAdvice(t) {
     job_missed: 'Its own cron schedule says it should have run again by now. Check the Cloud Scheduler trigger for this job — it may have been deleted, paused, or lost permission to run it.',
     job_cancelled: 'Someone or something cancelled this run before it finished. If nobody did this on purpose, check for a deploy, quota limit, or manual stop around that time.',
     job_stuck: 'Still running well past how long it normally takes. It may finish on its own — if not, check its logs for a hang (e.g. waiting on a slow external call) and consider cancelling and rerunning it.',
+    silent_failure: 'This service is answering requests normally (no server errors) but is logging internal errors itself. Click it on the Services page and check its logs to see what\'s actually going wrong inside.',
+    endpoint_failure: 'One specific URL on this service is failing badly while the rest of the service is fine. Click the service on the Services page to see the per-endpoint breakdown and its logs.',
   };
   return map[t] || 'Review the details and the affected service.';
 }

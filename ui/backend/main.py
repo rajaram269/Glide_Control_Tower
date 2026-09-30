@@ -234,6 +234,59 @@ def logs(kind: str, name: str, execution: str = None, errors_only: bool = False,
             "since": since, "lines": lines}
 
 
+# Same normalization rule the collector uses (see gcp_collector's
+# _normalize_path) — kept here too since this endpoint reads Cloud Logging
+# live rather than the collector's stored per-run snapshot, to give a fuller
+# window (24h) when someone clicks in to investigate a service.
+_ENDPOINT_ID_SEGMENT = re.compile(
+    r'^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d+|[0-9a-zA-Z]{20,})$'
+)
+
+
+def _normalize_endpoint_path(path):
+    return '/'.join('{id}' if _ENDPOINT_ID_SEGMENT.match(seg) else seg for seg in path.split('/'))
+
+
+@app.get("/api/services/{name}/endpoints")
+def service_endpoints(name: str, hours: int = 24):
+    """Per-URL request/error breakdown for a Cloud Run service, read live from
+    Cloud Logging — Cloud Run logs every request's URL and status on its own,
+    no app change needed. An aggregate error rate can hide one broken endpoint
+    inside otherwise-healthy traffic; this is how that's found."""
+    if not _RUN_NAME.match(name):
+        raise HTTPException(400, "invalid service name")
+    hours = max(1, min(hours, 168))
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    flt = (f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" '
+           f'AND httpRequest.status>0 AND timestamp>="{since}"')
+
+    try:
+        from google.cloud import logging as gcp_logging
+        from urllib.parse import urlparse
+        client = gcp_logging.Client(project=LOG_PROJECT)
+        by_path = {}
+        for entry in client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
+                                          max_results=2000, page_size=1000):
+            req = entry.http_request or {}
+            status = req.get("status") or 0
+            path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0})
+            d["requests"] += 1
+            if status >= 500:
+                d["errors"] += 1
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
+
+    endpoints = [
+        {"path": p, "requests": d["requests"], "errors": d["errors"],
+         "error_rate_pct": round(100 * d["errors"] / d["requests"], 1)}
+        for p, d in by_path.items()
+    ]
+    endpoints.sort(key=lambda r: (-r["errors"], -r["requests"]))
+    return {"since_hours": hours, "endpoints": endpoints}
+
+
 @app.get("/api/providers")
 def providers():
     with get_db() as cur:
