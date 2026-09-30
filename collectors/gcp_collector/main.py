@@ -386,6 +386,34 @@ def _poll_google_incidents(provider, url):
     return overall, affected
 
 
+def _check_openai_balance():
+    """Attempts to fetch OpenAI balance/credit details.
+    Supports credit grants, subscription, or organization costs endpoint."""
+    key = os.environ.get("OPENAI_ADMIN_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return None
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        r = requests.get("https://api.openai.com/v1/dashboard/billing/credit_grants", headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            total_avail = data.get("total_available")
+            if total_avail is not None:
+                return float(total_avail)
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://api.openai.com/v1/dashboard/billing/subscription", headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            hard_limit = data.get("hard_limit_usd")
+            if hard_limit is not None:
+                return float(hard_limit)
+    except Exception:
+        pass
+    return None
+
+
 def poll_status_pages(pg_cur):
     log.info("Polling status pages...")
     rows = []
@@ -397,6 +425,14 @@ def poll_status_pages(pg_cur):
                 overall, components = _poll_google_incidents(provider, url)
             else:
                 overall, components = _poll_statuspage_io(provider, url)
+
+            if provider == "openai":
+                bal = _check_openai_balance()
+                if bal is not None:
+                    components.insert(0, f"Balance: ${bal:,.2f}")
+                    if bal <= 0:
+                        overall = "major_outage"
+
             rows.append((provider, url, overall, json.dumps(components), NOW))
             log.info("Status %s: %s", provider, overall)
         except Exception as e:
@@ -426,7 +462,7 @@ _BRIGHTDATA_BALANCE_URL = "https://api.brightdata.com/customer/balance"
 
 
 def check_brightdata(pg_cur):
-    api_key = os.environ.get("BRIGHTDATA_API_KEY")
+    api_key = os.environ.get("BRIGHTDATA_API_KEY", "").strip()
     if not api_key:
         return  # not configured — leave BrightData showing as unmonitored
     try:
@@ -441,7 +477,7 @@ def check_brightdata(pg_cur):
         components = [f"Balance: ${balance:,.2f}" if balance is not None else "Balance: unknown"]
         log.info("BrightData: balance=%s", balance)
     except Exception as e:
-        status, components = "major_outage", [f"API check failed: {e}"[:200]]
+        status, components = "major_outage", [f"Check failed: {e}"[:200]]
         log.warning("BrightData health check failed: %s", e)
 
     pg_cur.execute(
@@ -449,6 +485,44 @@ def check_brightdata(pg_cur):
            (provider, status_page_url, overall_status, affected_components, polled_at)
            VALUES (%s, %s, %s, %s, %s)""",
         ("brightdata", _BRIGHTDATA_BALANCE_URL, status, json.dumps(components), NOW),
+    )
+
+
+_CAPSOLVER_BALANCE_URL = "https://api.capsolver.com/getBalance"
+
+
+def check_capsolver(pg_cur):
+    api_key = os.environ.get("CAPSOLVER_API_KEY", "").strip()
+    if not api_key:
+        return  # not configured — leave Capsolver showing as unmonitored
+    try:
+        r = requests.post(_CAPSOLVER_BALANCE_URL, json={"clientKey": api_key}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        error_id = data.get("errorId", 0)
+        balance = data.get("balance")
+        if error_id != 0 or balance is None:
+            err_msg = data.get("errorDescription") or data.get("errorCode") or f"errorId {error_id}"
+            status, components = "major_outage", [f"Capsolver API error: {err_msg}"]
+        elif balance <= 0:
+            status, components = "major_outage", ["Balance: $0.00 (Exhausted)"]
+        else:
+            status = "operational"
+            components = [f"Balance: ${balance:,.2f}"]
+        log.info("Capsolver: balance=%s status=%s", balance, status)
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        status, components = "major_outage", [f"API check failed (HTTP {status_code})"]
+        log.warning("Capsolver health check failed: %s", e)
+    except Exception as e:
+        status, components = "major_outage", ["API connection failed"]
+        log.warning("Capsolver health check failed: %s", e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        ("capsolver", _CAPSOLVER_BALANCE_URL, status, json.dumps(components), NOW),
     )
 
 
@@ -1019,6 +1093,7 @@ def main():
             # 3. Poll status pages
             poll_status_pages(cur)
             check_brightdata(cur)
+            check_capsolver(cur)
             pg.commit()
 
             # 4. Auto-discover new services
