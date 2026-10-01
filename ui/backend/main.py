@@ -278,13 +278,17 @@ def _request_note(entry):
 _REASON_WORDS = re.compile(r"can't|cannot|unable|failed|refused|denied|timed out|timeout|exception|error|invalid", re.I)
 
 
+_STRONG_WORDS = re.compile(r"can't|cannot|unable|refused|denied|timed out|failed|unreachable", re.I)
+
+
 def _headline(text):
     """The most telling line of a multi-line error: first one with an error word
     (ignoring bare labels like 'prisma:error'), else the last line."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for l in lines:
-        if _REASON_WORDS.search(l) and len(l) > 20:
-            return l
+    for words in (_STRONG_WORDS, _REASON_WORDS):
+        for l in lines:
+            if words.search(l) and len(l) > 20:
+                return l
     return lines[-1] if lines else ""
 
 
