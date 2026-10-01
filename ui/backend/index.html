@@ -538,7 +538,6 @@ function ServicesView() {
           <td style="color:var(--muted)">${fmt.ago(r.collected_at)}</td>
           </tr>
           ${open === r.service_name && html`<${EndpointBreakdownPanel} name=${r.service_name} colSpan=${6}/>`}
-          ${open === r.service_name && html`<${LogsPanel} kind="service" name=${r.service_name} colSpan=${6}/>`}
         <//>`)}
       </tbody>
     </table></div>`;
