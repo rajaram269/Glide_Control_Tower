@@ -158,7 +158,7 @@
     .log-line .ts { color: var(--faint); }
     .log-line.sev-ERROR, .log-line.sev-CRITICAL, .log-line.sev-ALERT, .log-line.sev-EMERGENCY {
       background: var(--critical-bg); color: var(--critical-fg); }
-    .log-line.sev-WARNING { background: var(--medium-bg); color: var(--medium-fg); }
+    .log-line.sev-WARNING, .log-line.timeout { background: var(--medium-bg); color: var(--medium-fg); }
     /* Full raw log entry, shown when a summarized line is clicked open */
     .log-raw { margin: 0 10px 6px; padding: 8px 10px; background: var(--sunken);
                border-radius: 6px; font-size: 11px; white-space: pre-wrap; word-break: break-word;
@@ -451,12 +451,21 @@ function EndpointErrorLogs({ name, path, colSpan }) {
       : !data ? html`<div style="color:var(--muted);font-size:12px">Loading errors…</div>`
       : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No 5xx errors for this endpoint.</div>`
       : html`<div class="logs-box">${data.lines.map(l => html`
-          <div class=${`log-line sev-${l.severity}`}>
+          <div class=${`log-line ${l.timeout ? 'timeout' : 'sev-' + l.severity}`}>
             <span class="ts">${new Date(l.timestamp).toLocaleString()}</span>
-            <span>${l.severity}</span>
+            <span>${l.timeout ? 'TIMEOUT' : l.severity}</span>
             <span>${l.message}${l.detail ? html`<br/><b>↳ ${l.detail}</b>` : ''}</span>
           </div>`)}</div>`}
   </td></tr>`;
+}
+
+// Red = real app errors (short AI/plain explanation), orange = the request was cut
+// off by the container/server timeout, green = no errors.
+function endpointDescription(e) {
+  const appErrors = e.errors - (e.timeouts || 0);
+  return html`${appErrors > 0 && html`<div style="color:var(--critical-fg)">${e.description || 'Server error (500)'}</div>`}
+    ${e.timeouts > 0 && html`<div style="color:var(--medium-fg)">Container/server timeout (${e.timeouts} request${e.timeouts > 1 ? 's' : ''} cut off)</div>`}
+    ${e.errors === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}`;
 }
 
 // Per-URL request/error breakdown for a service — an aggregate error rate can
@@ -485,7 +494,7 @@ function EndpointBreakdownPanel({ name, colSpan }) {
       : !data ? html`<div style="color:var(--muted);font-size:12px">Loading endpoint breakdown…</div>`
       : !data.endpoints.length ? html`<div style="color:var(--muted);font-size:12px">No requests in this window.</div>`
       : html`<div class="table-scroll"><table>
-          <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th></tr></thead>
+          <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th><th>Description</th></tr></thead>
           <tbody>${data.endpoints.map(e => html`<${Fragment} key=${e.path}>
             <tr class=${e.errors ? 'clickable' : ''} onClick=${() => e.errors && setOpenPath(openPath === e.path ? null : e.path)}>
               <td class="mono clamp wide" title=${e.path} style="font-size:12px">${e.errors ? (openPath === e.path ? '▾ ' : '▸ ') : ''}${e.path}</td>
@@ -493,8 +502,9 @@ function EndpointBreakdownPanel({ name, colSpan }) {
               <td style=${e.errors ? 'color:var(--critical-fg)' : ''}>${e.errors}</td>
               <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
                         : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
+              <td style="font-size:12px">${endpointDescription(e)}</td>
             </tr>
-            ${openPath === e.path && html`<${EndpointErrorLogs} name=${name} path=${e.path} colSpan=${4}/>`}
+            ${openPath === e.path && html`<${EndpointErrorLogs} name=${name} path=${e.path} colSpan=${5}/>`}
           <//>`)}</tbody>
         </table></div>`}
   </td></tr>`;

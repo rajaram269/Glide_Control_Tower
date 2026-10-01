@@ -247,6 +247,56 @@ def _normalize_endpoint_path(path):
     return '/'.join('{id}' if _ENDPOINT_ID_SEGMENT.match(seg) else seg for seg in path.split('/'))
 
 
+def _is_timeout(status, text):
+    """A request Cloud Run cut off at the container/server timeout (504, or its own
+    "maximum request timeout" line) — shown as a timeout, not as an app error."""
+    return status == 504 or "maximum request timeout" in (text or "")
+
+
+SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+_DESC_CACHE = {}   # (service, path, error text) -> description; keeps AI calls rare
+
+
+def _describe_errors(name, samples):
+    """{path: short plain-English reason} for endpoints with app errors. Only the
+    error text is sent to the AI (never successes), in one cheap gpt-4o-mini call,
+    and cached. Without OPENAI_API_KEY (or on failure) falls back to the raw error line."""
+    import urllib.request
+    out, todo = {}, {}
+    for path, msgs in samples.items():
+        key = (name, path, "\n".join(msgs)[:2000])
+        if key in _DESC_CACHE:
+            out[path] = _DESC_CACHE[key]
+        elif not msgs:
+            out[path] = "Server error (500) — no app error line found"
+        else:
+            todo[path] = key
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    fallback = lambda path: samples[path][0][:140]
+    if todo and api_key:
+        try:
+            body = json.dumps({
+                "model": SUMMARY_MODEL, "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "You explain server errors to a non-expert. For each "
+                     "endpoint, write ONE short sentence (max 15 words) in very simple English saying what "
+                     "went wrong. Use only the error text given. Reply as JSON: {\"<endpoint>\": \"<sentence>\"}."},
+                    {"role": "user", "content": json.dumps({p: samples[p][:3] for p in todo})[:12000]}],
+                "max_tokens": 600, "temperature": 0.2}).encode()
+            req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={
+                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                got = json.loads(json.load(r)["choices"][0]["message"]["content"])
+            for path, key in todo.items():
+                if isinstance(got.get(path), str) and got[path].strip():
+                    out[path] = _DESC_CACHE[key] = got[path].strip()
+        except Exception:
+            pass
+    for path in todo:
+        out.setdefault(path, fallback(path))
+    return out
+
+
 @app.get("/api/services/{name}/endpoints")
 def service_endpoints(name: str, hours: int = 24):
     """Per-URL request/error breakdown for a Cloud Run service, read live from
@@ -270,17 +320,34 @@ def service_endpoints(name: str, hours: int = 24):
             req = entry.http_request or {}
             status = req.get("status") or 0
             path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
-            d = by_path.setdefault(path, {"requests": 0, "errors": 0})
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "traces": []})
             d["requests"] += 1
             if status >= 500:
                 d["errors"] += 1
+                if _is_timeout(status, ""):
+                    d["timeouts"] += 1
+                elif entry.trace and len(d["traces"]) < 5:
+                    d["traces"].append(entry.trace)
+        # The app's own ERROR line (matched by trace) says *why* a request failed.
+        wanted = {t for d in by_path.values() for t in d["traces"]}
+        app_msgs = {}
+        if wanted:
+            for entry in client.list_entries(
+                    filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND NOT httpRequest.status>0"),
+                    order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+                if entry.trace in wanted and entry.trace not in app_msgs:
+                    app_msgs[entry.trace] = _log_line(entry)["message"]
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else ""
         raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
 
+    descriptions = _describe_errors(name, {
+        p: [app_msgs[t] for t in d["traces"] if t in app_msgs] for p, d in by_path.items()
+        if d["errors"] > d["timeouts"]})
     endpoints = [
-        {"path": p, "requests": d["requests"], "errors": d["errors"],
-         "error_rate_pct": round(100 * d["errors"] / d["requests"], 1)}
+        {"path": p, "requests": d["requests"], "errors": d["errors"], "timeouts": d["timeouts"],
+         "error_rate_pct": round(100 * d["errors"] / d["requests"], 1),
+         "description": descriptions.get(p)}
         for p, d in by_path.items()
     ]
     endpoints.sort(key=lambda r: (-r["errors"], -r["requests"]))
@@ -316,6 +383,7 @@ def _endpoint_error_logs(name, path, hours, limit=50):
     for e in requests_:
         line = _log_line(e)
         line["detail"] = app_msgs.get(e.trace)
+        line["timeout"] = _is_timeout((e.http_request or {}).get("status"), line["detail"])
         lines.append(line)
     return lines
 
@@ -334,9 +402,6 @@ def service_endpoint_logs(name: str, path: str, hours: int = 24):
 
 # Optional AI summary of an endpoint's errors. Off unless OPENAI_API_KEY is set on
 # the UI service; triggered only by a button click so it costs nothing otherwise.
-SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
-
-
 @app.post("/api/services/{name}/endpoints/summary")
 def service_endpoint_summary(name: str, path: str, hours: int = 24):
     import urllib.request, urllib.error
