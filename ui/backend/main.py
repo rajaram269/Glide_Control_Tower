@@ -298,7 +298,7 @@ def _window_note(client, gcp_logging, base, entry):
         secs = 0
     start = entry.timestamp
     end = start + timedelta(seconds=secs + 1)
-    flt = (f'{base} AND NOT httpRequest.status>0 AND timestamp>="{start.isoformat()}" '
+    flt = (f'{base} AND -httpRequest.status:* AND timestamp>="{start.isoformat()}" '
            f'AND timestamp<="{end.isoformat()}"')
     texts = []
     for e in client.list_entries(filter_=flt, order_by=gcp_logging.ASCENDING, max_results=30, page_size=30):
@@ -404,7 +404,7 @@ def service_endpoints(name: str, hours: int = 24):
         app_msgs = {}
         if wanted:
             for entry in client.list_entries(
-                    filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND NOT httpRequest.status>0"),
+                    filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND -httpRequest.status:*"),
                     order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
                 if entry.trace in wanted and entry.trace not in app_msgs:
                     app_msgs[entry.trace] = _log_line(entry)["message"]
@@ -455,7 +455,7 @@ def _endpoint_error_logs(name, path, hours, limit=50):
     traces = {e.trace for e in requests_ if e.trace}
     app_msgs = {}
     if traces:
-        for entry in client.list_entries(filter_=base + " AND severity>=ERROR AND NOT httpRequest.status>0",
+        for entry in client.list_entries(filter_=base + " AND severity>=ERROR AND -httpRequest.status:*",
                                          order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
             if entry.trace in traces and entry.trace not in app_msgs:
                 app_msgs[entry.trace] = _log_line(entry)["message"]
