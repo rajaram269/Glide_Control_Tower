@@ -464,9 +464,12 @@ def _endpoint_logs(name, path, hours, limit=50):
         req = entry.http_request or {}
         if _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/") == path:
             requests_.append(entry)
-            if len(requests_) >= limit:
-                break
-    failed = [e for e in requests_ if (e.http_request or {}).get("status", 0) >= 500]
+    # Keep every recent failure (up to 20) even if it is older than the newest
+    # `limit` requests, then fill the rest with the newest requests.
+    is_fail = lambda e: (e.http_request or {}).get("status", 0) >= 500
+    failed = [e for e in requests_ if is_fail(e)][:20]
+    others = [e for e in requests_ if not is_fail(e)][:max(limit - len(failed), 0)]
+    requests_ = sorted(failed + others, key=lambda e: e.timestamp, reverse=True)
     traces = {e.trace for e in failed if e.trace and not _request_note(e)}
     app_msgs = {}
     if traces:
@@ -479,7 +482,7 @@ def _endpoint_logs(name, path, hours, limit=50):
         line = _log_line(e)
         line["detail"] = None
         line["timeout"] = False
-        if e in failed:
+        if is_fail(e):
             line["timeout"] = _is_timeout(e, limit_s)
             line["detail"] = app_msgs.get(e.trace)
             if not line["detail"] and not _request_note(e) and looked_up < 15:
