@@ -415,6 +415,50 @@ function LogsPanel({ kind, name, region, colSpan }) {
   </td></tr>`;
 }
 
+// 5xx logs for one endpoint (click a row with errors in the breakdown below),
+// each with the app's own error line from the same request. "Summarize" asks the
+// backend for a short AI explanation — only on click, and only if configured.
+function EndpointErrorLogs({ name, path, colSpan }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [sumErr, setSumErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const q = `path=${encodeURIComponent(path)}`;
+  useEffect(() => {
+    setData(null); setErr(null);
+    fetch(`/api/services/${encodeURIComponent(name)}/endpoints/logs?${q}`)
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(setData)
+      .catch(e => setErr(String(e.message || e)));
+  }, [name, path]);
+  const summarize = () => {
+    setBusy(true); setSumErr(null);
+    fetch(`/api/services/${encodeURIComponent(name)}/endpoints/summary?${q}`, { method: 'POST' })
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(d => setSummary(d.summary))
+      .catch(e => setSumErr(String(e.message || e)))
+      .finally(() => setBusy(false));
+  };
+  return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
+    <div class="logs-bar">
+      <b style="color:var(--fg-2)">Errors</b><span>${path} · newest first</span>
+      <button onClick=${summarize} disabled=${busy || !data || !data.lines.length}>${busy ? 'Summarizing…' : 'Summarize'}</button>
+    </div>
+    ${summary && html`<div style="font-size:12px;margin-bottom:8px;white-space:pre-wrap"><b>Summary:</b> ${summary}</div>`}
+    ${sumErr && html`<div style="color:var(--critical-fg);font-size:12px;margin-bottom:8px">${sumErr}</div>`}
+    ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
+      : !data ? html`<div style="color:var(--muted);font-size:12px">Loading errors…</div>`
+      : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No 5xx errors for this endpoint.</div>`
+      : html`<div class="logs-box">${data.lines.map(l => html`
+          <div class=${`log-line sev-${l.severity}`}>
+            <span class="ts">${new Date(l.timestamp).toLocaleString()}</span>
+            <span>${l.severity}</span>
+            <span>${l.message}${l.detail ? html`<br/><b>↳ ${l.detail}</b>` : ''}</span>
+          </div>`)}</div>`}
+  </td></tr>`;
+}
+
 // Per-URL request/error breakdown for a service — an aggregate error rate can
 // hide one broken endpoint inside otherwise-healthy traffic; this is how
 // that's found. Read live from Cloud Logging (no app change needed — Cloud
@@ -422,6 +466,7 @@ function LogsPanel({ kind, name, region, colSpan }) {
 function EndpointBreakdownPanel({ name, colSpan }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
+  const [openPath, setOpenPath] = useState(null);   // endpoint whose error logs are expanded
   const load = useCallback(() => {
     setData(null); setErr(null);
     fetch(`/api/services/${encodeURIComponent(name)}/endpoints`)
@@ -441,13 +486,16 @@ function EndpointBreakdownPanel({ name, colSpan }) {
       : !data.endpoints.length ? html`<div style="color:var(--muted);font-size:12px">No requests in this window.</div>`
       : html`<div class="table-scroll"><table>
           <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th></tr></thead>
-          <tbody>${data.endpoints.map(e => html`<tr key=${e.path}>
-            <td class="mono clamp wide" title=${e.path} style="font-size:12px">${e.path}</td>
-            <td>${e.requests}</td>
-            <td style=${e.errors ? 'color:var(--critical-fg)' : ''}>${e.errors}</td>
-            <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
-                      : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
-          </tr>`)}</tbody>
+          <tbody>${data.endpoints.map(e => html`<${Fragment} key=${e.path}>
+            <tr class=${e.errors ? 'clickable' : ''} onClick=${() => e.errors && setOpenPath(openPath === e.path ? null : e.path)}>
+              <td class="mono clamp wide" title=${e.path} style="font-size:12px">${e.errors ? (openPath === e.path ? '▾ ' : '▸ ') : ''}${e.path}</td>
+              <td>${e.requests}</td>
+              <td style=${e.errors ? 'color:var(--critical-fg)' : ''}>${e.errors}</td>
+              <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
+                        : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
+            </tr>
+            ${openPath === e.path && html`<${EndpointErrorLogs} name=${name} path=${e.path} colSpan=${4}/>`}
+          <//>`)}</tbody>
         </table></div>`}
   </td></tr>`;
 }

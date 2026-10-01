@@ -287,6 +287,94 @@ def service_endpoints(name: str, hours: int = 24):
     return {"since_hours": hours, "endpoints": endpoints}
 
 
+def _endpoint_error_logs(name, path, hours, limit=50):
+    """5xx request logs for one (normalized) endpoint path, each paired with the
+    app's own ERROR log line from the same request (matched by trace) when there
+    is one — the request log alone only says "500", the app line says why."""
+    from google.cloud import logging as gcp_logging
+    from urllib.parse import urlparse
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = (f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" '
+            f'AND timestamp>="{since}"')
+    client = gcp_logging.Client(project=LOG_PROJECT)
+    requests_ = []
+    for entry in client.list_entries(filter_=base + " AND httpRequest.status>=500",
+                                     order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+        req = entry.http_request or {}
+        if _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/") == path:
+            requests_.append(entry)
+            if len(requests_) >= limit:
+                break
+    traces = {e.trace for e in requests_ if e.trace}
+    app_msgs = {}
+    if traces:
+        for entry in client.list_entries(filter_=base + " AND severity>=ERROR AND NOT httpRequest.status>0",
+                                         order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+            if entry.trace in traces and entry.trace not in app_msgs:
+                app_msgs[entry.trace] = _log_line(entry)["message"]
+    lines = []
+    for e in requests_:
+        line = _log_line(e)
+        line["detail"] = app_msgs.get(e.trace)
+        lines.append(line)
+    return lines
+
+
+@app.get("/api/services/{name}/endpoints/logs")
+def service_endpoint_logs(name: str, path: str, hours: int = 24):
+    if not _RUN_NAME.match(name):
+        raise HTTPException(400, "invalid service name")
+    hours = max(1, min(hours, 168))
+    try:
+        return {"path": path, "since_hours": hours, "lines": _endpoint_error_logs(name, path, hours)}
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Endpoint logs unavailable: {type(e).__name__}: {first_line}")
+
+
+# Optional AI summary of an endpoint's errors. Off unless OPENAI_API_KEY is set on
+# the UI service; triggered only by a button click so it costs nothing otherwise.
+SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+
+
+@app.post("/api/services/{name}/endpoints/summary")
+def service_endpoint_summary(name: str, path: str, hours: int = 24):
+    import urllib.request, urllib.error
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(503, "AI summary not configured (OPENAI_API_KEY not set on the UI service)")
+    if not _RUN_NAME.match(name):
+        raise HTTPException(400, "invalid service name")
+    hours = max(1, min(hours, 168))
+    try:
+        lines = _endpoint_error_logs(name, path, hours, limit=30)
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Endpoint logs unavailable: {type(e).__name__}: {first_line}")
+    if not lines:
+        return {"summary": "No 5xx errors for this endpoint in this window."}
+    text = "\n".join(f'{l["timestamp"]} {l["message"]}' + (f' | app log: {l["detail"]}' if l["detail"] else "")
+                     for l in lines)[:12000]
+    body = json.dumps({
+        "model": SUMMARY_MODEL,
+        "messages": [
+            {"role": "system", "content": "You summarise server error logs for a developer. In 2-3 short "
+             "sentences say what is failing on this endpoint, the likely cause, and what to check first. "
+             "Use only the logs given; if the cause is unclear, say so."},
+            {"role": "user", "content": f"Service {name}, endpoint {path}, last {hours}h. "
+             f"{len(lines)} recent 5xx errors:\n{text}"}],
+        "max_tokens": 200, "temperature": 0.2}).encode()
+    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return {"summary": json.load(r)["choices"][0]["message"]["content"].strip()}
+    except urllib.error.HTTPError as e:
+        raise HTTPException(502, f"OpenAI returned HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(502, f"OpenAI request failed: {type(e).__name__}")
+
+
 @app.get("/api/providers")
 def providers():
     with get_db() as cur:
