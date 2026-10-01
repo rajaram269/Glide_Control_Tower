@@ -275,6 +275,39 @@ def _request_note(entry):
     return str(p).strip() if p else ""
 
 
+_REASON_WORDS = re.compile(r"can't|cannot|unable|failed|refused|denied|timed out|timeout|exception|error|invalid", re.I)
+
+
+def _headline(text):
+    """The most telling line of a multi-line error: first one with an error word
+    (ignoring bare labels like 'prisma:error'), else the last line."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for l in lines:
+        if _REASON_WORDS.search(l) and len(l) > 20:
+            return l
+    return lines[-1] if lines else ""
+
+
+def _window_note(client, gcp_logging, base, entry):
+    """Apps like Node/Prisma log their error without a trace id. Fall back to the
+    app log lines written while this request was running."""
+    req = entry.http_request or {}
+    try:
+        secs = float(str(req.get("latency") or "0").rstrip("s"))
+    except ValueError:
+        secs = 0
+    start = entry.timestamp
+    end = start + timedelta(seconds=secs + 1)
+    flt = (f'{base} AND NOT httpRequest.status>0 AND timestamp>="{start.isoformat()}" '
+           f'AND timestamp<="{end.isoformat()}"')
+    texts = []
+    for e in client.list_entries(filter_=flt, order_by=gcp_logging.ASCENDING, max_results=30, page_size=30):
+        t = _log_line(e)["message"]
+        if t.strip():
+            texts.append(t)
+    return _headline(chr(10).join(texts)) if any(_REASON_WORDS.search(t) for t in texts) else None
+
+
 def _is_timeout(entry, limit):
     """A request cut off at the container/server timeout — 504, Cloud Run's own
     'maximum request timeout' note, or a 5xx that ran right up to the limit."""
@@ -308,7 +341,7 @@ def _describe_errors(name, samples):
         else:
             todo[path] = key
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    fallback = lambda path: samples[path][0].strip().splitlines()[-1].split(". ")[0][:140]
+    fallback = lambda path: _headline(samples[path][0]).split(". ")[0][:140]
     if todo and api_key:
         try:
             body = json.dumps({
@@ -357,19 +390,17 @@ def service_endpoints(name: str, hours: int = 24):
             req = entry.http_request or {}
             status = req.get("status") or 0
             path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
-            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "traces": [], "notes": []})
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "fails": []})
             d["requests"] += 1
             if status >= 500:
                 d["errors"] += 1
                 if _is_timeout(entry, limit):
                     d["timeouts"] += 1
                 else:
-                    if _request_note(entry) and len(d["notes"]) < 5:
-                        d["notes"].append(_request_note(entry))
-                    if entry.trace and len(d["traces"]) < 5:
-                        d["traces"].append(entry.trace)
+                    if len(d["fails"]) < 5:
+                        d["fails"].append(entry)
         # The app's own ERROR line (matched by trace) says *why* a request failed.
-        wanted = {t for d in by_path.values() for t in d["traces"]}
+        wanted = {e.trace for d in by_path.values() for e in d["fails"] if e.trace and not _request_note(e)}
         app_msgs = {}
         if wanted:
             for entry in client.list_entries(
@@ -377,13 +408,21 @@ def service_endpoints(name: str, hours: int = 24):
                     order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
                 if entry.trace in wanted and entry.trace not in app_msgs:
                     app_msgs[entry.trace] = _log_line(entry)["message"]
+        base = flt.replace(" AND httpRequest.status>0", "")
+        samples = {}
+        for p, d in by_path.items():
+            msgs = []
+            for e in d["fails"]:
+                msg = _request_note(e) or app_msgs.get(e.trace) or _window_note(client, gcp_logging, base, e)
+                if msg:
+                    msgs.append(msg)
+            samples[p] = msgs
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else ""
         raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
 
     descriptions = _describe_errors(name, {
-        p: d["notes"] + [app_msgs[t] for t in d["traces"] if t in app_msgs] for p, d in by_path.items()
-        if d["errors"] > d["timeouts"]})
+        p: samples[p] for p, d in by_path.items() if d["errors"] > d["timeouts"]})
     endpoints = [
         {"path": p, "requests": d["requests"], "errors": d["errors"], "timeouts": d["timeouts"],
          "error_rate_pct": round(100 * d["errors"] / d["requests"], 1),
@@ -421,9 +460,10 @@ def _endpoint_error_logs(name, path, hours, limit=50):
             if entry.trace in traces and entry.trace not in app_msgs:
                 app_msgs[entry.trace] = _log_line(entry)["message"]
     lines = []
-    for e in requests_:
+    for i, e in enumerate(requests_):
         line = _log_line(e)
-        line["detail"] = app_msgs.get(e.trace)
+        line["detail"] = app_msgs.get(e.trace) or (
+            _window_note(client, gcp_logging, base, e) if i < 15 and not _request_note(e) else None)
         line["timeout"] = _is_timeout(e, limit_s)
         lines.append(line)
     return lines
