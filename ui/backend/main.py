@@ -247,10 +247,46 @@ def _normalize_endpoint_path(path):
     return '/'.join('{id}' if _ENDPOINT_ID_SEGMENT.match(seg) else seg for seg in path.split('/'))
 
 
-def _is_timeout(status, text):
-    """A request Cloud Run cut off at the container/server timeout (504, or its own
-    "maximum request timeout" line) — shown as a timeout, not as an app error."""
-    return status == 504 or "maximum request timeout" in (text or "")
+_TIMEOUT_CACHE = {}
+
+
+def _service_timeout(name):
+    """The service's configured request timeout in seconds (default 300). Cloud Run
+    often reports a timed-out request as a plain 500 that took about this long."""
+    if name not in _TIMEOUT_CACHE:
+        secs = 300
+        try:
+            from google.cloud import run_v2
+            for svc in run_v2.ServicesClient().list_services(parent=f"projects/{LOG_PROJECT}/locations/-"):
+                if svc.name.split("/")[-1] == name:
+                    secs = int(svc.template.timeout.total_seconds()) or 300
+                    break
+        except Exception:
+            pass
+        _TIMEOUT_CACHE[name] = secs
+    return _TIMEOUT_CACHE[name]
+
+
+def _request_note(entry):
+    """Cloud Run's own note on a request log (e.g. 'container ... too much memory')."""
+    p = entry.payload
+    if isinstance(p, dict):
+        p = p.get("message") or p.get("msg")
+    return str(p).strip() if p else ""
+
+
+def _is_timeout(entry, limit):
+    """A request cut off at the container/server timeout — 504, Cloud Run's own
+    'maximum request timeout' note, or a 5xx that ran right up to the limit."""
+    req = entry.http_request or {}
+    if (req.get("status") or 0) < 500:
+        return False
+    try:
+        secs = float(str(req.get("latency") or "0").rstrip("s"))
+    except ValueError:
+        secs = 0
+    return (req.get("status") == 504 or "maximum request timeout" in _request_note(entry)
+            or secs >= limit - 5)
 
 
 SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
@@ -272,7 +308,7 @@ def _describe_errors(name, samples):
         else:
             todo[path] = key
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    fallback = lambda path: samples[path][0][:140]
+    fallback = lambda path: samples[path][0].strip().splitlines()[-1].split(". ")[0][:140]
     if todo and api_key:
         try:
             body = json.dumps({
@@ -315,19 +351,23 @@ def service_endpoints(name: str, hours: int = 24):
         from urllib.parse import urlparse
         client = gcp_logging.Client(project=LOG_PROJECT)
         by_path = {}
+        limit = _service_timeout(name)
         for entry in client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
                                           max_results=2000, page_size=1000):
             req = entry.http_request or {}
             status = req.get("status") or 0
             path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
-            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "traces": []})
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "traces": [], "notes": []})
             d["requests"] += 1
             if status >= 500:
                 d["errors"] += 1
-                if _is_timeout(status, ""):
+                if _is_timeout(entry, limit):
                     d["timeouts"] += 1
-                elif entry.trace and len(d["traces"]) < 5:
-                    d["traces"].append(entry.trace)
+                else:
+                    if _request_note(entry) and len(d["notes"]) < 5:
+                        d["notes"].append(_request_note(entry))
+                    if entry.trace and len(d["traces"]) < 5:
+                        d["traces"].append(entry.trace)
         # The app's own ERROR line (matched by trace) says *why* a request failed.
         wanted = {t for d in by_path.values() for t in d["traces"]}
         app_msgs = {}
@@ -342,7 +382,7 @@ def service_endpoints(name: str, hours: int = 24):
         raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
 
     descriptions = _describe_errors(name, {
-        p: [app_msgs[t] for t in d["traces"] if t in app_msgs] for p, d in by_path.items()
+        p: d["notes"] + [app_msgs[t] for t in d["traces"] if t in app_msgs] for p, d in by_path.items()
         if d["errors"] > d["timeouts"]})
     endpoints = [
         {"path": p, "requests": d["requests"], "errors": d["errors"], "timeouts": d["timeouts"],
@@ -365,6 +405,7 @@ def _endpoint_error_logs(name, path, hours, limit=50):
             f'AND timestamp>="{since}"')
     client = gcp_logging.Client(project=LOG_PROJECT)
     requests_ = []
+    limit_s = _service_timeout(name)
     for entry in client.list_entries(filter_=base + " AND httpRequest.status>=500",
                                      order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
         req = entry.http_request or {}
@@ -383,7 +424,7 @@ def _endpoint_error_logs(name, path, hours, limit=50):
     for e in requests_:
         line = _log_line(e)
         line["detail"] = app_msgs.get(e.trace)
-        line["timeout"] = _is_timeout((e.http_request or {}).get("status"), line["detail"])
+        line["timeout"] = _is_timeout(e, limit_s)
         lines.append(line)
     return lines
 

@@ -465,7 +465,8 @@ function endpointDescription(e) {
   const appErrors = e.errors - (e.timeouts || 0);
   return html`${appErrors > 0 && html`<div style="color:var(--critical-fg)">${e.description || 'Server error (500)'}</div>`}
     ${e.timeouts > 0 && html`<div style="color:var(--medium-fg)">Container/server timeout (${e.timeouts} request${e.timeouts > 1 ? 's' : ''} cut off)</div>`}
-    ${e.errors === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}`;
+    ${e.errors === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}
+    ${e.errors > 0 && html`<div style="color:var(--muted)">Click this row to see its logs</div>`}`;
 }
 
 // Per-URL request/error breakdown for a service — an aggregate error rate can
