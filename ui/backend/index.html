@@ -672,11 +672,11 @@ function SchedulerJobsView() {
 // Providers we know we depend on but don't have live monitoring wired up for yet.
 // Shows as a placeholder card so they aren't forgotten — swapped for a real card
 // automatically once /api/providers starts returning a row with this name.
-const PLACEHOLDER_PROVIDERS = ['BrightData', 'Capsolver', 'Gemini'];
+const PLACEHOLDER_PROVIDERS = ['BrightData', 'Capsolver', 'Gemini', 'Hiker'];
 // Account this token/login belongs to — shown so it's clear which account is
 // being checked. Static (not fetched from the API), so it can only ever show
 // what was actually given, never guessed.
-const PROVIDER_ACCOUNT = { brightdata: 'ai@holistique.in' };
+const PROVIDER_ACCOUNT = { brightdata: 'ai@holistique.in', hiker: 'hikerapi.com', gemini: 'Google AI Studio' };
 
 function ProvidersView() {
   const [rows] = useApi('/api/providers');

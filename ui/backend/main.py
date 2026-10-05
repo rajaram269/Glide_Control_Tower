@@ -505,6 +505,61 @@ def service_endpoint_logs(name: str, path: str, hours: int = 24):
         raise HTTPException(503, f"Endpoint logs unavailable: {type(e).__name__}: {first_line}")
 
 
+def _check_hiker_live():
+    api_key = os.environ.get("HIKER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.hikerapi.com/sys/balance",
+            headers={"x-access-key": api_key, "User-Agent": "GlideControlTower/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                amount = data.get("amount")
+                currency = data.get("currency", "USD")
+                requests_count = data.get("requests")
+                components = []
+                if amount is not None:
+                    components.append(f"Balance: ${amount:,.2f}" if currency == "USD" else f"Balance: {amount} {currency}")
+                return {
+                    "provider": "hiker",
+                    "overall_status": "operational" if (amount is None or amount > 0) else "major_outage",
+                    "affected_components": components,
+                    "polled_at": datetime.now(timezone.utc),
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _check_gemini_live():
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            headers={"User-Agent": "GlideControlTower/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name", "") for m in data.get("models", []) if "gemini" in m.get("name", "")]
+                return {
+                    "provider": "gemini",
+                    "overall_status": "operational",
+                    "affected_components": [],
+                    "polled_at": datetime.now(timezone.utc),
+                }
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/api/providers")
 def providers():
     with get_db() as cur:
@@ -521,6 +576,20 @@ def providers():
                     r["affected_components"] = json.loads(r["affected_components"])
                 except Exception:
                     pass
+            if str(r.get("provider", "")).lower() == "hiker" and isinstance(r.get("affected_components"), list):
+                r["affected_components"] = [c for c in r["affected_components"] if str(c).startswith("Balance:")]
+            if str(r.get("provider", "")).lower() == "openai" and isinstance(r.get("affected_components"), list):
+                r["affected_components"] = [c for c in r["affected_components"] if str(c).startswith("Balance:")]
+            if str(r.get("provider", "")).lower() == "gemini" and r.get("overall_status") == "operational":
+                r["affected_components"] = []
+        if not any(str(r.get("provider", "")).lower() == "hiker" for r in rows):
+            hiker_status = _check_hiker_live()
+            if hiker_status:
+                rows.append(hiker_status)
+        if not any(str(r.get("provider", "")).lower() == "gemini" for r in rows):
+            gemini_status = _check_gemini_live()
+            if gemini_status:
+                rows.append(gemini_status)
         return rows
 
 

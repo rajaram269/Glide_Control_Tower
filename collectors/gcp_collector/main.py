@@ -427,6 +427,7 @@ def poll_status_pages(pg_cur):
                 overall, components = _poll_statuspage_io(provider, url)
 
             if provider == "openai":
+                components = []
                 bal = _check_openai_balance()
                 if bal is not None:
                     components.insert(0, f"Balance: ${bal:,.2f}")
@@ -523,6 +524,86 @@ def check_capsolver(pg_cur):
            (provider, status_page_url, overall_status, affected_components, polled_at)
            VALUES (%s, %s, %s, %s, %s)""",
         ("capsolver", _CAPSOLVER_BALANCE_URL, status, json.dumps(components), NOW),
+    )
+
+
+# ─── HikerAPI account health ──────────────────────────────────────────────────
+_HIKER_BALANCE_URL = "https://api.hikerapi.com/sys/balance"
+
+
+def check_hiker(pg_cur):
+    api_key = os.environ.get("HIKER_API_KEY", "").strip()
+    if not api_key:
+        return  # not configured
+    try:
+        r = requests.get(
+            _HIKER_BALANCE_URL,
+            headers={"x-access-key": api_key, "User-Agent": "GlideControlTower/1.0"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        amount = data.get("amount")
+        currency = data.get("currency", "USD")
+        requests_count = data.get("requests")
+        if amount is not None and amount <= 0:
+            status = "major_outage"
+            components = [f"Balance: {amount} {currency} (Exhausted)"]
+        else:
+            status = "operational"
+            components = [
+                f"Balance: ${amount:,.2f}" if currency == "USD" and amount is not None else f"Balance: {amount} {currency}"
+            ]
+        log.info("Hiker: balance=%s %s status=%s", amount, currency, status)
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        status, components = "major_outage", [f"API check failed (HTTP {status_code})"]
+        log.warning("Hiker health check failed: %s", e)
+    except Exception as e:
+        status, components = "major_outage", [f"Check failed: {e}"[:200]]
+        log.warning("Hiker health check failed: %s", e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        ("hiker", "https://hikerapi.com/", status, json.dumps(components), NOW),
+    )
+
+
+# ─── Gemini API health ────────────────────────────────────────────────────────
+_GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def check_gemini(pg_cur):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return  # not configured
+    try:
+        r = requests.get(
+            f"{_GEMINI_MODELS_URL}?key={api_key}",
+            headers={"User-Agent": "GlideControlTower/1.0"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        models = [m.get("name", "") for m in data.get("models", []) if "gemini" in m.get("name", "")]
+        status = "operational"
+        components = []
+        log.info("Gemini: %d models accessible status=%s", len(models), status)
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        status, components = "major_outage", [f"API check failed (HTTP {status_code})"]
+        log.warning("Gemini health check failed: %s", e)
+    except Exception as e:
+        status, components = "major_outage", [f"Check failed: {e}"[:200]]
+        log.warning("Gemini health check failed: %s", e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        ("gemini", "https://ai.google.dev/", status, json.dumps(components), NOW),
     )
 
 
@@ -1094,6 +1175,8 @@ def main():
             poll_status_pages(cur)
             check_brightdata(cur)
             check_capsolver(cur)
+            check_hiker(cur)
+            check_gemini(cur)
             pg.commit()
 
             # 4. Auto-discover new services

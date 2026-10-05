@@ -95,9 +95,9 @@ Everything is stored in one Postgres database, split into two sections:
 | Page | What it shows |
 |---|---|
 | Overview | Quick summary: how many alerts, failing jobs, things needing review |
-| Services | Always-on apps: traffic, speed, error rate |
+| Services | Always-on apps: traffic, speed, error rate. Click any service to see a per-endpoint breakdown (which specific URL is actually broken, not just one overall number) with its own logs and a plain-English reason per failing endpoint |
 | Jobs | Scheduled/batch jobs: did they run, did they succeed, click a row for its logs |
-| Providers | Is OpenAI/Anthropic/GCP itself having an outage right now |
+| Providers | Is OpenAI/Anthropic/GCP having an outage, plus real account checks for BrightData, Capsolver, Hiker and Gemini (actual balance/API-key health, not just a public status page) |
 | Alerts | History of every problem found, with a button to mark it handled |
 | Costs | Money spent vs budget |
 | Catalog | The AI's description of every business-data table |

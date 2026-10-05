@@ -27,30 +27,34 @@ project overview yet.
 
 **STATUS: IN_PROGRESS**
 
-*Real progress:* BrightData now has a genuine health check — reads the actual
-account balance from BrightData's own API (not a status page): currently
-**$92.63 balance, $312.37 pending costs**. Turns red automatically if the
-balance hits zero or the API call fails. This is the first provider with a
-real, working check instead of a placeholder.
+*Real progress (updated):* 4 providers now have genuine account-level checks,
+not placeholders — confirmed live on the dashboard:
+- **BrightData** — real balance ($91.69)
+- **Capsolver** — real balance ($8.41)
+- **Hiker (HikerAPI)** — real balance ($132.97)
+- **Gemini** — real reachability check (can the key list its models)
+- **OpenAI** — a balance check was added too, but it's currently showing
+  "degraded" with no balance figure — worth a quick look at why (likely needs
+  an Admin-tier API key, same issue the cost collector hit for OpenAI/Anthropic
+  cost tracking).
+
+**One gap worth knowing:** the endpoint-level error descriptions on the Services
+page use an OpenAI call to turn a raw error into a plain-English sentence — but
+`ct-ui` doesn't have `OPENAI_API_KEY` set, so in production this always falls
+back to the raw error line, silently. Harmless (nothing breaks), just means the
+AI-summary feature isn't actually active yet despite being built.
 
 **What it means:** know when OpenAI, ClickHouse, AWS etc. are failing *for us*
 specifically, and get alerted.
 
-**What's actually there today:** the Providers page reads public status pages
-(status.openai.com and similar) for 7 providers. Gemini, ClickHouse and AWS aren't
-checked at all. There's a second attempt to measure *our own* error rate by scanning
-our logs, but it only ever counts errors — the success/total count it needs to turn
-that into a percentage is never filled in, so the alert built on top of it can
-mathematically never fire.
+**What's still a placeholder:** ClickHouse and AWS aren't checked at all yet.
+The separate "scan our own logs for API errors" attempt still has the same
+original bug — it only ever counts errors, never a total, so a rate can't be
+computed and that specific alert can never fire.
 
-*Small step taken:* BrightData, Capsolver and Gemini now show as greyed-out
-"not monitored yet" boxes on the Providers page, so they're visible as known gaps
-rather than missing entirely. This is a placeholder card only — no real check behind
-it yet. Waiting on you for details on how each of these three should actually be
-checked.
-
-**What "done" looks like:** measure our own real success/failure rate calling each
-provider, not just their public status page, and actually send an alert when it's bad.
+**What "done" looks like:** ClickHouse and AWS get the same real-check
+treatment as BrightData/Capsolver/Hiker/Gemini, the OpenAI balance check
+actually returns a number, and an alert fires when any of them look bad.
 
 ---
 
