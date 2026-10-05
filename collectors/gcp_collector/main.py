@@ -386,34 +386,6 @@ def _poll_google_incidents(provider, url):
     return overall, affected
 
 
-def _check_openai_balance():
-    """Attempts to fetch OpenAI balance/credit details.
-    Supports credit grants, subscription, or organization costs endpoint."""
-    key = os.environ.get("OPENAI_ADMIN_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not key:
-        return None
-    headers = {"Authorization": f"Bearer {key}"}
-    try:
-        r = requests.get("https://api.openai.com/v1/dashboard/billing/credit_grants", headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            total_avail = data.get("total_available")
-            if total_avail is not None:
-                return float(total_avail)
-    except Exception:
-        pass
-    try:
-        r = requests.get("https://api.openai.com/v1/dashboard/billing/subscription", headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            hard_limit = data.get("hard_limit_usd")
-            if hard_limit is not None:
-                return float(hard_limit)
-    except Exception:
-        pass
-    return None
-
-
 def poll_status_pages(pg_cur):
     log.info("Polling status pages...")
     rows = []
@@ -425,14 +397,6 @@ def poll_status_pages(pg_cur):
                 overall, components = _poll_google_incidents(provider, url)
             else:
                 overall, components = _poll_statuspage_io(provider, url)
-
-            if provider == "openai":
-                components = []
-                bal = _check_openai_balance()
-                if bal is not None:
-                    components.insert(0, f"Balance: ${bal:,.2f}")
-                    if bal <= 0:
-                        overall = "major_outage"
 
             rows.append((provider, url, overall, json.dumps(components), NOW))
             log.info("Status %s: %s", provider, overall)

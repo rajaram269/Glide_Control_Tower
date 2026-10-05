@@ -578,8 +578,6 @@ def providers():
                     pass
             if str(r.get("provider", "")).lower() == "hiker" and isinstance(r.get("affected_components"), list):
                 r["affected_components"] = [c for c in r["affected_components"] if str(c).startswith("Balance:")]
-            if str(r.get("provider", "")).lower() == "openai" and isinstance(r.get("affected_components"), list):
-                r["affected_components"] = [c for c in r["affected_components"] if str(c).startswith("Balance:")]
             if str(r.get("provider", "")).lower() == "gemini" and r.get("overall_status") == "operational":
                 r["affected_components"] = []
         if not any(str(r.get("provider", "")).lower() == "hiker" for r in rows):
