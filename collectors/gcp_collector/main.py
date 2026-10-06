@@ -31,7 +31,6 @@ WINDOW_START = NOW - datetime.timedelta(minutes=COLLECTION_WINDOW_MINUTES)
 # Statuspage.io providers — use /api/v2/status.json format
 STATUSPAGE_PROVIDERS = {
     "openai":     "https://status.openai.com/api/v2/status.json",
-    "anthropic":  "https://status.anthropic.com/api/v2/status.json",
     "cloudflare": "https://www.cloudflarestatus.com/api/v2/status.json",
     "cohere":     "https://status.cohere.com/api/v2/status.json",
 }
@@ -568,6 +567,52 @@ def check_gemini(pg_cur):
            (provider, status_page_url, overall_status, affected_components, polled_at)
            VALUES (%s, %s, %s, %s, %s)""",
         ("gemini", "https://ai.google.dev/", status, json.dumps(components), NOW),
+    )
+
+
+# ─── Anthropic account health ─────────────────────────────────────────────────
+#
+# Used to just poll status.anthropic.com — that only answers "is Anthropic's
+# service itself down", not "does OUR key still work". An expired key showed
+# green/operational for weeks because of this (Anthropic was never down, only
+# our key was). This instead calls the API directly with our own key — the
+# cheapest possible real call (lists models, no tokens spent) — so a dead key
+# shows red immediately, labeled clearly rather than a generic outage.
+_ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
+
+
+def check_anthropic(pg_cur):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return  # not configured
+    try:
+        r = requests.get(
+            _ANTHROPIC_MODELS_URL,
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "User-Agent": "GlideControlTower/1.0"},
+            timeout=15,
+        )
+        if r.status_code == 401:
+            status, components = "major_outage", ["Key expired or invalid"]
+        elif r.status_code == 400 and "workspace" in r.text.lower():
+            status, components = "major_outage", ["Key needs a workspace ID (wrong key type)"]
+        else:
+            r.raise_for_status()
+            status, components = "operational", []
+        log.info("Anthropic: status=%s", status)
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        status, components = "major_outage", [f"API check failed (HTTP {status_code})"]
+        log.warning("Anthropic health check failed: %s", e)
+    except Exception as e:
+        status, components = "major_outage", [f"Check failed: {e}"[:200]]
+        log.warning("Anthropic health check failed: %s", e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        ("anthropic", _ANTHROPIC_MODELS_URL, status, json.dumps(components), NOW),
     )
 
 
@@ -1141,6 +1186,7 @@ def main():
             check_capsolver(cur)
             check_hiker(cur)
             check_gemini(cur)
+            check_anthropic(cur)
             pg.commit()
 
             # 4. Auto-discover new services
