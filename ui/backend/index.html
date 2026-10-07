@@ -881,9 +881,16 @@ function FreshnessView() {
   const [rows] = useApi('/api/sentinel/freshness');
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(null);
+  const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
-  const shown = rows.filter(r => rowMatches(r, q));
+  // Dead/stale rank first (the problem you'd want to act on), static tables last
+  // (nothing to do there) — same "problems first" convention as the Jobs page.
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    sync: r => r.is_static ? 4
+      : r.sync_status === 'dead' ? 0 : r.sync_status === 'stale' ? 1
+      : r.sync_status === 'fresh' ? 3 : 2,
+  });
   const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
   const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
   const dataBad = shown.filter(r => ['stale','dead'].includes(r.data_status)).length;
@@ -899,7 +906,8 @@ function FreshnessView() {
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Table</th><th>Sync</th><th>Data</th><th>Expected update</th>
+        <th>Table</th><${Th} label="Sync" k="sync" title="Click to sort: dead/stale first → fresh last"/>
+        <th>Data</th><th>Expected update</th>
         <th>Newest data</th><th>Monitored variables</th>
       </tr></thead>
       <tbody>
@@ -907,8 +915,11 @@ function FreshnessView() {
           const tv = Array.isArray(r.tracked_variables) ? r.tracked_variables : [];
           const syncD = freshDisplay({ ...r, sentinel_status: r.sync_status || r.sentinel_status });
           const bad = ['stale','dead'].includes(r.data_status) || ['stale','dead'].includes(r.sync_status);
+          // A table with no table-level date column can still show a Data verdict here
+          // if one of its tracked variables (e.g. one platform) came back stale/dead —
+          // that escalation happens server-side, so data_status alone already covers it.
           const dataBadge = r.is_static ? html`<span class="badge unknown">—</span>`
-            : !r.data_column ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
+            : !r.data_column && !r.data_status ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
             : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
             : html`<span class="badge unknown">—</span>`;
           return html`<tr key=${`${r.database_name}.${r.table_name}`} onClick=${()=>setSel(r)} style=${bad ? 'background:var(--critical-bg)' : ''}>
@@ -944,6 +955,15 @@ function FreshnessView() {
               <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
           ${(['stale','dead'].includes(sel.data_status) && !['stale','dead'].includes(sel.sync_status)) && html`
             <div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`}
+          ${Array.isArray(sel.variable_freshness_detail) && sel.variable_freshness_detail.length > 0 && html`
+            <div class="callout bad" style="margin-top:8px">
+              <b>⚠ Specific values with stale/dead data</b> — this is why Data shows ${sel.data_status} even if most of the table looks fine:
+              ${sel.variable_freshness_detail.map(d => html`<div style="margin-top:6px">
+                <b>${d.variable}</b>:
+                ${(d.dead_values||[]).map(v => html`<span class="badge major_outage" style="margin:2px 4px 0 0">${v}</span>`)}
+                ${(d.stale_values||[]).map(v => html`<span class="badge degraded" style="margin:2px 4px 0 0">${v}</span>`)}
+              </div>`)}
+            </div>`}
           <div class="kv"><div class="kv-label">Expected update frequency</div>${sel.is_static?'frozen':cadenceLabel(sel.expected_cadence_weeks)}</div>
           ${tv.length>0 && html`<div class="kv"><div class="kv-label">Monitored dimensions</div>${tv.map(v=>html`<span class="badge accent" style="margin-right:4px">${v}</span>`)}</div>`}
           ${sel.mismatch && html`<div class="kv"><div class="kv-label">Legacy check</div>The old freshness path disagrees (says ${sel.legacy_status}) — being verified before retiring it.</div>`}`;

@@ -871,6 +871,29 @@ def sentinel_freshness():
                 SELECT DISTINCT database_name, table_name, is_static
                 FROM sentinel.monitor_targets WHERE variable = ''
             ),
+            varfresh_latest AS (   -- latest variable_freshness result per tracked variable
+                SELECT DISTINCT ON (database_name, table_name, variable)
+                    database_name, table_name, variable, status, observed
+                FROM sentinel.check_results
+                WHERE check_type = 'variable_freshness'
+                ORDER BY database_name, table_name, variable, run_ts DESC
+            ),
+            varfresh AS (   -- rolled up to table level: a stale PLATFORM makes the
+                -- table's own Data badge stale too, not just the whole-table max date —
+                -- otherwise one dead platform hides behind 73 healthy ones (§ the whole
+                -- point of this check existing).
+                SELECT database_name, table_name,
+                       bool_or(status = 'fail') AS any_dead,
+                       bool_or(status IN ('warn','fail')) AS any_stale,
+                       jsonb_agg(jsonb_build_object(
+                           'variable', variable, 'status', status,
+                           'stale_values', observed->'stale_values',
+                           'dead_values', observed->'dead_values'
+                       ) ORDER BY variable) FILTER (WHERE status IN ('warn','fail'))
+                           AS stale_detail
+                FROM varfresh_latest
+                GROUP BY database_name, table_name
+            ),
             leg AS (
                 SELECT DISTINCT ON (database_name, table_name)
                     database_name, table_name,
@@ -885,15 +908,23 @@ def sentinel_freshness():
                    sen.sentinel_status, sen.mechanism, sen.sentinel_last_write,
                    sen.expected_cadence_weeks, sen.sentinel_checked_at,
                    sen.sync_status, sen.sync_last_write,
-                   sen.data_status, sen.data_column, sen.data_last,
+                   -- Data badge = worst of the whole-table date AND any tracked
+                   -- variable's own date — a stale/dead platform now shows up here,
+                   -- not only buried in a separate, easy-to-miss check.
+                   CASE WHEN vf.any_dead OR sen.data_status = 'dead' THEN 'dead'
+                        WHEN vf.any_stale OR sen.data_status = 'stale' THEN 'stale'
+                        ELSE sen.data_status END AS data_status,
+                   sen.data_column, sen.data_last,
+                   vf.stale_detail AS variable_freshness_detail,
                    leg.legacy_status, leg.legacy_last_write, leg.legacy_checked_at,
                    vars.tracked_variables, COALESCE(stat.is_static, false) AS is_static,
                    (sen.sentinel_status IS NOT NULL AND leg.legacy_status IS NOT NULL
                     AND sen.sentinel_status <> leg.legacy_status) AS mismatch
             FROM sen
-            FULL OUTER JOIN leg  USING (database_name, table_name)
-            LEFT JOIN      vars USING (database_name, table_name)
-            LEFT JOIN      stat USING (database_name, table_name)
+            FULL OUTER JOIN leg      USING (database_name, table_name)
+            LEFT JOIN      vars      USING (database_name, table_name)
+            LEFT JOIN      stat      USING (database_name, table_name)
+            LEFT JOIN      varfresh vf USING (database_name, table_name)
             ORDER BY mismatch DESC NULLS LAST, database_name, table_name
         """)
         return cur.fetchall()
