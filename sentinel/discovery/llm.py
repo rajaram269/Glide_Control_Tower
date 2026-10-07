@@ -286,7 +286,13 @@ def _call_anthropic(prompt):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        max_tokens=2048,   # 1024 truncated the full discovery JSON → unterminated string
+        max_tokens=8192,   # 1024, then 2048, then 4096 ALL still truncated on wider
+                           # tables — a truncated response fails validation and the
+                           # retry uses the same budget, so it fails identically every
+                           # time, wasting a full extra round trip (seen in prod:
+                           # consistent on attempt 1 AND 2, not transient flakiness,
+                           # cutting off at nearly the same ~14k-char mark regardless
+                           # of table size — doubling again for real headroom)
         temperature=0,
         messages=[{"role": "user", "content": prompt + "\n\nReturn a single JSON object only."}],
     )

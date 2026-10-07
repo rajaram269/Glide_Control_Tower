@@ -17,9 +17,22 @@ project overview yet.
 | 3 | Pipeline page redundancy | 🟢 DONE (removed) |
 | 4 | Deeper service monitoring (silent failures) | 🟢 DONE |
 | 5 | Sentinel reconciliation alerting | 🔴 PENDING |
-| 6 | Sentinel freshness cleanup | 🔴 PENDING |
+| 6 | Sentinel freshness cleanup | 🟡 IN_PROGRESS |
+| 7 | Freshness checks include deleted/tombstone rows (new, found 2026-10-06) | 🟢 DONE |
 
 🟢 DONE · 🟡 IN_PROGRESS · 🔴 PENDING
+
+---
+
+## 7. Freshness checks don't filter out deleted rows — found while investigating a weird date
+
+**STATUS: DONE**
+
+**What happened:** `Holistique_Base` showed a "newest data" date of Dec 8, 2026 — about 2 months in the future. Checked the real source (MySQL): that date doesn't exist there at all. Root cause, confirmed directly in ClickHouse: those rows have `_peerdb_is_deleted = 1` — they're deleted/tombstone rows from the CDC replication, not live data. The convention everywhere else in this project is `_peerdb_is_deleted = 0` = the real, live data.
+
+**The fix — made universal, not just this one spot:** decided this should apply everywhere, not just this one function — any ClickHouse read, any database, any table, should only ever consider `_peerdb_is_deleted = 0` rows. Added a small helper (`_live_only_clause`, checks whether the table even has that column, cached per table per run) and applied it everywhere ClickHouse is read for live data: freshness (`_maxcol_freshness`), variable coverage, the no-dedup fallback paths of reconciliation's count/sum helpers, and discovery's segment-cardinality/segment-value sampling. Deliberately left `check_volume` alone (it reads `system.parts` row counts, which is a different, cheaper mechanism than scanning the table — filtering there would mean a full table scan every day; row-count drift already gets caught by the volume-drop alert, so the correctness gain wasn't worth the cost).
+
+**Deployed:** `ct-sentinel-check`, `ct-sentinel-discovery`, and `ct-sentinel-resolver` (discovery's fix propagates into resolver via the existing file-copy step) are all live with this fix as of 2026-10-06.
 
 ---
 
@@ -171,31 +184,141 @@ current default of "new problems are invisible by design."
 
 ## 6. Sentinel — freshness logic is messy at the variable level
 
-**STATUS: PENDING**
+**STATUS: IN_PROGRESS**
 
 **What "variable level" means:** Sentinel doesn't just track "is this whole table
 up to date" — for some tables it also tracks up to 3 individual columns inside that
-table (e.g. brand name) as their own separate tracked things, called "variables,"
+table (e.g. Platform, Brand) as their own separate tracked things, called "variables,"
 each with its own copy of the same settings (how often to check, how stale is too
 stale).
 
-**The actual mess I found:** the freshness check itself (is the data current) is
-**only ever run at the whole-table level** — it never looks at those per-variable
-rows at all. But per-variable rows still exist in the same settings table with their
-own copies of "how often" and "how stale is bad," which are never used for freshness
-and only matter for a *different* check (are all the expected values still showing
-up). So there are extra rows with unused settings living alongside the real ones,
-in the same table, which makes it confusing to read and easy to misconfigure.
+**The original mess:** the freshness check itself (is the data current) was
+**only ever run at the whole-table level** — it never looked at per-variable rows at
+all. A table like `Holistique_Base` could keep looking "fresh" overall because most of
+its ~40-50 platforms keep syncing, while one specific platform's feed quietly died —
+invisible, because nothing checked per-platform recency.
 
-**One more thing worth knowing:** there are currently *two separate* freshness
-systems running side by side on purpose — an older, simpler one, and this newer
-Sentinel one — while the team confirms the new one gives the same answers as the old
-one on real data before retiring the old one. That part is intentional, not a bug.
+**What was built (2026-10-06):** a new check, `variable_freshness`, alongside the
+existing `variable_coverage`. Coverage asks "does this value still exist anywhere in
+the table" (set-difference against recent data); freshness asks "is each value's *own*
+data still current" (per-value `max(event_date)`, classified fresh/stale/dead the same
+way table-level freshness is). Cost stays bounded on purpose:
+- **One query per tracked variable per table**, not one per value — a single
+  `GROUP BY` gets every platform's/brand's last-seen date in one pass.
+- **One alert per variable**, never one per value — never "40 platforms × 4 brands =
+  160 alerts." A variable with several stale/dead values produces one incident listing
+  which values are affected and what % of the tracked set that is.
+- Severity scales with how much is affected (a couple of stale values → warn; a large
+  chunk dead → fail), same pattern as `variable_coverage`.
 
-**What "done" looks like:** separate "how often do we check" from "how stale counts
-as a problem" cleanly (the code has already tried to fix this once with limited
-success), stop creating per-variable rows that the freshness check ignores, and once
-the new system is confirmed to agree with the old one, retire the old one.
+This directly targets the ~40-50 platform × 3-4 brand scale for `Holistique_Base`
+without exploding alert volume — each of Platform and Brand gets exactly one
+freshness verdict per run, regardless of how many values each one has.
+
+**Deployed, but blocked on one step:** `ct-sentinel-check`'s image with this new check
+was built, but **rolled back to the previous image** before going live — the new
+check writes `check_type = 'variable_freshness'`, which isn't yet in the database's
+CHECK constraint (`sentinel.check_results`), so every run would crash the instant it
+hit a variable target. Migration `021_sentinel_variable_freshness.sql` widens that
+constraint. **This needs you to run it** (see "Needs your action" below) — I don't have
+write access to the Postgres secret this session. Once it's applied, redeploy with:
+`gcloud run jobs update ct-sentinel-check --image="gcr.io/seoai-479305/ct-sentinel-check@sha256:262e7245a363a8bcd09ef707fdf73da186c1dd2e8ea209d2e62af34a155b5519" --project=seoai-479305 --region=asia-south1`
+
+**Still not done from the original ask:** separating "how often do we check" from
+"how stale counts as a problem" cleanly for per-variable rows, and retiring the old
+`control_tower.data_freshness` system once the new one is confirmed to agree with it.
+There are currently *two separate* freshness systems running side by side **on
+purpose** — don't delete the old one without checking first.
+
+---
+
+### Needs your action — can't do these myself this session
+
+**1. Apply migration 021** (adds `variable_freshness` to the allowed check types).
+Run via `cloud-sql-proxy` + `psql` the same way `scripts/deploy.sh` applies the others,
+or paste this into whatever Postgres client you use against `agenteye-pg` /
+`control_tower`:
+```sql
+ALTER TABLE sentinel.check_results
+  DROP CONSTRAINT IF EXISTS check_results_check_type_check;
+
+ALTER TABLE sentinel.check_results
+  ADD CONSTRAINT check_results_check_type_check
+  CHECK (check_type IN (
+      'freshness', 'volume', 'variable_coverage', 'variable_freshness',
+      'schema_drift', 'reconciliation'
+  ));
+```
+Then tell me and I'll redeploy `ct-sentinel-check` to the version with the new check
+(image digest above, already built and pushed).
+
+**2. Wipe old freshness history, restart clean from today** (your request). This
+deletes Sentinel's own freshness-family history, not the legacy
+`control_tower.data_freshness` table (that one's still intentionally running
+side-by-side — see above):
+```sql
+DELETE FROM sentinel.incidents
+  WHERE check_type IN ('freshness', 'variable_coverage', 'variable_freshness');
+
+DELETE FROM sentinel.check_results
+  WHERE check_type IN ('freshness', 'variable_coverage', 'variable_freshness');
+```
+Incidents first — `check_results` rows are referenced by `incidents.check_result_id`,
+so deleting results first would fail with a foreign-key error.
+
+**3. A second blocker, found 2026-10-07 while checking the live UI:** raising
+`MAX_DISTINCT` alone does **not** make Platform/Brand start getting tracked for
+`Holistique_Base`, even after discovery re-runs. Discovery has an efficiency gate
+(`sentinel/discovery/main.py`, the "incremental gate"): it skips the AI pass entirely
+for any table whose ClickHouse column structure hasn't changed since it was last
+catalogued — and only a structure change makes it re-evaluate which columns to track
+as variables. I changed the Python cutoff, not `Holistique_Base`'s actual ClickHouse
+columns, so discovery will keep silently skipping it forever unless nudged. The nudge
+is forcing its `structure_hash` to look stale so discovery treats it as needing a
+fresh look.
+
+**Combined runbook — run this whole script once, in order, against `agenteye-pg` /
+`control_tower`:**
+```sql
+-- 1) Force discovery to re-evaluate these two tables under the new MAX_DISTINCT=150
+--    cutoff (discovery otherwise skips any table whose ClickHouse structure hasn't
+--    changed, so this nudge is required — just raising the cutoff isn't enough).
+UPDATE sentinel.catalog_overlay
+SET structure_hash = NULL
+WHERE database_name = 'holistique_default_database'
+  AND table_name IN ('Holistique_Base', 'Holistique_Base_resync');
+
+-- 2) Allow the new per-value freshness check type.
+ALTER TABLE sentinel.check_results
+  DROP CONSTRAINT IF EXISTS check_results_check_type_check;
+
+ALTER TABLE sentinel.check_results
+  ADD CONSTRAINT check_results_check_type_check
+  CHECK (check_type IN (
+      'freshness', 'volume', 'variable_coverage', 'variable_freshness',
+      'schema_drift', 'reconciliation'
+  ));
+
+-- 3) Wipe old freshness-family history so monitoring restarts clean from today.
+--    Incidents first -- check_results rows are FK-referenced by incidents.
+--    Scope is Sentinel's own freshness-family only, NOT the legacy
+--    control_tower.data_freshness table (that one's intentionally still running
+--    side-by-side until the two are confirmed to agree).
+DELETE FROM sentinel.incidents
+  WHERE check_type IN ('freshness', 'variable_coverage', 'variable_freshness');
+
+DELETE FROM sentinel.check_results
+  WHERE check_type IN ('freshness', 'variable_coverage', 'variable_freshness');
+```
+
+Once that's run, tell me and I'll do the rest myself (none of this needs the Postgres
+secret, so it's not blocked on my end):
+1. `gcloud run jobs execute ct-sentinel-discovery` — reprocess `Holistique_Base`/
+   `_resync` immediately instead of waiting for the weekly schedule; Platform/Brand
+   should appear as tracked variables in the UI right after this.
+2. `gcloud run jobs update ct-sentinel-check --image="gcr.io/seoai-479305/ct-sentinel-check@sha256:262e7245a363a8bcd09ef707fdf73da186c1dd2e8ea209d2e62af34a155b5519"` — redeploy the new per-value freshness check now that the DB allows it.
+3. `gcloud run jobs execute ct-sentinel-check` — run it immediately so you don't have to
+   wait for the next 02:00/08:00/14:00 UTC tick to see per-platform freshness data.
 
 ---
 

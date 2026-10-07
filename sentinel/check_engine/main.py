@@ -63,6 +63,32 @@ def ch_connect():
 
 # ─── 1. Freshness ──────────────────────────────────────────────────────────────
 
+_live_filter_cache = {}
+
+
+def _live_only_clause(ch, db, table):
+    """WHERE fragment excluding PeerDB tombstone rows (_peerdb_is_deleted=1),
+    for whichever database/table actually has that column — a deleted row is
+    never real data, regardless of which table it's on. None if the table
+    doesn't have this column at all (e.g. a non-CDC/manually-added table).
+    Cached per (db, table) for this run so repeated calls for the same table
+    don't re-check column existence each time."""
+    key = (db, table)
+    if key in _live_filter_cache:
+        return _live_filter_cache[key]
+    try:
+        r = ch.query(
+            "SELECT count() FROM system.columns WHERE database={db:String} "
+            "AND table={tbl:String} AND name='_peerdb_is_deleted'",
+            parameters={"db": db, "tbl": table},
+        )
+        result = "`_peerdb_is_deleted` = 0" if r.result_rows[0][0] else None
+    except Exception:
+        result = None
+    _live_filter_cache[key] = result
+    return result
+
+
 def _parts_freshness(ch, db, table):
     """Cheap metadata read — no data scan. Returns latest modification_time or None."""
     res = ch.query(
@@ -78,9 +104,13 @@ def _maxcol_freshness(ch, db, table, col):
     """max of a date/datetime column, parsing robustly across formats (String dates
     in DD/MM/YYYY or ISO, Date/DateTime/Date32, epoch strings). Returns tz-aware
     datetime or None. parseDateTimeBestEffortOrNull tolerates the value-format
-    variations these ClickHouse tables have (many store dates as String)."""
+    variations these ClickHouse tables have (many store dates as String).
+    Excludes deleted rows (see _live_only_clause) — a tombstone row's date is
+    not real data and must never count as "the newest data in this table"."""
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
     res = ch.query(
-        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`"
+        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`{where}"
     )
     r = res.result_rows
     return r[0][0] if r and r[0][0] else None
@@ -268,7 +298,9 @@ def check_variable_coverage(ch, pg_cur, target):
     if not expected:
         return "ok", {"note": "no active values tracked yet"}
     try:
-        res = ch.query(f"SELECT DISTINCT toString(`{variable}`) FROM `{db}`.`{table}`")
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        res = ch.query(f"SELECT DISTINCT toString(`{variable}`) FROM `{db}`.`{table}`{where}")
         present = {r[0] for r in res.result_rows}
     except Exception as e:
         return "warn", {"error": str(e)}
@@ -278,6 +310,65 @@ def check_variable_coverage(ch, pg_cur, target):
         return status, {"missing_values": missing[:50], "missing_count": len(missing),
                         "expected_count": len(expected)}
     return "ok", {"expected_count": len(expected), "missing_count": 0}
+
+
+# Per-value freshness — coverage (above) only asks "does this value exist anywhere in
+# the table." It misses a segment whose feed died while other segments keep the table
+# looking fresh overall (e.g. one of 40 platforms stops syncing; Base still gets daily
+# writes from the other 39). This asks "is each value's OWN data still current."
+# One GROUP BY query gets every value's last business date in a single pass — cost is
+# one query per tracked variable per table, not one per value. One alert per variable,
+# listing affected values, keeps volume bounded regardless of how many values exist.
+def check_variable_freshness(ch, pg_cur, target):
+    db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
+    if not variable:
+        return "ok", {"note": "table-level target, no variable"}
+    edc = target.get("event_date_column")
+    if not edc:
+        return "ok", {"note": "no business date column — nothing to check per value"}
+    tolerance_weeks = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
+
+    pg_cur.execute(
+        """SELECT value FROM sentinel.variable_values
+           WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
+        (db, table, variable),
+    )
+    expected = {r[0] for r in pg_cur.fetchall()}
+    if not expected:
+        return "ok", {"note": "no active values tracked yet"}
+
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
+    try:
+        res = ch.query(
+            f"SELECT toString(`{variable}`), "
+            f"max(parseDateTimeBestEffortOrNull(toString(`{edc}`))) "
+            f"FROM `{db}`.`{table}`{where} GROUP BY toString(`{variable}`)"
+        )
+        last_seen = {r[0]: r[1] for r in res.result_rows}
+    except Exception as e:
+        return "warn", {"error": str(e)}
+
+    stale, dead = [], []
+    for v in sorted(expected):
+        _, vstatus, _age = _classify(last_seen.get(v), tolerance_weeks)
+        if vstatus == "fail":
+            dead.append(v)
+        elif vstatus == "warn":
+            stale.append(v)
+
+    affected = len(stale) + len(dead)
+    if not affected:
+        return "ok", {"expected_count": len(expected), "stale_count": 0, "dead_count": 0}
+
+    affected_pct = affected / len(expected) * 100.0
+    status = "fail" if (dead and affected_pct >= 20) or affected_pct >= 50 else "warn"
+    return status, {
+        "expected_count": len(expected),
+        "stale_values": stale[:50], "stale_count": len(stale),
+        "dead_values": dead[:50], "dead_count": len(dead),
+        "affected_pct": round(affected_pct, 1),
+    }
 
 
 # ─── 5. Cross-table reconciliation (dedup ON) ────────────────────────────────────
@@ -335,7 +426,11 @@ def _deduped_count(ch, ref, dedup):
             inner = f"SELECT DISTINCT {keys} FROM `{db}`.`{table}`"
         sql = f"SELECT count() FROM ({inner})"
     else:
-        sql = f"SELECT count() FROM `{db}`.`{table}`"
+        # No dedup key configured for this table — still exclude deleted rows
+        # when the column exists, rather than counting tombstones as real data.
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        sql = f"SELECT count() FROM `{db}`.`{table}`{where}"
     return float(ch.query(sql).result_rows[0][0] or 0)
 
 
@@ -353,7 +448,10 @@ def _deduped_sum(ch, ref, dedup):
                f"FROM `{db}`.`{table}` GROUP BY {keys} "
                f"HAVING argMax(`{dedup['delete']}`, `{dedup['version']}`) = 0)")
     else:
-        sql = f"SELECT sum({q}) FROM `{db}`.`{table}`"
+        # No dedup key configured — still exclude deleted rows when present.
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        sql = f"SELECT sum({q}) FROM `{db}`.`{table}`{where}"
     return float(ch.query(sql).result_rows[0][0] or 0)
 
 
@@ -535,6 +633,7 @@ TABLE_CHECKS = [
 ]
 VARIABLE_CHECKS = [
     ("variable_coverage", check_variable_coverage),
+    ("variable_freshness", check_variable_freshness),
 ]
 
 

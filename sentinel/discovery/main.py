@@ -36,7 +36,7 @@ ADVISORY_LOCK_KEY = 0x53454E54  # "SENT"
 MAX_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_TABLES_PER_RUN", "80"))
 
 # PII-safe sampling caps (§10.3)
-MAX_DISTINCT = 50
+MAX_DISTINCT = 150    # was 50 — too small for real wide dimensions like Platform
 MAX_STR_LEN = 64
 # Never sample raw row values from these databases — schema + stats only (R5)
 PII_DATABASES = {"recruitment_hr"}
@@ -60,6 +60,32 @@ def source_type_heuristic(db, table):
     if "order" in t or "inventory" in t or "product" in t:
         return "sales_channel"
     return None
+
+
+# Deterministic event_date_column fallback — the LLM's prompt already explains this
+# field well, but it still misses obvious cases (seen in prod: Holistique_Base has a
+# plain SalesDate column and the LLM said null). Only fires when the LLM said null
+# (never overrides an explicit LLM pick) and never on a table the LLM already judged
+# static (a lookup table can have an effective_date column and correctly have no
+# business event date). Unambiguous name matches only — two+ "*Date" columns means
+# we don't know which one is "the" business date, so it stays null rather than guess.
+_EVENT_DATE_NAMES = {
+    "salesdate", "orderdate", "invoicedate", "transactiondate", "postingdate",
+    "documentdate", "eventdate", "billdate", "shipdate", "deliverydate",
+}
+_NON_EVENT_DATE_PREFIXES = ("_peerdb", "created", "updated", "modified", "synced", "inserted")
+
+
+def event_date_column_heuristic(columns, is_static):
+    if is_static:
+        return None
+    names = [c["name"] for c in columns]
+    for n in names:
+        if n.lower() in _EVENT_DATE_NAMES:
+            return n
+    date_like = [n for n in names if n.lower().endswith("date")
+                 and not n.lower().startswith(_NON_EVENT_DATE_PREFIXES)]
+    return date_like[0] if len(date_like) == 1 else None
 
 
 def pg_connect():
@@ -460,10 +486,38 @@ def _is_business_segment_col(col_name, role):
     return True
 
 
-def _segment_cardinality(ch, db, tbl, col):
-    """Cheap distinct-count probe. Returns int or None on error."""
+_live_filter_cache = {}
+
+
+def _live_only_clause(ch, db, table):
+    """WHERE fragment excluding PeerDB tombstone rows (_peerdb_is_deleted=1),
+    for whichever database/table actually has that column — a deleted row is
+    never real data, regardless of which table it's on. None if the table
+    doesn't have this column at all. Cached per (db, table) for this run."""
+    key = (db, table)
+    if key in _live_filter_cache:
+        return _live_filter_cache[key]
     try:
-        r = ch.query(f"SELECT uniqExact(`{col}`) FROM `{db}`.`{tbl}`")
+        r = ch.query(
+            "SELECT count() FROM system.columns WHERE database={db:String} "
+            "AND table={tbl:String} AND name='_peerdb_is_deleted'",
+            parameters={"db": db, "tbl": table},
+        )
+        result = "`_peerdb_is_deleted` = 0" if r.result_rows[0][0] else None
+    except Exception:
+        result = None
+    _live_filter_cache[key] = result
+    return result
+
+
+def _segment_cardinality(ch, db, tbl, col):
+    """Cheap distinct-count probe. Returns int or None on error. Excludes
+    deleted rows — a column shouldn't look higher/lower cardinality than it
+    really is because of tombstone rows still sitting in the table."""
+    try:
+        live = _live_only_clause(ch, db, tbl)
+        where = f" WHERE {live}" if live else ""
+        r = ch.query(f"SELECT uniqExact(`{col}`) FROM `{db}`.`{tbl}`{where}")
         return int(r.result_rows[0][0] or 0)
     except Exception as e:
         log.warning("cardinality probe failed %s.%s.%s: %s", db, tbl, col, e)
@@ -472,10 +526,14 @@ def _segment_cardinality(ch, db, tbl, col):
 
 def _segment_values(ch, db, tbl, col):
     """Fetch the current distinct value set (as toString, matching the coverage
-    check). Bounded by MAX_DISTINCT. Reuses cached samples when present."""
+    check). Bounded by MAX_DISTINCT. Reuses cached samples when present.
+    Excludes deleted rows — a value that only exists in deleted rows shouldn't
+    be tracked as a currently-active value."""
+    live = _live_only_clause(ch, db, tbl)
+    extra = f" AND {live}" if live else ""
     r = ch.query(
         f"SELECT DISTINCT toString(`{col}`) FROM `{db}`.`{tbl}` "
-        f"WHERE length(toString(`{col}`)) <= {MAX_STR_LEN} LIMIT {MAX_DISTINCT}"
+        f"WHERE length(toString(`{col}`)) <= {MAX_STR_LEN}{extra} LIMIT {MAX_DISTINCT}"
     )
     return {row[0] for row in r.result_rows}
 
@@ -664,89 +722,103 @@ def main():
     llm_count = skip_count = 0
 
     try:
-        with pg.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
-            if not cur.fetchone()[0]:
-                log.warning("Another discovery run holds the lock. Exiting.")
-                return
+        cur = pg.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+        if not cur.fetchone()[0]:
+            log.warning("Another discovery run holds the lock. Exiting.")
+            return
 
-            existing = load_existing_overlay(cur)
-            tables = enumerate_tables(ch)
-            log.info("Enumerated %d ClickHouse tables", len(tables))
+        existing = load_existing_overlay(cur)
+        tables = enumerate_tables(ch)
+        log.info("Enumerated %d ClickHouse tables", len(tables))
 
-            seen_keys = set()
-            full_pass = True   # False if we break early on the batch cap
-            for meta in tables:
-                db, tbl = meta["database_name"], meta["table_name"]
-                key = (db, tbl)
-                seen_keys.add(key)
-                columns = introspect_columns(ch, db, tbl)
-                if not columns:
-                    continue
-                meta["structure_hash"] = structure_hash(columns)
+        seen_keys = set()
+        full_pass = True   # False if we break early on the batch cap
+        for meta in tables:
+            db, tbl = meta["database_name"], meta["table_name"]
+            key = (db, tbl)
+            seen_keys.add(key)
+            columns = introspect_columns(ch, db, tbl)
+            if not columns:
+                continue
+            meta["structure_hash"] = structure_hash(columns)
 
-                prior = existing.get(key)
-                # 4. Incremental gate — unchanged structure skips the LLM. This is what
-                # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
-                # are skipped here, so each run advances the frontier of new/changed
-                # tables until the whole catalog is filled, then steady-state is cheap.
-                if prior and prior["structure_hash"] == meta["structure_hash"]:
-                    skip_count += 1
-                    continue
+            prior = existing.get(key)
+            # 4. Incremental gate — unchanged structure skips the LLM. This is what
+            # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
+            # are skipped here, so each run advances the frontier of new/changed
+            # tables until the whole catalog is filled, then steady-state is cheap.
+            if prior and prior["structure_hash"] == meta["structure_hash"]:
+                skip_count += 1
+                continue
 
-                # Per-run batch cap: only process up to MAX_TABLES_PER_RUN new/changed
-                # tables, so a run over 450 tables never risks the Cloud Run task timeout.
-                # The next scheduled (or stacked manual) run picks up the rest.
-                if llm_count >= MAX_TABLES_PER_RUN:
-                    log.info("Batch cap reached (%d tables this run); remaining tables "
-                             "will be picked up next run.", MAX_TABLES_PER_RUN)
-                    full_pass = False
-                    break
+            # Per-run batch cap: only process up to MAX_TABLES_PER_RUN new/changed
+            # tables, so a run over 450 tables never risks the Cloud Run task timeout.
+            # The next scheduled (or stacked manual) run picks up the rest.
+            if llm_count >= MAX_TABLES_PER_RUN:
+                log.info("Batch cap reached (%d tables this run); remaining tables "
+                         "will be picked up next run.", MAX_TABLES_PER_RUN)
+                full_pass = False
+                break
 
-                # 5. PII-safe sample
-                samples = pii_safe_samples(ch, db, tbl, columns)
-                mstats = measure_stats(ch, db, tbl, columns)
-                payload = {**meta, "columns": columns, "samples": samples,
-                           "measure_stats": mstats}
+            # 5. PII-safe sample
+            samples = pii_safe_samples(ch, db, tbl, columns)
+            mstats = measure_stats(ch, db, tbl, columns)
+            payload = {**meta, "columns": columns, "samples": samples,
+                       "measure_stats": mstats}
 
-                # 6. LLM pass + heuristic pre-fill for source_type
-                try:
-                    inferred, maker = llm.infer_overlay(payload)
-                except Exception as e:
-                    log.error("LLM failed for %s.%s, skipping: %s", db, tbl, e)
-                    continue
-                heur = source_type_heuristic(db, tbl)
-                if heur:
-                    inferred["source_type"] = heur
-                # Guard the LLM's event_date_column — must be a real column, and never a
-                # sync/CDC column (those are sync freshness, not data freshness).
-                edc = inferred.get("event_date_column")
-                colset = {c["name"] for c in columns}
-                if edc and (edc not in colset or edc.startswith("_peerdb") or edc in ("_sign",)):
-                    log.info("dropping bad event_date_column %r for %s.%s", edc, db, tbl)
-                    inferred["event_date_column"] = None
-                llm_count += 1
+            # 6. LLM pass + heuristic pre-fill for source_type. This cascades across up
+            # to 3 providers (maker + checker) with retries on a bad response — a single
+            # table can legitimately take 100+ seconds here with zero DB activity.
+            try:
+                inferred, maker = llm.infer_overlay(payload)
+            except Exception as e:
+                log.error("LLM failed for %s.%s, skipping: %s", db, tbl, e)
+                continue
+            heur = source_type_heuristic(db, tbl)
+            if heur:
+                inferred["source_type"] = heur
+            # Guard the LLM's event_date_column — must be a real column, and never a
+            # sync/CDC column (those are sync freshness, not data freshness).
+            edc = inferred.get("event_date_column")
+            colset = {c["name"] for c in columns}
+            if edc and (edc not in colset or edc.startswith("_peerdb") or edc in ("_sign",)):
+                log.info("dropping bad event_date_column %r for %s.%s", edc, db, tbl)
+                edc = None
+            if not edc:
+                heur_edc = event_date_column_heuristic(columns, bool(inferred.get("is_static")))
+                if heur_edc:
+                    log.info("heuristic event_date_column=%r for %s.%s (LLM said null)",
+                             heur_edc, db, tbl)
+                    edc = heur_edc
+            inferred["event_date_column"] = edc
+            llm_count += 1
 
-                # maker-checker — only material disagreements (source_type/dedup) flag review.
-                # When a deterministic name heuristic set source_type, it is authoritative —
-                # exclude source_type from the checker comparison (else the checker's free
-                # guess always "disagrees" with the heuristic and flags every table).
-                agree, checker, disagree_reason = llm.check(
-                    payload, inferred, maker, skip_source_type=bool(heur))
-                review = llm.needs_review(inferred, agree)
-                conf = float(inferred.get("authority_confidence") or 0)
-                # human-readable reason for the UI (why this row needs review)
-                if not review:
-                    review_reason = None
-                elif not agree:
-                    review_reason = f"maker/checker disagree — {disagree_reason}"
-                else:
-                    review_reason = f"low confidence ({conf:.2f} < {llm.CONFIRM_THRESHOLD})"
-                inferred["_review_reason"] = review_reason
-                log.info("%s.%s inferred by %s (checker=%s agree=%s review=%s conf=%.2f)",
-                         db, tbl, maker, checker, agree, review, conf)
+            # maker-checker — only material disagreements (source_type/dedup) flag review.
+            # When a deterministic name heuristic set source_type, it is authoritative —
+            # exclude source_type from the checker comparison (else the checker's free
+            # guess always "disagrees" with the heuristic and flags every table).
+            agree, checker, disagree_reason = llm.check(
+                payload, inferred, maker, skip_source_type=bool(heur))
+            review = llm.needs_review(inferred, agree)
+            conf = float(inferred.get("authority_confidence") or 0)
+            # human-readable reason for the UI (why this row needs review)
+            if not review:
+                review_reason = None
+            elif not agree:
+                review_reason = f"maker/checker disagree — {disagree_reason}"
+            else:
+                review_reason = f"low confidence ({conf:.2f} < {llm.CONFIRM_THRESHOLD})"
+            inferred["_review_reason"] = review_reason
+            log.info("%s.%s inferred by %s (checker=%s agree=%s review=%s conf=%.2f)",
+                     db, tbl, maker, checker, agree, review, conf)
 
-                overlay_row = build_overlay_row(meta, columns, inferred, review)
+            overlay_row = build_overlay_row(meta, columns, inferred, review)
+            # The LLM cascade above can leave the PG connection idle long enough that
+            # Postgres or a network intermediary drops it silently (seen in prod: same
+            # table, same spot, twice in one session) — reconnect and keep going rather
+            # than losing the whole run's remaining tables over one slow table's writes.
+            try:
                 upsert_overlay(cur, overlay_row)
                 upsert_target(cur, meta, inferred)
                 tracked_vars = populate_variable_values(cur, ch, meta, inferred, samples)
@@ -754,50 +826,68 @@ def main():
                 # duplicate-concept rules for this run use the prior authority state;
                 # they converge on the next run — acceptable for observe-stage rules.
                 generate_recon_rules(cur, overlay_row, inferred, tracked_vars)
-
                 # Commit each table immediately: catalog populates live (visible in the
                 # UI as it goes), and a timeout/crash never loses completed work — the
-                # incremental gate skips them on the next run. Advisory lock is
-                # session-scoped so it survives these commits.
+                # incremental gate skips them on the next run.
                 pg.commit()
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                log.warning("PG connection lost writing %s.%s (likely idle during the LLM "
+                            "calls above) — reconnecting and re-acquiring the lock: %s",
+                            db, tbl, e)
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+                pg = pg_connect()
+                cur = pg.cursor()
+                # Session-scoped lock released automatically when the old session died —
+                # safe to block for it again on the new one.
+                cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+                continue
 
-            # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
-            # unvisited tables are absent from seen_keys and would be wrongly retired.
-            if full_pass:
-                gone = set(existing) - seen_keys
-                for db, tbl in gone:
-                    cur.execute(
-                        "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
-                        "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
-                        (db, tbl),
-                    )
-                    cur.execute(
-                        "UPDATE sentinel.monitor_targets SET status = 'retired' "
-                        "WHERE database_name = %s AND table_name = %s",
-                        (db, tbl),
-                    )
-                if gone:
-                    log.info("Retired %d dropped tables", len(gone))
-            else:
-                log.info("Partial run (batch cap) — skipping dropped-table retirement.")
+        # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
+        # unvisited tables are absent from seen_keys and would be wrongly retired.
+        if full_pass:
+            gone = set(existing) - seen_keys
+            for db, tbl in gone:
+                cur.execute(
+                    "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
+                    "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
+                    (db, tbl),
+                )
+                cur.execute(
+                    "UPDATE sentinel.monitor_targets SET status = 'retired' "
+                    "WHERE database_name = %s AND table_name = %s",
+                    (db, tbl),
+                )
+            if gone:
+                log.info("Retired %d dropped tables", len(gone))
+        else:
+            log.info("Partial run (batch cap) — skipping dropped-table retirement.")
 
-            # 7. Global authority reconciliation (I1/I2) after all upserts
-            reconcile_authority(cur, seen_keys)
+        # 7. Global authority reconciliation (I1/I2) after all upserts
+        reconcile_authority(cur, seen_keys)
 
-            # 8. Cross-source agreement rules — MUST run after authority is set (§9.4)
-            generate_cross_source_rules(cur)
+        # 8. Cross-source agreement rules — MUST run after authority is set (§9.4)
+        generate_cross_source_rules(cur)
 
-            cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
-            pg.commit()
-            log.info("Discovery committed. LLM ran on %d tables, skipped %d unchanged.",
-                     llm_count, skip_count)
+        cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+        pg.commit()
+        log.info("Discovery committed. LLM ran on %d tables, skipped %d unchanged.",
+                 llm_count, skip_count)
 
     except Exception as e:
-        pg.rollback()
+        try:
+            pg.rollback()
+        except Exception:
+            pass
         log.error("Discovery failed: %s", e)
         raise
     finally:
-        pg.close()
+        try:
+            pg.close()
+        except Exception:
+            pass
         ch.close()
 
     if HEALTHCHECK_URL:
