@@ -616,6 +616,55 @@ def check_anthropic(pg_cur):
     )
 
 
+# ─── OpenAI key health ─────────────────────────────────────────────────────
+#
+# Same problem as Anthropic above: polling status.openai.com only answers "is
+# OpenAI itself down", not "does OUR key work". Confirmed in prod: Sentinel's own
+# key (ct-sentinel-openai-key) sat dead with a 401 for an extended stretch while
+# this would have shown green the whole time, since nothing ever tested OUR
+# credential. There are two separate OpenAI keys in this project and one dying
+# doesn't mean the other did — checked and shown separately, by name, so it's
+# clear which credential actually broke.
+_OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+
+
+def _check_openai_key(pg_cur, provider_name, api_key):
+    if not api_key:
+        return  # not configured
+    try:
+        r = requests.get(
+            _OPENAI_MODELS_URL,
+            headers={"Authorization": f"Bearer {api_key}", "User-Agent": "GlideControlTower/1.0"},
+            timeout=15,
+        )
+        if r.status_code == 401:
+            status, components = "major_outage", ["Key expired or invalid"]
+        else:
+            r.raise_for_status()
+            status, components = "operational", []
+        log.info("%s: status=%s", provider_name, status)
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "Unknown"
+        status, components = "major_outage", [f"API check failed (HTTP {status_code})"]
+        log.warning("%s health check failed: %s", provider_name, e)
+    except Exception as e:
+        status, components = "major_outage", [f"Check failed: {e}"[:200]]
+        log.warning("%s health check failed: %s", provider_name, e)
+
+    pg_cur.execute(
+        """INSERT INTO control_tower.provider_status
+           (provider, status_page_url, overall_status, affected_components, polled_at)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (provider_name, _OPENAI_MODELS_URL, status, json.dumps(components), NOW),
+    )
+
+
+def check_openai_keys(pg_cur):
+    _check_openai_key(pg_cur, "openai_key", os.environ.get("OPENAI_API_KEY", "").strip())
+    _check_openai_key(pg_cur, "openai_sentinel_key",
+                       os.environ.get("SENTINEL_OPENAI_API_KEY", "").strip())
+
+
 # ─── Auto-discovery ──────────────────────────────────────────────────────────
 
 # Historical default kept only as a last-resort fallback (see below) — discovery
@@ -1187,6 +1236,7 @@ def main():
             check_hiker(cur)
             check_gemini(cur)
             check_anthropic(cur)
+            check_openai_keys(cur)
             pg.commit()
 
             # 4. Auto-discover new services

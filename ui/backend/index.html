@@ -687,16 +687,48 @@ const PLACEHOLDER_PROVIDERS = ['BrightData', 'Capsolver', 'Gemini', 'Hiker'];
 // what was actually given, never guessed.
 const PROVIDER_ACCOUNT = { brightdata: 'ai@holistique.in', hiker: 'hikerapi.com', gemini: 'Google AI Studio' };
 
+// Two real OpenAI keys exist in this project (one shared, one Sentinel-only) and
+// one dying doesn't mean the other did — shown together in one OpenAI card
+// (public status on top, each key's own line below) rather than one combined
+// "openai" row that could hide which credential broke.
+const OPENAI_KEY_LABEL = { openai_key: 'General Key', openai_sentinel_key: 'Sentinel Key' };
+
 function ProvidersView() {
   const [rows] = useApi('/api/providers');
   if (!rows) return html`<div class="loading">Loading…</div>`;
   const borderColor = { operational:'var(--success-bd)', degraded:'var(--medium-bd)', partial_outage:'var(--high-bd)', major_outage:'var(--critical-bd)' };
+  const openaiStatus = rows.find(r => r.provider.toLowerCase() === 'openai');
+  const openaiKeys = rows.filter(r => r.provider.toLowerCase() in OPENAI_KEY_LABEL);
+  const otherRows = rows.filter(r => r.provider.toLowerCase() !== 'openai' && !(r.provider.toLowerCase() in OPENAI_KEY_LABEL));
   const known = new Set(rows.map(r => r.provider.toLowerCase()));
   const placeholders = PLACEHOLDER_PROVIDERS.filter(p => !known.has(p.toLowerCase()));
+  const openaiWorst = [openaiStatus, ...openaiKeys].reduce((worst, r) => {
+    const rank = { operational: 0, degraded: 1, partial_outage: 2, major_outage: 3 };
+    return r && (rank[r.overall_status] ?? 0) > (rank[worst] ?? -1) ? r.overall_status : worst;
+  }, 'operational');
   return html`
     <div class="section-title">Third-Party Provider Status</div>
     <div class="provider-grid">
-      ${rows.map(r => {
+      ${(openaiStatus || openaiKeys.length > 0) && html`<div class="provider-card"
+        style=${`border-color:${borderColor[openaiWorst]||'var(--border)'}`}>
+        <div class="provider-name">OpenAI</div>
+        ${openaiStatus && html`<${Fragment}>
+          <${StatusBadge} status=${openaiStatus.overall_status}/>
+          ${openaiStatus.affected_components?.length > 0 && html`<div class="provider-components">${openaiStatus.affected_components.slice(0,3).join(', ')}</div>`}
+          <div style="font-size:11px;color:var(--faint);margin-top:4px">${fmt.ago(openaiStatus.polled_at)}</div>
+        <//>`}
+        ${openaiKeys.length > 0 && html`<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--faint);margin-bottom:6px">API KEYS</div>
+          ${openaiKeys.map(r => html`<${Fragment} key=${r.provider}>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <span style="font-size:12px">${OPENAI_KEY_LABEL[r.provider.toLowerCase()]}</span>
+              <${StatusBadge} status=${r.overall_status}/>
+            </div>
+            ${r.affected_components?.length > 0 && html`<div class="provider-components" style="margin-top:-2px">${r.affected_components.join(', ')}</div>`}
+          <//>`)}
+        </div>`}
+      </div>`}
+      ${otherRows.map(r => {
         const comps = Array.isArray(r.affected_components) ? r.affected_components : [];
         const account = PROVIDER_ACCOUNT[r.provider.toLowerCase()];
         return html`<div key=${r.provider} class="provider-card"
