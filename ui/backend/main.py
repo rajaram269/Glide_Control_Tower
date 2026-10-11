@@ -64,19 +64,67 @@ def summary():
 
 @app.get("/api/services")
 def services():
-    """Cloud Run services only — request-driven, has traffic/latency metrics."""
+    """Cloud Run services only — request-driven, has traffic/latency metrics.
+    Traffic/error numbers are a real 24h rollup, not a single 1h snapshot — a service
+    that errored heavily 3 hours ago but looks clean right now should still show it."""
     with get_db() as cur:
         cur.execute("""
-            SELECT DISTINCT ON (service_name)
-                service_name, platform, region,
-                request_count, error_count, error_rate_pct,
-                instance_count, p50_latency_ms, p95_latency_ms,
-                collected_at
-            FROM control_tower.service_health
-            WHERE platform = 'cloud_run_service'
-              AND service_name IN (
-                  SELECT service_name FROM control_tower.registered_services WHERE active = true)
-            ORDER BY service_name, collected_at DESC
+            WITH latest AS (
+                -- instance_count/collected_at are point-in-time gauges (how many
+                -- instances RIGHT NOW) — summing those across a day is meaningless,
+                -- so this part still takes the latest snapshot.
+                SELECT DISTINCT ON (service_name)
+                    service_name, platform, region,
+                    instance_count, collected_at
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND service_name IN (
+                      SELECT service_name FROM control_tower.registered_services WHERE active = true)
+                ORDER BY service_name, collected_at DESC
+            ),
+            day AS (
+                -- request_count/error_count are per-hour deltas, so SUM gives a true
+                -- 24h total; error_rate_pct is recomputed from those sums (not
+                -- averaged — averaging per-hour percentages skews toward quiet hours).
+                -- p95 latency takes the worst hour in the day, not just whatever the
+                -- latest snapshot happened to catch.
+                SELECT service_name,
+                       SUM(COALESCE(request_count, 0))               AS request_count_24h,
+                       SUM(COALESCE(error_count, 0))                 AS error_count_24h,
+                       MAX(p95_latency_ms)                            AS p95_latency_ms_24h
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND collected_at >= now() - interval '24 hours'
+                GROUP BY service_name
+            ),
+            -- 24h rollup of the "deeper than 5xx rate" signals (migration 020) — the
+            -- latest single row can show 0 errors even though this service logged a
+            -- real internal error a few hours ago; this is what drives the red-name
+            -- highlight so you don't have to open every service to find out.
+            err24 AS (
+                SELECT service_name,
+                       SUM(COALESCE(error_log_count, 0)) AS error_log_count_24h,
+                       bool_or(bad_endpoints IS NOT NULL
+                               AND jsonb_array_length(bad_endpoints) > 0) AS had_bad_endpoint_24h
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND collected_at >= now() - interval '24 hours'
+                GROUP BY service_name
+            )
+            SELECT latest.service_name, latest.platform, latest.region,
+                   latest.instance_count, latest.collected_at,
+                   COALESCE(day.request_count_24h, 0) AS request_count,
+                   COALESCE(day.error_count_24h, 0) AS error_count,
+                   CASE WHEN COALESCE(day.request_count_24h, 0) > 0
+                        THEN round(100.0 * day.error_count_24h / day.request_count_24h, 2)
+                        ELSE 0 END AS error_rate_pct,
+                   day.p95_latency_ms_24h AS p95_latency_ms,
+                   COALESCE(err24.error_log_count_24h, 0) AS error_log_count_24h,
+                   COALESCE(err24.had_bad_endpoint_24h, false) AS had_bad_endpoint_24h
+            FROM latest
+            LEFT JOIN day   USING (service_name)
+            LEFT JOIN err24 USING (service_name)
+            ORDER BY service_name
         """)
         return cur.fetchall()
 
@@ -773,6 +821,24 @@ def sentinel_set_static(database_name: str, table_name: str, value: bool = True)
             WHERE database_name=%s AND table_name=%s
         """, (value, database_name, table_name))
         return {"ok": True, "is_static": value}
+
+
+@app.post("/api/sentinel/overlay/{database_name}/{table_name}/event_date_column")
+def sentinel_set_event_date_column(database_name: str, table_name: str, column: str):
+    """Human sets/corrects the business-date column. Human-pinned (same convention as
+    /static) so discovery's next reprocessing can't silently reset it back to null —
+    the AI re-guesses this from scratch every run with no memory of a prior fix."""
+    with get_db() as cur:
+        cur.execute("""
+            UPDATE sentinel.catalog_overlay
+            SET event_date_column=%s, updated_by='human', updated_at=now()
+            WHERE database_name=%s AND table_name=%s
+        """, (column, database_name, table_name))
+        cur.execute("""
+            UPDATE sentinel.monitor_targets SET event_date_column=%s
+            WHERE database_name=%s AND table_name=%s AND variable=''
+        """, (column, database_name, table_name))
+        return {"ok": True, "event_date_column": column}
 
 
 @app.get("/api/sentinel/coverage")

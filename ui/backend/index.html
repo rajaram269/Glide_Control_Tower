@@ -523,14 +523,23 @@ function ServicesView() {
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Service</th><${Th} label="Requests (1h)" k="request_count"/>
-        <${Th} label="Err%" k="error_rate_pct"/><${Th} label="Instances" k="instance_count"/>
-        <${Th} label="P95 Latency" k="p95_latency_ms"/><th>Checked</th>
+        <th>Service</th><${Th} label="Requests (24h)" k="request_count" title="Total requests over the last 24 hours"/>
+        <${Th} label="Err% (24h)" k="error_rate_pct" title="5xx error rate over the last 24 hours, not just right now"/>
+        <${Th} label="Instances" k="instance_count" title="Current instance count (right now, not a 24h figure)"/>
+        <${Th} label="P95 Latency (24h peak)" k="p95_latency_ms" title="Worst P95 latency seen in the last 24 hours"/><th>Checked</th>
       </tr></thead>
       <tbody>
-        ${shown.map(r => html`<${Fragment} key=${r.service_name}>
+        ${shown.map(r => {
+          // Caught in the last 24h even if the current 1h snapshot looks clean: a
+          // service logging real internal errors while still returning 200 (silent
+          // failure), or one specific endpoint failing badly inside otherwise-healthy
+          // traffic. Name turns red so this doesn't require opening every row to find.
+          const hadRecentError = r.error_log_count_24h > 0 || r.had_bad_endpoint_24h;
+          return html`<${Fragment} key=${r.service_name}>
           <tr class="clickable" onClick=${() => setOpen(open === r.service_name ? null : r.service_name)}>
-          <td class="mono">${open === r.service_name ? '▾' : '▸'} ${r.service_name}</td>
+          <td class="mono" style=${hadRecentError ? 'color:var(--critical-fg);font-weight:600' : ''}
+              title=${hadRecentError ? `${r.error_log_count_24h} internal error log(s) in the last 24h${r.had_bad_endpoint_24h ? ' · a specific endpoint is failing badly' : ''}` : ''}>
+            ${open === r.service_name ? '▾' : '▸'} ${r.service_name}${hadRecentError ? ' ⚠' : ''}</td>
           <td>${fmt.num(r.request_count)}</td>
           <td style=${r.error_rate_pct > 5 ? 'color:var(--critical-fg);font-weight:600' : ''}>${fmt.pct(r.error_rate_pct)}</td>
           <td style=${r.instance_count === 0 ? 'color:var(--faint)' : ''}>${fmt.num(r.instance_count)}${r.instance_count === 0 ? ' (idle)' : ''}</td>
@@ -538,7 +547,7 @@ function ServicesView() {
           <td style="color:var(--muted)">${fmt.ago(r.collected_at)}</td>
           </tr>
           ${open === r.service_name && html`<${EndpointBreakdownPanel} name=${r.service_name} colSpan=${6}/>`}
-        <//>`)}
+        <//>`;})}
       </tbody>
     </table></div>`;
 }
@@ -884,12 +893,16 @@ function FreshnessView() {
   const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
-  // Dead/stale rank first (the problem you'd want to act on), static tables last
+  // Dead/stale rank first (the problem you'd want to act on), static/n-a tables last
   // (nothing to do there) — same "problems first" convention as the Jobs page.
   const shown = applySort(rows.filter(r => rowMatches(r, q)), {
     sync: r => r.is_static ? 4
       : r.sync_status === 'dead' ? 0 : r.sync_status === 'stale' ? 1
       : r.sync_status === 'fresh' ? 3 : 2,
+    data: r => r.is_static ? 5
+      : !r.data_column ? 4   // n/a — no business date column on this table at all
+      : r.data_status === 'dead' ? 0 : r.data_status === 'stale' ? 1
+      : r.data_status === 'fresh' ? 3 : 2,
   });
   const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
   const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
@@ -907,7 +920,7 @@ function FreshnessView() {
     <div class="table-scroll"><table>
       <thead><tr>
         <th>Table</th><${Th} label="Sync" k="sync" title="Click to sort: dead/stale first → fresh last"/>
-        <th>Data</th><th>Expected update</th>
+        <${Th} label="Data" k="data" title="Click to sort: dead/stale first → fresh last"/><th>Expected update</th>
         <th>Newest data</th><th>Monitored variables</th>
       </tr></thead>
       <tbody>
@@ -922,12 +935,22 @@ function FreshnessView() {
             : !r.data_column && !r.data_status ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
             : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
             : html`<span class="badge unknown">—</span>`;
+          // Short reason right in the row — e.g. "Platform: 2 stale" — so you don't
+          // have to open the drawer just to see which dimension is the problem.
+          const vfDetail = Array.isArray(r.variable_freshness_detail) ? r.variable_freshness_detail : [];
+          const reasonShort = vfDetail.map(d => {
+            const dead = (d.dead_values||[]).length, stale = (d.stale_values||[]).length;
+            return `${d.variable}: ` + [dead && `${dead} dead`, stale && `${stale} stale`].filter(Boolean).join(', ');
+          }).join(' · ');
           return html`<tr key=${`${r.database_name}.${r.table_name}`} onClick=${()=>setSel(r)} style=${bad ? 'background:var(--critical-bg)' : ''}>
             <td class="mono clamp wide" title=${`${r.database_name}.${r.table_name}`}>
               <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}
               ${r.is_static ? html`<span class="badge info" style="margin-left:6px">static</span>` : ''}</td>
             <td><span class=${`badge ${syncD.cls}`} title=${`synced ${fmt.ago(r.sync_last_write||r.sentinel_last_write)}`}>${r.is_static ? 'static' : syncD.label}</span></td>
-            <td title=${r.data_column ? `business date: ${r.data_column}` : ''}>${dataBadge}</td>
+            <td title=${r.data_column ? `business date: ${r.data_column}` : ''}>
+              ${dataBadge}
+              ${reasonShort && html`<div style="font-size:11px;color:var(--high-fg);margin-top:2px">${reasonShort}</div>`}
+            </td>
             <td style="color:var(--fg-2);font-size:13px">${r.is_static ? '—' : cadenceLabel(r.expected_cadence_weeks)}</td>
             <td style="color:var(--muted)" title=${r.data_last || ''}>${r.data_column ? fmt.ago(r.data_last) : '—'}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length

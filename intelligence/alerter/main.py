@@ -23,6 +23,9 @@ ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 # this app to send as (hr@ and others return ErrorAccessDenied / RAOP)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "ai@holistique.in")
 WEEKLY_DIGEST = os.environ.get("WEEKLY_DIGEST", "false").lower() == "true"
+# Suppresses real email delivery — alerts still process/acknowledge normally. Set
+# during the Sentinel rebuild so 740 tables' worth of resettling alerts don't email.
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # Email transport: "graph" (MS Graph, default) or "ses" (AWS SES).
 EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "graph").lower()
@@ -94,8 +97,16 @@ def _send_via_ses(subject, html_body, to):
 
 
 def send_email(token, subject, html_body, to_email=None):
-    """Dispatch by EMAIL_TRANSPORT. `token` is the MS Graph token (None for SES)."""
+    """Dispatch by EMAIL_TRANSPORT. `token` is the MS Graph token (None for SES).
+    DRY_RUN (env) skips actual delivery — alerts still get written/acknowledged
+    normally so the UI reflects everything, just nothing hits an inbox. For the
+    Sentinel rebuild: re-running discovery+checks across the whole catalog will
+    surface a burst of alerts while things resettle; those shouldn't go out as
+    real email until the rebuild is confirmed good."""
     to = to_email or ALERT_EMAIL
+    if DRY_RUN:
+        log.info("DRY RUN (no email sent): %s -> %s", subject, to)
+        return
     if EMAIL_TRANSPORT == "ses":
         _send_via_ses(subject, html_body, to)
     else:
@@ -337,7 +348,13 @@ def main():
 
                 try:
                     send_email(token, subject, html)
-                    acknowledged_ids.append(alert["alert_id"])
+                    # In DRY_RUN, don't acknowledge — the point is to see what WOULD
+                    # have fired. Auto-acking here defeated that: everything vanished
+                    # from the Alerts page's default "unacked" view within ~15 minutes
+                    # regardless of whether a real email went out (seen in prod: 39
+                    # Sentinel alerts fired, all already acked, page looked empty).
+                    if not DRY_RUN:
+                        acknowledged_ids.append(alert["alert_id"])
                     log.info("Sent: %s", subject)
                 except Exception as e:
                     log.error("Failed to send alert %s: %s", alert["alert_id"], e)
