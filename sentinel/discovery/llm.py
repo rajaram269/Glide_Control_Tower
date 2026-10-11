@@ -288,7 +288,12 @@ def _prompt(payload, system=None, output_spec=None):
 
 def _call_openai(prompt):
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    # .strip() matters here: a secret stored with a trailing newline (an easy accident
+    # via --data-file on a heredoc-written file) makes the Bearer header contain a
+    # literal \n, which httpx's h11 layer rejects outright as an illegal header value
+    # before any request even reaches OpenAI - surfaces as a generic "Connection
+    # error" with no indication it was ever about the key's formatting.
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
     resp = client.chat.completions.create(
         model=os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-4o-mini"),
         messages=[{"role": "user", "content": prompt}],
@@ -301,7 +306,7 @@ def _call_openai(prompt):
 
 def _call_gemini(prompt):
     from google import genai
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
     resp = client.models.generate_content(
         model=os.environ.get("SENTINEL_GEMINI_MODEL", "gemini-2.5-flash"),
         contents=prompt + "\n\nRespond with a single JSON object only, no markdown.",
@@ -312,7 +317,7 @@ def _call_gemini(prompt):
 
 def _call_anthropic(prompt):
     import anthropic
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
     msg = client.messages.create(
         model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
         max_tokens=8192,   # 1024, then 2048, then 4096 ALL still truncated on wider
@@ -374,6 +379,20 @@ def _validate(obj):
     return obj
 
 
+def _exc_detail(e):
+    """str(e) on an SDK connection error is often just "Connection error" with the
+    real cause (DNS failure, TLS error, timeout, refused connection) thrown away in
+    __cause__ — walk the chain so the actual problem shows up in logs instead of a
+    generic, undiagnosable message."""
+    parts = [f"{type(e).__name__}: {e}"]
+    cause, seen = e.__cause__, set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+    return " | ".join(parts)
+
+
 def _run(provider, prompt):
     """One provider call + validation, retrying invalid JSON once."""
     caller = _CALLERS[provider]
@@ -394,7 +413,7 @@ def infer_overlay(payload):
             return _run(provider, _prompt(payload)), provider
         except Exception as e:
             last_err = e
-            log.warning("maker %s failed, falling through: %s", provider, e)
+            log.warning("maker %s failed, falling through: %s", provider, _exc_detail(e))
     raise RuntimeError(f"all LLM providers failed: {last_err}")
 
 
@@ -421,7 +440,7 @@ def check(payload, maker_result, maker_provider, skip_source_type=False):
         try:
             other = _run(provider, _prompt(payload))
         except Exception as e:
-            log.warning("checker %s failed: %s", provider, e)
+            log.warning("checker %s failed: %s", provider, _exc_detail(e))
             continue
         reasons = []
         if not skip_source_type and not _same_source(other["source_type"], maker_result["source_type"]):

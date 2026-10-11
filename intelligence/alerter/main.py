@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 # ai@holistique.in is the only mailbox the tenant's AppOnly AccessPolicy allows
 # this app to send as (hr@ and others return ErrorAccessDenied / RAOP)
