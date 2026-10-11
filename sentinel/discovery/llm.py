@@ -192,9 +192,23 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       leaves useful tables with zero monitored variables (a real problem on ERP/ledger
       tables). Aim to surface the 3 most monitoring-worthy segments even on wide tables.
       Do NOT label as segment: unique identifiers (id, entryNo, sku, order_name,
-      customer_id, document_no), free-text or high-cardinality strings (names, titles,
-      city, postal_code, narration), monetary/numeric measures, timestamps, or
+      document_no), free-text or high-cardinality strings (names, titles, city,
+      postal_code, narration), monetary/numeric measures, timestamps, or
       CDC/technical columns (_peerdb*, _sign, _version).
+      The test that matters is MEANING, not the column's naming pattern: does this
+      column tell you WHICH BUSINESS CATEGORY a row belongs to (platform, channel,
+      region, brand — a handful of recurring values many different rows/customers
+      share), or does it tell you WHICH SPECIFIC CUSTOMER/VENDOR/ENTITY the row
+      belongs to? Any column identifying a specific customer or vendor — by whatever
+      name it uses (customer_id, CustomerCode, Customer_Code, client_no, vendor_id,
+      VendorCode, account_no — "id"/"code"/"no" are equally identifiers here) — is
+      NEVER a segment, even if it happens to have few distinct values in a sample
+      window (a business with only 40 active customers this year still has
+      customer identity as an IDENTITY column, not a business category). If a
+      "code" column's values are generic business categories (currency_code,
+      payment_method_code), it IS a segment; if its values are specific named
+      parties (a customer, a vendor, a company), it is NEVER a segment regardless
+      of the word "code" in its name.
       Those get role measure / key / timestamp / other.
       ORDER variables by monitoring priority — most important business segments FIRST
       (brand/channel/region/currency before minor enums). Only the top few are monitored.
@@ -218,9 +232,24 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       to detect stale business data (e.g. a sales table whose newest SalesDate is May
       even though it synced today). It is DIFFERENT from sync/load columns
       (_peerdb_synced_at, created_at/updated_at that record when the row was loaded, not
-      when the business event happened). Pick the single most representative event date.
-      Use null if the table has no such business/event date (dimension/reference/master/
-      snapshot tables). Must be an actual column name present in the schema.
+      when the business event happened).
+      Some tables (a sales/purchase HEADER especially) have MANY date columns for
+      different stages of the same transaction (order date, posting date, shipment
+      date, due date, requested/promised delivery date, expiry date). Pick ONE, in
+      this priority when several are present:
+        1. The date the document was POSTED/COMPLETED (posting_date, invoice_date) —
+           this is when the transaction became final/actual, the strongest signal of
+           "is new business activity actually happening."
+        2. Else the date the document was CREATED/PLACED (order_date, document_date).
+        3. Else the SHIPMENT/fulfillment date, if that's the table's whole subject
+           (a shipment/delivery table).
+      Never pick a column that is a FUTURE PLAN rather than a recorded fact — due_date,
+      requested_delivery_date, promised_delivery_date, expiry_date describe something
+      expected to happen, not something that already happened, so they make a poor
+      freshness signal (a row can sit there with an old creation date but a due_date
+      far in the future, making the table look artificially "fresh"). Use null if the
+      table has no such business/event date (dimension/reference/master/snapshot
+      tables). Must be an actual column name present in the schema.
 Do not add, rename, or omit keys. Do not wrap in markdown."""
 
 

@@ -36,7 +36,14 @@ ADVISORY_LOCK_KEY = 0x53454E54  # "SENT"
 MAX_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_TABLES_PER_RUN", "80"))
 
 # PII-safe sampling caps (§10.3)
-MAX_DISTINCT = 150    # was 50 — too small for real wide dimensions like Platform
+MAX_DISTINCT = 65    # was 50, briefly 150, briefly 55 — 150 counted a table's entire
+                     # history (dead platforms/customers included), which is why it had
+                     # to go that high. Cardinality is now scoped to the last 1 year
+                     # (see _segment_cardinality), but 55 was still too tight: confirmed
+                     # in prod that Holistique_Base's Platform genuinely has 58 active
+                     # values within the last year — real data, not noise — so 55
+                     # wrongly excluded it. 65 gives real dimensions like this headroom
+                     # while still rejecting true identifiers (seen: 1,830 / 17,908).
 MAX_STR_LEN = 64
 # Never sample raw row values from these databases — schema + stats only (R5)
 PII_DATABASES = {"recruitment_hr"}
@@ -156,11 +163,24 @@ def _is_sampleable(col):
     return False
 
 
-def pii_safe_samples(ch, db, table, columns):
+def pii_safe_samples(ch, db, table, columns, event_date_column=None):
     """Return {column: [distinct values]} for low-cardinality columns only.
-    Never touches PII databases (schema+stats only there)."""
+    Never touches PII databases (schema+stats only there).
+
+    Scoped to the last 1 year when a business date is already known from a prior
+    run — without this, a borderline column (seen in prod: Platform, 74 distinct
+    all-time vs. 58 within the last year) can exceed MAX_DISTINCT on full history
+    and get silently dropped from here entirely. That left the AI deciding whether
+    it's a "segment" from the column NAME ALONE, with zero real values to look at —
+    the actual reason its answer kept flip-flopping between runs. A brand-new table
+    with no known event date yet falls back to full-history sampling, same as before."""
     if db in PII_DATABASES:
         return {}
+    date_clause = ""
+    if event_date_column:
+        date_clause = (
+            f" AND parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+            f">= today() - INTERVAL 1 YEAR")
     samples = {}
     for col in columns:
         if not _is_sampleable(col):
@@ -172,7 +192,7 @@ def pii_safe_samples(ch, db, table, columns):
             # column false-flags as "all values missing" (caught in real E2E).
             res = ch.query(
                 f"SELECT DISTINCT toString(`{col['name']}`) AS v FROM `{db}`.`{table}` "
-                f"WHERE length(toString(`{col['name']}`)) <= {MAX_STR_LEN} "
+                f"WHERE length(toString(`{col['name']}`)) <= {MAX_STR_LEN}{date_clause} "
                 f"LIMIT {MAX_DISTINCT + 1}"
             )
             vals = [r[0] for r in res.result_rows]
@@ -245,12 +265,13 @@ def measure_stats(ch, db, table, columns):
 def load_existing_overlay(pg_cur):
     pg_cur.execute(
         "SELECT database_name, table_name, structure_hash, updated_by, authoritative, "
-        "       concept, scope, source_type "
+        "       concept, scope, source_type, event_date_column "
         "FROM sentinel.catalog_overlay"
     )
     return {
         (r[0], r[1]): {"structure_hash": r[2], "updated_by": r[3], "authoritative": r[4],
-                       "concept": r[5], "scope": r[6], "source_type": r[7]}
+                       "concept": r[5], "scope": r[6], "source_type": r[7],
+                       "event_date_column": r[8]}
         for r in pg_cur.fetchall()
     }
 
@@ -436,6 +457,18 @@ def upsert_target(pg_cur, meta, inferred):
     expected = inferred.get("expected_cadence_weeks")           # how stale = bad (freshness)
     static = bool(inferred.get("is_static"))
     event_col = inferred.get("event_date_column")               # business date → data freshness
+    # A human-pinned event_date_column must survive reprocessing — the AI re-guesses
+    # from scratch every time a table's structure changes, with no memory of a prior
+    # correction, and can silently flip a working pick back to null (seen in prod:
+    # Holistique_Base's SalesDate got wiped on a later re-run after being fixed once).
+    pg_cur.execute(
+        "SELECT event_date_column FROM sentinel.catalog_overlay "
+        "WHERE database_name = %s AND table_name = %s AND updated_by = 'human'",
+        (meta["database_name"], meta["table_name"]),
+    )
+    pinned = pg_cur.fetchone()
+    if pinned and pinned[0]:
+        event_col = pinned[0]
     # system.parts is validated at check time; default cheap_source = system_parts,
     # check engine falls back to light_scan if unreliable (Lapse 4).
     pg_cur.execute(
@@ -510,13 +543,20 @@ def _live_only_clause(ch, db, table):
     return result
 
 
-def _segment_cardinality(ch, db, tbl, col):
-    """Cheap distinct-count probe. Returns int or None on error. Excludes
-    deleted rows — a column shouldn't look higher/lower cardinality than it
-    really is because of tombstone rows still sitting in the table."""
+def _segment_cardinality(ch, db, tbl, col, event_date_column=None):
+    """Cheap distinct-count probe, scoped to the last 1 year of business data when a
+    business date column is known. Without this, a platform/customer nobody has done
+    business with in years still counts toward cardinality forever — that's what let
+    MAX_DISTINCT get bloated upward in the first place. Falls back to full table
+    history when there's no business date to scope by. Excludes deleted rows too."""
     try:
         live = _live_only_clause(ch, db, tbl)
-        where = f" WHERE {live}" if live else ""
+        clauses = [live] if live else []
+        if event_date_column:
+            clauses.append(
+                f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+                f">= today() - INTERVAL 1 YEAR")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         r = ch.query(f"SELECT uniqExact(`{col}`) FROM `{db}`.`{tbl}`{where}")
         return int(r.result_rows[0][0] or 0)
     except Exception as e:
@@ -524,13 +564,19 @@ def _segment_cardinality(ch, db, tbl, col):
         return None
 
 
-def _segment_values(ch, db, tbl, col):
+def _segment_values(ch, db, tbl, col, event_date_column=None):
     """Fetch the current distinct value set (as toString, matching the coverage
-    check). Bounded by MAX_DISTINCT. Reuses cached samples when present.
-    Excludes deleted rows — a value that only exists in deleted rows shouldn't
-    be tracked as a currently-active value."""
+    check), scoped to the last 1 year the same way as _segment_cardinality — a value
+    not seen in over a year ages out of 'active' tracking on its own via the existing
+    retire-on-disappearance logic below, no separate cleanup needed. Bounded by
+    MAX_DISTINCT. Excludes deleted rows."""
     live = _live_only_clause(ch, db, tbl)
-    extra = f" AND {live}" if live else ""
+    clauses = [live] if live else []
+    if event_date_column:
+        clauses.append(
+            f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+            f">= today() - INTERVAL 1 YEAR")
+    extra = f" AND {' AND '.join(clauses)}" if clauses else ""
     r = ch.query(
         f"SELECT DISTINCT toString(`{col}`) FROM `{db}`.`{tbl}` "
         f"WHERE length(toString(`{col}`)) <= {MAX_STR_LEN}{extra} LIMIT {MAX_DISTINCT}"
@@ -538,8 +584,9 @@ def _segment_values(ch, db, tbl, col):
     return {row[0] for row in r.result_rows}
 
 
-def populate_variable_values(pg_cur, ch, meta, inferred, samples):
+def populate_variable_values(pg_cur, ch, meta, inferred):
     db, tbl = meta["database_name"], meta["table_name"]
+    edc = inferred.get("event_date_column")
     tracked = []
     for var in (inferred.get("variables") or []):     # already priority-ordered by LLM
         if len(tracked) >= MAX_TRACKED_VARIABLES:
@@ -549,13 +596,16 @@ def populate_variable_values(pg_cur, ch, meta, inferred, samples):
         if not col or not _is_business_segment_col(col, role):
             continue
         # cardinality probe: keep genuine segments only (excludes bool flags + runaway)
-        card = _segment_cardinality(ch, db, tbl, col)
+        card = _segment_cardinality(ch, db, tbl, col, edc)
         if card is None or card < MIN_SEGMENT_CARD or card > MAX_DISTINCT:
             log.info("skip variable %s.%s.%s (cardinality=%s not in [%d,%d])",
                      db, tbl, col, card, MIN_SEGMENT_CARD, MAX_DISTINCT)
             continue
         try:
-            seen_now = set(samples[col]) if col in samples else _segment_values(ch, db, tbl, col)
+            # Always query fresh (not the cached pii_safe_samples) — that cache isn't
+            # scoped to the last year or to live rows, so reusing it here would quietly
+            # defeat both filters for whichever columns happened to be cached.
+            seen_now = _segment_values(ch, db, tbl, col, edc)
         except Exception as e:
             log.warning("value fetch failed %s.%s.%s: %s", db, tbl, col, e)
             continue
@@ -594,6 +644,23 @@ def populate_variable_values(pg_cur, ch, meta, inferred, samples):
              inferred.get("expected_cadence_weeks")),
         )
     log.info("%s.%s tracked %d variables: %s", db, tbl, len(tracked), tracked)
+
+    # A variable the AI no longer recommends (e.g. it correctly stops treating
+    # CustomerCode as a segment on a later run) must stop being tracked too — without
+    # this, its monitor_targets row and value list just sit there active forever,
+    # since nothing above touches a column that isn't in THIS run's `tracked` list.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets SET status = 'retired'
+           WHERE database_name = %s AND table_name = %s AND variable <> ''
+             AND status = 'active' AND variable <> ALL(%s)""",
+        (db, tbl, tracked),
+    )
+    pg_cur.execute(
+        """UPDATE sentinel.variable_values SET lifecycle = 'retired', retired_at = now()
+           WHERE database_name = %s AND table_name = %s AND lifecycle = 'active'
+             AND variable <> ALL(%s)""",
+        (db, tbl, tracked),
+    )
     return tracked
 
 
@@ -761,8 +828,11 @@ def main():
                 full_pass = False
                 break
 
-            # 5. PII-safe sample
-            samples = pii_safe_samples(ch, db, tbl, columns)
+            # 5. PII-safe sample — scoped to the last year using whatever business date
+            # a prior run already found for this table, if any (brand-new tables fall
+            # back to full-history sampling inside pii_safe_samples).
+            prior_edc = (prior or {}).get("event_date_column")
+            samples = pii_safe_samples(ch, db, tbl, columns, prior_edc)
             mstats = measure_stats(ch, db, tbl, columns)
             payload = {**meta, "columns": columns, "samples": samples,
                        "measure_stats": mstats}
@@ -821,7 +891,7 @@ def main():
             try:
                 upsert_overlay(cur, overlay_row)
                 upsert_target(cur, meta, inferred)
-                tracked_vars = populate_variable_values(cur, ch, meta, inferred, samples)
+                tracked_vars = populate_variable_values(cur, ch, meta, inferred)
                 # authority (use_instead) is set later in reconcile_authority, so
                 # duplicate-concept rules for this run use the prior authority state;
                 # they converge on the next run — acceptable for observe-stage rules.
