@@ -934,7 +934,8 @@ def sentinel_freshness():
                 GROUP BY database_name, table_name
             ),
             stat AS (   -- static (intentionally-frozen) tables
-                SELECT DISTINCT database_name, table_name, is_static
+                SELECT DISTINCT database_name, table_name, is_static,
+                       event_date_column AS picked_event_column
                 FROM sentinel.monitor_targets WHERE variable = ''
             ),
             varfresh_latest AS (   -- latest variable_freshness result per tracked variable
@@ -942,6 +943,12 @@ def sentinel_freshness():
                     database_name, table_name, variable, status, observed
                 FROM sentinel.check_results
                 WHERE check_type = 'variable_freshness'
+                  -- only variables still being tracked: a retired variable's old result
+                  -- must not keep marking the table dead
+                  AND (database_name, table_name, variable) IN (
+                      SELECT database_name, table_name, variable
+                      FROM sentinel.monitor_targets
+                      WHERE variable <> '' AND status = 'active')
                 ORDER BY database_name, table_name, variable, run_ts DESC
             ),
             varfresh AS (   -- rolled up to table level: a stale PLATFORM makes the
@@ -984,6 +991,7 @@ def sentinel_freshness():
                    vf.stale_detail AS variable_freshness_detail,
                    leg.legacy_status, leg.legacy_last_write, leg.legacy_checked_at,
                    vars.tracked_variables, COALESCE(stat.is_static, false) AS is_static,
+                   stat.picked_event_column,
                    (sen.sentinel_status IS NOT NULL AND leg.legacy_status IS NOT NULL
                     AND sen.sentinel_status <> leg.legacy_status) AS mismatch
             FROM sen

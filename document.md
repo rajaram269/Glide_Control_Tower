@@ -123,6 +123,36 @@ the background jobs run there, and they all connect to one Postgres database
 (`agenteye-pg`). ClickHouse (the business data) is a separate, already-existing system
 that Control Tower only reads from.
 
+## 7a. How Sentinel decides things (current rules)
+
+- **Each table is classified once.** Discovery (weekly, Monday 06:45 IST) looks at the
+  full column list plus real data profiles (min/max/future dates per date column,
+  common values per text column) and records the table's **event date column** (the
+  business date, e.g. `SalesDate`) and up to 3 **monitored variables** (e.g. Platform).
+  A table is only re-classified if its columns change, a human pin exists (pins always
+  win), or `CLASSIFIER_VERSION` in `sentinel/discovery/main.py` is bumped.
+- **Event date is verified against the data**, not just the AI's word: a column with no
+  real recent values (e.g. all `1970-01-01`) is rejected. Variables are ordered
+  Platform, Brand, Channel, Region...; Type/Status/Flag-style columns are only used
+  when nothing better exists; identifier-style names (`*_id`, `*_no`) never are.
+- **Fresh / Stale / Dead** use the table's expected update interval. Data freshness
+  (business date, per table and per platform) never judges on less than 3 days
+  (`DATA_MIN_DAYS` in `sentinel/check_engine/main.py`): Fresh up to the window, Stale up
+  to 3x it, Dead beyond. Sync (pipeline) freshness stays strict. A table's Data badge is
+  the worst of its own newest date and its per-platform check.
+- **Per-platform rhythm:** each platform value gets its own expected cadence
+  (`variable_values.expected_cadence_weeks`, migration 022) so slow reporters are not
+  judged on the daily yardstick.
+- **Checks run 3x a day** (07:30 / 13:30 / 19:30 IST) but only on targets that are due.
+- **All displayed times are IST** (dashboard, alert emails, Cloud Scheduler). Internal
+  logic and Cloud Logging stay on UTC.
+- **AI models:** discovery/resolver cascade is OpenAI `gpt-4o-mini` -> Gemini
+  `gemini-2.5-flash` -> Anthropic `claude-haiku-5-5` (cheapest, last fallback). The
+  alerter's triage also uses `claude-haiku-5-5`. No Sonnet is used anywhere. Providers-tab
+  and cost-collector Anthropic calls use no tokens (free).
+- "Not checked yet" on the Freshness tab mostly means the table is in the old watch list
+  but no longer exists in ClickHouse (a leftover), or discovery has not reached it yet.
+
 ## 8. Things to know before you touch anything
 
 - **The dashboard has no login.** Anyone with the link can open it. This was a

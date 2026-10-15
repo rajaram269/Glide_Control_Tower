@@ -116,7 +116,14 @@ def _maxcol_freshness(ch, db, table, col):
     return r[0][0] if r and r[0][0] else None
 
 
-def _classify(last, tolerance_weeks):
+# Business dates (SalesDate etc.) are date-only and many channels report with a lag
+# (on the 12th you may only have data up to the 9th). So Data freshness never judges
+# on less than this many days, whatever the table's expected interval (a "daily" table
+# is Fresh up to 3 days, Stale up to 9, Dead after). Sync (pipeline) stays strict.
+DATA_MIN_DAYS = 3
+
+
+def _classify(last, tolerance_weeks, min_days=0):
     """(sub_status, status, age_hours) for a timestamp vs a tolerance. last=None → dead."""
     if last is None:
         return "dead", "fail", None
@@ -124,7 +131,8 @@ def _classify(last, tolerance_weeks):
         last = last.replace(tzinfo=datetime.timezone.utc)
     age = NOW - last
     age_hours = round(age.total_seconds() / 3600, 1)
-    limit = datetime.timedelta(weeks=float(tolerance_weeks))
+    limit = max(datetime.timedelta(weeks=float(tolerance_weeks)),
+                datetime.timedelta(days=min_days))
     if age <= limit:
         return "fresh", "ok", age_hours
     if age <= limit * 3:
@@ -185,7 +193,7 @@ def check_freshness(ch, target):
     if edc:
         try:
             data_last = _maxcol_freshness(ch, db, table, edc)
-            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks)
+            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks, DATA_MIN_DAYS)
             observed["data"] = {"column": edc, "sub_status": data_sub,
                                 "max_event_date": data_last.isoformat() if data_last else None,
                                 "age_hours": data_age}
@@ -326,14 +334,19 @@ def check_variable_freshness(ch, pg_cur, target):
     edc = target.get("event_date_column")
     if not edc:
         return "ok", {"note": "no business date column — nothing to check per value"}
-    tolerance_weeks = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
+    default_tolerance = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
 
     pg_cur.execute(
-        """SELECT value FROM sentinel.variable_values
+        """SELECT value, expected_cadence_weeks FROM sentinel.variable_values
            WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
         (db, table, variable),
     )
-    expected = {r[0] for r in pg_cur.fetchall()}
+    # Each value's own inferred cadence (discovery) when there's enough history for one,
+    # else the variable/table default — a value that genuinely reports slower than the
+    # table's norm (an offline channel vs. a live marketplace) gets judged against its
+    # own real pattern instead of being flagged dead on everyone else's yardstick.
+    value_tolerance = {r[0]: (r[1] if r[1] else default_tolerance) for r in pg_cur.fetchall()}
+    expected = set(value_tolerance)
     if not expected:
         return "ok", {"note": "no active values tracked yet"}
 
@@ -351,7 +364,7 @@ def check_variable_freshness(ch, pg_cur, target):
 
     stale, dead = [], []
     for v in sorted(expected):
-        _, vstatus, _age = _classify(last_seen.get(v), tolerance_weeks)
+        _, vstatus, _age = _classify(last_seen.get(v), value_tolerance[v], DATA_MIN_DAYS)
         if vstatus == "fail":
             dead.append(v)
         elif vstatus == "warn":

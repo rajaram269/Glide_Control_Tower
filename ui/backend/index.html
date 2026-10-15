@@ -253,6 +253,8 @@ const fmt = {
     return `${Math.floor(d/86400)}d ago`;
   },
   pct: (n) => n == null ? '—' : `${Number(n).toFixed(1)}%`,
+  // Absolute timestamps are always shown in IST, whatever the viewer's browser zone.
+  ist: (ts) => ts ? new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) + ' IST' : '—',
 };
 
 // Freshness color for "time since X" columns — same idea as data_freshness status,
@@ -394,7 +396,7 @@ function LogsPanel({ kind, name, region, colSpan }) {
         <select value=${execution} onChange=${e => setExecution(e.target.value)}>
           <option value="">Latest run</option>
           ${executions.map((ex, i) => html`<option value=${ex.execution}>
-            Execution ${executions.length - i} — ${ex.status}${ex.started_at ? ' · ' + new Date(ex.started_at).toLocaleString() : ''}
+            Execution ${executions.length - i} — ${ex.status}${ex.started_at ? ' · ' + fmt.ist(ex.started_at) : ''}
           </option>`)}
         </select>`}
       <label style="cursor:pointer"><input type="checkbox" checked=${errorsOnly}
@@ -407,7 +409,7 @@ function LogsPanel({ kind, name, region, colSpan }) {
       : html`<div class="logs-box">${data.lines.map((l, i) => html`
           <div class=${`log-line sev-${l.severity}`} style=${l.raw ? 'cursor:pointer' : ''}
                onClick=${() => l.raw && toggleLine(i)} title=${l.raw ? 'Click for full log entry' : ''}>
-            <span class="ts">${new Date(l.timestamp).toLocaleString()}</span>
+            <span class="ts">${fmt.ist(l.timestamp)}</span>
             <span>${l.severity}</span>
             <span>${l.raw ? (expanded.has(i) ? '▾ ' : '▸ ') : ''}${l.message}</span>
           </div>
@@ -441,7 +443,7 @@ function EndpointLogs({ name, path, colSpan }) {
       : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No requests for this endpoint.</div>`
       : html`<div class="logs-box">${data.lines.map(l => html`
           <div class=${`log-line ${l.timeout ? 'timeout' : 'sev-' + l.severity}`}>
-            <span class="ts">${new Date(l.timestamp).toLocaleString()}</span>
+            <span class="ts">${fmt.ist(l.timestamp)}</span>
             <span>${l.timeout ? 'TIMEOUT' : l.severity}</span>
             <span>${l.message}${l.detail ? html`<br/><b>↳ ${l.detail}</b>` : ''}</span>
           </div>`)}</div>`}
@@ -953,6 +955,7 @@ function FreshnessView() {
       <thead><tr>
         <th>Table</th><${Th} label="Sync" k="sync" title="Click to sort: dead/stale first → fresh last"/>
         <${Th} label="Data" k="data" title="Click to sort: dead/stale first → fresh last"/><th>Expected update</th>
+        <th title="The business/event date column Sentinel uses to judge Data freshness">Event date column</th>
         <th>Newest data</th><th>Monitored variables</th>
       </tr></thead>
       <tbody>
@@ -984,6 +987,10 @@ function FreshnessView() {
               ${reasonShort && html`<div style="font-size:11px;color:var(--high-fg);margin-top:2px">${reasonShort}</div>`}
             </td>
             <td style="color:var(--fg-2);font-size:13px">${r.is_static ? '—' : cadenceLabel(r.expected_cadence_weeks)}</td>
+            <td class="mono" style="font-size:12px">${r.is_static ? '—'
+              : (r.data_column || r.picked_event_column)
+                ? html`<span class="badge accent">${r.data_column || r.picked_event_column}</span>`
+                : html`<span style="color:var(--high-fg)" title="No business date column identified — only sync is tracked">none</span>`}</td>
             <td style="color:var(--muted)" title=${r.data_last || ''}>${r.data_column ? fmt.ago(r.data_last) : '—'}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length
               ? tv.map(v => html`<span class="badge accent" style="margin-right:4px">${v}</span>`)
@@ -1008,6 +1015,8 @@ function FreshnessView() {
           <div class="kv"><div class="kv-label">Is the data current? (Data)</div>
             <div class=${`callout ${sel.data_status==='fresh'?'good':(['stale','dead'].includes(sel.data_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.data_status)?'background:var(--raised);border:1px solid var(--border)':''}>
               <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
+          <div class="kv"><div class="kv-label">Event date column (used for Data freshness)</div>
+            <div class="mono">${sel.is_static ? '—' : (sel.data_column || sel.picked_event_column || 'none identified')}</div></div>
           ${(['stale','dead'].includes(sel.data_status) && !['stale','dead'].includes(sel.sync_status)) && html`
             <div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`}
           ${Array.isArray(sel.variable_freshness_detail) && sel.variable_freshness_detail.length > 0 && html`

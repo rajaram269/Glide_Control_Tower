@@ -45,6 +45,8 @@ MAX_DISTINCT = 65    # was 50, briefly 150, briefly 55 — 150 counted a table's
                      # wrongly excluded it. 65 gives real dimensions like this headroom
                      # while still rejecting true identifiers (seen: 1,830 / 17,908).
 MAX_STR_LEN = 64
+# Bump when the classification logic improves: every table is re-classified once.
+CLASSIFIER_VERSION = "3"    # + per-value cadence inference (infer_value_cadences)
 # Never sample raw row values from these databases — schema + stats only (R5)
 PII_DATABASES = {"recruitment_hr"}
 
@@ -76,10 +78,12 @@ def source_type_heuristic(db, table):
 # static (a lookup table can have an effective_date column and correctly have no
 # business event date). Unambiguous name matches only — two+ "*Date" columns means
 # we don't know which one is "the" business date, so it stays null rather than guess.
-_EVENT_DATE_NAMES = {
-    "salesdate", "orderdate", "invoicedate", "transactiondate", "postingdate",
-    "documentdate", "eventdate", "billdate", "shipdate", "deliverydate",
-}
+# Priority order (first listed present column wins): the date a sale/transaction
+# actually happened, before order/document stage dates, before fulfilment dates.
+_EVENT_DATE_NAMES = (
+    "salesdate", "postingdate", "invoicedate", "transactiondate", "orderdate",
+    "documentdate", "billdate", "eventdate", "shipdate", "deliverydate",
+)
 _NON_EVENT_DATE_PREFIXES = ("_peerdb", "created", "updated", "modified", "synced", "inserted")
 
 
@@ -87,9 +91,10 @@ def event_date_column_heuristic(columns, is_static):
     if is_static:
         return None
     names = [c["name"] for c in columns]
-    for n in names:
-        if n.lower() in _EVENT_DATE_NAMES:
-            return n
+    by_lower = {n.lower(): n for n in names}
+    for pref in _EVENT_DATE_NAMES:
+        if pref in by_lower:
+            return by_lower[pref]
     date_like = [n for n in names if n.lower().endswith("date")
                  and not n.lower().startswith(_NON_EVENT_DATE_PREFIXES)]
     return date_like[0] if len(date_like) == 1 else None
@@ -260,18 +265,167 @@ def measure_stats(ch, db, table, columns):
     return stats
 
 
+# ─── Date + segment evidence (one-time classification) ────────────────────────
+#
+# The AI used to see column NAMES and samples of LowCardinality/Enum columns only, so a
+# plain String Platform/Brand column got judged by name alone and a date column had no
+# evidence at all. These two profiles give it real facts, and let the code verify its
+# answers: a date must actually hold recent, non-future values; a segment must show
+# real recurring values.
+
+_DATE_TYPE_HINTS = ("Date",)   # matches Date, Date32, DateTime, DateTime64
+_DATE_NAME_HINTS = ("date", "time", "day", "month", "period")
+MAX_DATE_CANDIDATES = 12
+MAX_SEGMENT_CANDIDATES = 40
+_SEGMENT_TYPE_HINTS = ("String", "LowCardinality", "Enum")
+
+
+def _is_cdc_name(name):
+    return name.lower().startswith(("_peerdb", "_sign", "_version", "_ver", "__"))
+
+
+def _date_candidates(columns):
+    out = []
+    for c in columns:
+        if _is_cdc_name(c["name"]):
+            continue
+        if (any(h in c["type"] for h in _DATE_TYPE_HINTS)
+                or any(h in c["name"].lower() for h in _DATE_NAME_HINTS)):
+            out.append(c["name"])
+    return out[:MAX_DATE_CANDIDATES]
+
+
+def date_profile(ch, db, table, columns):
+    """{column: {min, max, nonnull, future, active_days_90}} per candidate date column.
+    Aggregates only (no row values). Skips PII databases."""
+    if db in PII_DATABASES:
+        return {}
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
+    prof = {}
+    for col in _date_candidates(columns):
+        try:
+            res = ch.query(
+                f"SELECT min(d), max(d), count(d), countIf(d > now() + INTERVAL 1 DAY), "
+                f"uniqIf(toDate(d), d >= now() - INTERVAL 90 DAY) FROM "
+                f"(SELECT parseDateTimeBestEffortOrNull(toString(`{col}`)) AS d "
+                f"FROM `{db}`.`{table}`{where})"
+            )
+            mn, mx, nn, fut, days = res.result_rows[0]
+            if nn:
+                prof[col] = {"min": str(mn)[:10], "max": str(mx)[:10], "nonnull": int(nn),
+                             "future": int(fut or 0), "active_days_90": int(days or 0)}
+        except Exception as e:
+            log.warning("date profile failed %s.%s.%s: %s", db, table, col, e)
+    return prof
+
+
+def _valid_date(p):
+    """A usable business date: real values, not epoch junk, not mostly future-dated."""
+    return bool(p and p["nonnull"] > 0 and p["max"] >= "2000-01-01"
+                and p["future"] / p["nonnull"] < 0.5)
+
+
+def pick_event_date(llm_pick, profile, columns, is_static):
+    """Final event date column. Trusts the AI's pick when the data backs it up; when the
+    AI said null or picked a bad column, falls back to name-priority among columns whose
+    data is genuinely valid. Static tables never get one."""
+    if is_static:
+        return None
+    colset = {c["name"] for c in columns}
+    if llm_pick and llm_pick in colset and not _is_cdc_name(llm_pick):
+        # not profiled (query failed / not a candidate) → no evidence against it, trust it
+        if llm_pick not in profile or _valid_date(profile[llm_pick]):
+            return llm_pick
+        log.info("AI event date %r rejected (no valid recent data)", llm_pick)
+    valid = {n: p for n, p in profile.items()
+             if _valid_date(p) and not n.lower().startswith(_NON_EVENT_DATE_PREFIXES)}
+    by_lower = {n.lower(): n for n in valid}
+    for pref in _EVENT_DATE_NAMES:
+        if pref in by_lower:
+            return by_lower[pref]
+    heur = event_date_column_heuristic(columns, False)
+    return heur if heur in valid else None
+
+
+# Business-segment priority by column-name meaning — Platform and Brand first, then the
+# usual reporting dimensions. Anything else keeps the AI's order after these.
+_SEGMENT_PRIORITY = ("platform", "brand", "channel", "marketplace", "region", "store",
+                     "division", "category", "currency")
+_SEGMENT_DEMOTE = ("type", "status", "flag", "is_", "mmm")
+
+
+def segment_profile(ch, db, table, columns, event_date_column=None):
+    """{column: {distinct, top_values}} for categorical-looking string columns, scoped to
+    the last year of business data. Gives the AI real values for plain String columns
+    (Platform, Brand) that the low-cardinality sampler never saw. Same PII policy as the
+    sampler: only columns with a small value set, values capped at MAX_STR_LEN."""
+    if db in PII_DATABASES:
+        return {}
+    cands = [c["name"] for c in columns
+             if any(h in c["type"] for h in _SEGMENT_TYPE_HINTS) and not _is_cdc_name(c["name"])
+             ][:MAX_SEGMENT_CANDIDATES]
+    if not cands:
+        return {}
+    live = _live_only_clause(ch, db, table)
+    clauses = [live] if live else []
+    if event_date_column:
+        clauses.append(f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+                       f">= today() - INTERVAL 1 YEAR")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        res = ch.query("SELECT " + ", ".join(f"uniq(toString(`{c}`))" for c in cands)
+                       + f" FROM `{db}`.`{table}`{where}")
+        counts = dict(zip(cands, res.result_rows[0]))
+        small = [c for c in cands if MIN_SEGMENT_CARD <= int(counts[c] or 0) <= MAX_DISTINCT]
+        if not small:
+            return {}
+        res = ch.query("SELECT " + ", ".join(
+            f"topK(8)(substring(toString(`{c}`), 1, {MAX_STR_LEN}))" for c in small)
+            + f" FROM `{db}`.`{table}`{where}")
+        return {c: {"distinct": int(counts[c]), "top_values": list(v)}
+                for c, v in zip(small, res.result_rows[0])}
+    except Exception as e:
+        log.warning("segment profile failed %s.%s: %s", db, table, e)
+        return {}
+
+
+def rank_variables(inferred, seg_prof, columns):
+    """Final ordered variable list for tracking: the AI's segments, plus any priority
+    segment (Platform/Brand/...) it missed that really has categorical values, ordered by
+    business priority; type/status/flag-style columns last."""
+    colset = {c["name"] for c in columns}
+    variables = list(inferred.get("variables") or [])
+    have = {v.get("column") for v in variables}
+    for col in seg_prof:
+        if col not in have and any(k in col.lower() for k in _SEGMENT_PRIORITY):
+            variables.append({"column": col, "role": "segment", "note": "added by profile"})
+
+    def rank(v):
+        n = (v.get("column") or "").lower()
+        for i, k in enumerate(_SEGMENT_PRIORITY):
+            if k in n:
+                return i
+        return 90 if any(k in n for k in _SEGMENT_DEMOTE) else 50
+    # stable sort: ties keep the AI's own priority order
+    ranked = sorted((v for v in variables if v.get("column") in colset), key=rank)
+    # type/status/flag-style columns are tracked only when the table has nothing better
+    good = [v for v in ranked if rank(v) < 90]
+    return good or ranked
+
+
 # ─── Overlay read/write ────────────────────────────────────────────────────────
 
 def load_existing_overlay(pg_cur):
     pg_cur.execute(
         "SELECT database_name, table_name, structure_hash, updated_by, authoritative, "
-        "       concept, scope, source_type, event_date_column "
+        "       concept, scope, source_type, event_date_column, description->>'_cls_v' "
         "FROM sentinel.catalog_overlay"
     )
     return {
         (r[0], r[1]): {"structure_hash": r[2], "updated_by": r[3], "authoritative": r[4],
                        "concept": r[5], "scope": r[6], "source_type": r[7],
-                       "event_date_column": r[8]}
+                       "event_date_column": r[8], "cls_v": r[9]}
         for r in pg_cur.fetchall()
     }
 
@@ -338,7 +492,7 @@ def build_overlay_row(meta, columns, inferred, review):
     conflict = "none"
     if requires_dedup and not dedup_key:
         conflict = "unresolved_dedup"
-    desc = inferred.get("description") or {}
+    desc = {**(inferred.get("description") or {}), "_cls_v": CLASSIFIER_VERSION}
     # summary is a compact derivative; prefer the model's, else what_it_is
     summary = inferred.get("summary") or desc.get("what_it_is")
     return {
@@ -481,11 +635,25 @@ def upsert_target(pg_cur, meta, inferred):
                monitor_frequency_weeks = EXCLUDED.monitor_frequency_weeks,
                expected_cadence_weeks = EXCLUDED.expected_cadence_weeks,
                is_static = EXCLUDED.is_static,
+               -- a newly picked/changed event date must be checked now, not after the
+               -- normal interval (otherwise Data stays blank for up to a week)
+               next_due_at = CASE WHEN sentinel.monitor_targets.event_date_column
+                                       IS DISTINCT FROM EXCLUDED.event_date_column
+                                  THEN now() ELSE sentinel.monitor_targets.next_due_at END,
                event_date_column = EXCLUDED.event_date_column,
                status = CASE WHEN sentinel.monitor_targets.status = 'retired'
                              THEN 'active' ELSE sentinel.monitor_targets.status END,
                iteration = sentinel.monitor_targets.iteration + 1""",
         (meta["database_name"], meta["table_name"], weeks, expected, static, event_col),
+    )
+    # Per-variable targets (Platform, Brand, ...) must carry the same event date, or the
+    # per-value freshness check has no date to group by and silently does nothing.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets
+           SET event_date_column = %s, next_due_at = now()
+           WHERE database_name = %s AND table_name = %s AND variable <> ''
+             AND event_date_column IS DISTINCT FROM %s""",
+        (event_col, meta["database_name"], meta["table_name"], event_col),
     )
 
 
@@ -515,6 +683,10 @@ def _is_business_segment_col(col_name, role):
         return False
     lc = col_name.lower()
     if any(lc.startswith(p) for p in _CDC_PREFIXES):
+        return False
+    # identifier-style names (document/entry numbers, ids) are never business segments,
+    # even when a small table happens to have few distinct values
+    if lc == "id" or lc.endswith(("_id", "_no", "entryno", "entry_no")) or lc.startswith("doc_"):
         return False
     return True
 
@@ -584,6 +756,57 @@ def _segment_values(ch, db, tbl, col, event_date_column=None):
     return {row[0] for row in r.result_rows}
 
 
+# A platform/segment value can be perfectly healthy while reporting far slower than
+# the table's own daily default (an offline retail channel vs. a live marketplace,
+# say) — judging every value against the same table-wide cadence flags the slow-but-
+# fine ones as "dead" forever (seen in prod: Holistique_Base marked 50+ real platforms
+# dead, several of which are legitimately slower-reporting, not broken). Instead of
+# guessing or asking for manual per-platform config, infer each value's OWN natural
+# cadence from how far apart its own active days actually land, historically.
+MIN_CADENCE_SAMPLES = 3       # need a few real gaps before trusting a median
+CADENCE_FLOOR_WEEKS = 0.14    # never inferred tighter than ~daily
+CADENCE_CEIL_WEEKS = 8.0      # never inferred looser than ~2 months (sparse-data guard)
+
+
+def infer_value_cadences(ch, db, tbl, col, event_date_column):
+    """{value: expected_cadence_weeks} for values with enough history to infer one.
+    A value absent from the result keeps inheriting the variable/table-level cadence,
+    unchanged from today's behavior — this only ever makes a value's bar more
+    accurate, never removes the existing fallback."""
+    if not event_date_column:
+        return {}
+    live = _live_only_clause(ch, db, tbl)
+    clauses = [live] if live else []
+    clauses.append(
+        f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+        f">= today() - INTERVAL 180 DAY")
+    where = f" WHERE {' AND '.join(clauses)}"
+    try:
+        res = ch.query(f"""
+            WITH days AS (
+                SELECT toString(`{col}`) AS value,
+                       toDate(parseDateTimeBestEffortOrNull(toString(`{event_date_column}`))) AS d
+                FROM `{db}`.`{tbl}`{where}
+                GROUP BY value, d
+            ),
+            gaps AS (
+                SELECT value, d - lagInFrame(d) OVER (PARTITION BY value ORDER BY d) AS gap
+                FROM days
+            )
+            SELECT value, median(gap) AS gap_days, count() AS n
+            FROM gaps WHERE gap > 0
+            GROUP BY value HAVING n >= {MIN_CADENCE_SAMPLES}
+        """)
+        out = {}
+        for value, gap_days, _n in res.result_rows:
+            weeks = max(CADENCE_FLOOR_WEEKS, min(CADENCE_CEIL_WEEKS, float(gap_days) / 7))
+            out[value] = round(weeks, 3)
+        return out
+    except Exception as e:
+        log.warning("cadence inference failed %s.%s.%s: %s", db, tbl, col, e)
+        return {}
+
+
 def populate_variable_values(pg_cur, ch, meta, inferred):
     db, tbl = meta["database_name"], meta["table_name"]
     edc = inferred.get("event_date_column")
@@ -612,15 +835,18 @@ def populate_variable_values(pg_cur, ch, meta, inferred):
         if not seen_now:
             continue
         tracked.append(col)
+        value_cadence = infer_value_cadences(ch, db, tbl, col, edc)
 
         for value in seen_now:
             pg_cur.execute(
                 """INSERT INTO sentinel.variable_values
-                   (database_name, table_name, variable, value, first_seen, last_seen, lifecycle)
-                   VALUES (%s, %s, %s, %s, now(), now(), 'active')
+                   (database_name, table_name, variable, value, first_seen, last_seen,
+                    lifecycle, expected_cadence_weeks)
+                   VALUES (%s, %s, %s, %s, now(), now(), 'active', %s)
                    ON CONFLICT (database_name, table_name, variable, value) DO UPDATE SET
-                       last_seen = now(), lifecycle = 'active', retired_at = NULL""",
-                (db, tbl, col, value),
+                       last_seen = now(), lifecycle = 'active', retired_at = NULL,
+                       expected_cadence_weeks = EXCLUDED.expected_cadence_weeks""",
+                (db, tbl, col, value, value_cadence.get(value)),
             )
         pg_cur.execute(
             """UPDATE sentinel.variable_values
@@ -660,6 +886,18 @@ def populate_variable_values(pg_cur, ch, meta, inferred):
            WHERE database_name = %s AND table_name = %s AND lifecycle = 'active'
              AND variable <> ALL(%s)""",
         (db, tbl, tracked),
+    )
+    # Variable targets inherit the table-level event date (incl. a human pin) — without
+    # it the per-value freshness check has no date to group by and never runs.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets v
+           SET event_date_column = t.event_date_column, next_due_at = now()
+           FROM sentinel.monitor_targets t
+           WHERE t.database_name = v.database_name AND t.table_name = v.table_name
+             AND t.variable = '' AND v.variable <> ''
+             AND v.database_name = %s AND v.table_name = %s
+             AND v.event_date_column IS DISTINCT FROM t.event_date_column""",
+        (db, tbl),
     )
     return tracked
 
@@ -815,7 +1053,14 @@ def main():
             # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
             # are skipped here, so each run advances the frontier of new/changed
             # tables until the whole catalog is filled, then steady-state is cheap.
-            if prior and prior["structure_hash"] == meta["structure_hash"]:
+            # ONE-TIME classification: a table is classified once, then skipped until its
+            # structure changes (or CLASSIFIER_VERSION is bumped because the logic itself
+            # improved — that re-classifies every table exactly once, then they settle).
+            # Human-pinned rows are never re-run just for a version bump.
+            up_to_date = (prior and prior["structure_hash"] == meta["structure_hash"]
+                          and (prior["cls_v"] == CLASSIFIER_VERSION
+                               or prior["updated_by"] == "human"))
+            if up_to_date:
                 skip_count += 1
                 continue
 
@@ -831,11 +1076,18 @@ def main():
             # 5. PII-safe sample — scoped to the last year using whatever business date
             # a prior run already found for this table, if any (brand-new tables fall
             # back to full-history sampling inside pii_safe_samples).
-            prior_edc = (prior or {}).get("event_date_column")
+            # Date profile first (real min/max/future/active-days per date column): it
+            # gives the AI evidence and scopes the value profiles below to the last year
+            # even for a brand-new table with no prior date.
+            dprof = date_profile(ch, db, tbl, columns)
+            prior_edc = pick_event_date((prior or {}).get("event_date_column"),
+                                        dprof, columns, False)
             samples = pii_safe_samples(ch, db, tbl, columns, prior_edc)
+            sprof = segment_profile(ch, db, tbl, columns, prior_edc)
             mstats = measure_stats(ch, db, tbl, columns)
             payload = {**meta, "columns": columns, "samples": samples,
-                       "measure_stats": mstats}
+                       "measure_stats": mstats, "date_profile": dprof,
+                       "segment_profile": sprof}
 
             # 6. LLM pass + heuristic pre-fill for source_type. This cascades across up
             # to 3 providers (maker + checker) with retries on a bad response — a single
@@ -848,20 +1100,16 @@ def main():
             heur = source_type_heuristic(db, tbl)
             if heur:
                 inferred["source_type"] = heur
-            # Guard the LLM's event_date_column — must be a real column, and never a
-            # sync/CDC column (those are sync freshness, not data freshness).
-            edc = inferred.get("event_date_column")
-            colset = {c["name"] for c in columns}
-            if edc and (edc not in colset or edc.startswith("_peerdb") or edc in ("_sign",)):
-                log.info("dropping bad event_date_column %r for %s.%s", edc, db, tbl)
-                edc = None
-            if not edc:
-                heur_edc = event_date_column_heuristic(columns, bool(inferred.get("is_static")))
-                if heur_edc:
-                    log.info("heuristic event_date_column=%r for %s.%s (LLM said null)",
-                             heur_edc, db, tbl)
-                    edc = heur_edc
+            # Verify the AI's event date against the data (real column, never a sync/CDC
+            # column, actual recent non-future values); when it's null or wrong, fall back
+            # to name-priority over columns whose data is valid. Then order the tracked
+            # variables by business priority (Platform, Brand, ...).
+            llm_edc = inferred.get("event_date_column")
+            edc = pick_event_date(llm_edc, dprof, columns, bool(inferred.get("is_static")))
+            if edc != llm_edc:
+                log.info("event_date_column %r -> %r for %s.%s", llm_edc, edc, db, tbl)
             inferred["event_date_column"] = edc
+            inferred["variables"] = rank_variables(inferred, sprof, columns)
             llm_count += 1
 
             # maker-checker — only material disagreements (source_type/dedup) flag review.

@@ -11,7 +11,7 @@ The prompt builder receives only a PII-safe payload (schema + stats + low-card
 DISTINCT samples). It has no path to raw rows; recruitment_hr is schema+stats only,
 asserted by the caller (see sample.py / main.py). — DATA_MONITOR_SPEC §10.3, §7.4
 """
-import os, json, logging
+import os, json, logging, re
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +250,9 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       far in the future, making the table look artificially "fresh"). Use null if the
       table has no such business/event date (dimension/reference/master/snapshot
       tables). Must be an actual column name present in the schema.
+      A table of sales, orders, invoices or transactions must NEVER be null: a column
+      named SalesDate, OrderDate, InvoiceDate or PostingDate IS the answer. Null is only
+      for pure reference/master/lookup tables.
 Do not add, rename, or omit keys. Do not wrap in markdown."""
 
 
@@ -271,6 +274,17 @@ def _evidence_block(payload):
           "gross-only). Very different magnitudes for a same-named measure across tables "
           "mean they are NOT the same metric.\n"
         + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+        + "\n\nDate column profile (real data: min/max date, non-null rows, rows dated in "
+          "the FUTURE, distinct active days in the last 90). Choose event_date_column "
+          "from THESE: the business date whose max is recent, not future-dated, and has "
+          "many active days. A column that is all future, epoch junk or load-time is not "
+          "the business date.\n"
+        + json.dumps(payload.get("date_profile", {}), ensure_ascii=False)
+        + "\n\nCategorical column profile (distinct values in the last year + the most "
+          "common real values). Judge segments from these REAL values, not the column "
+          "name: a handful of recurring business categories (platform, brand, channel, "
+          "region) is a segment; specific customers/entities, ids or free text is not.\n"
+        + json.dumps(payload.get("segment_profile", {}), ensure_ascii=False)
     )
 
 
@@ -312,14 +326,27 @@ def _call_gemini(prompt):
         contents=prompt + "\n\nRespond with a single JSON object only, no markdown.",
         config={"response_mime_type": "application/json", "temperature": 0},
     )
-    return json.loads(resp.text)
+    return _loads_lenient(resp.text)
+
+
+def _loads_lenient(text):
+    """json.loads that first strips a ```json fence and trailing commas — the two
+    near-misses Gemini/Claude produce on otherwise-valid answers, which used to burn a
+    retry (and then fall through to a more expensive provider)."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1].lstrip("json").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", text))
 
 
 def _call_anthropic(prompt):
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
     msg = client.messages.create(
-        model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-haiku-5-5"),
         max_tokens=8192,   # 1024, then 2048, then 4096 ALL still truncated on wider
                            # tables — a truncated response fails validation and the
                            # retry uses the same budget, so it fails identically every
@@ -327,14 +354,12 @@ def _call_anthropic(prompt):
                            # consistent on attempt 1 AND 2, not transient flakiness,
                            # cutting off at nearly the same ~14k-char mark regardless
                            # of table size — doubling again for real headroom)
-        temperature=0,
+        # Haiku 5.5 rejects non-default sampling (no temperature=0) and bills thinking as
+        # output - structured extraction needs neither, so thinking is switched off.
+        extra_body={"thinking": {"type": "disabled"}},   # via extra_body: pinned SDK predates `thinking`
         messages=[{"role": "user", "content": prompt + "\n\nReturn a single JSON object only."}],
     )
-    text = msg.content[0].text.strip()
-    # strip a ```json fence if present
-    if text.startswith("```"):
-        text = text.split("```", 2)[1].lstrip("json").strip()
-    return json.loads(text)
+    return _loads_lenient(msg.content[0].text)
 
 
 _CALLERS = {"openai": _call_openai, "gemini": _call_gemini, "anthropic": _call_anthropic}
@@ -362,7 +387,19 @@ def _validate(obj):
         raise ValueError("description.not_computable must be an array")
     if not isinstance(obj["variables"], list):
         raise ValueError("variables must be a list")
-    if obj["dedup_method"] not in ("argmax", "final", "none"):
+    # Models sometimes answer with the table ENGINE ("ReplacingMergeTree") or a variant
+    # spelling instead of the method — map those to the intended value rather than
+    # failing the whole answer (which falls through to a pricier provider).
+    dm = str(obj["dedup_method"] or "none").strip().lower().replace("_", "")
+    if dm in ("argmax", "final", "none"):
+        obj["dedup_method"] = dm
+    elif "final" in dm:
+        obj["dedup_method"] = "final"
+    elif "argmax" in dm or "replacing" in dm or "version" in dm:
+        obj["dedup_method"] = "argmax"
+    elif dm in ("", "null", "n/a", "no"):
+        obj["dedup_method"] = "none"
+    else:
         raise ValueError(f"bad dedup_method: {obj['dedup_method']}")
     w = obj["monitor_frequency_weeks"]
     if not (isinstance(w, int) and 1 <= w <= 4):

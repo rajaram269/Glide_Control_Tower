@@ -39,6 +39,8 @@ SES_SECRET_ACCESS_KEY = os.environ.get("SES_SECRET_ACCESS_KEY", "")
 SES_REGION = os.environ.get("SES_REGION", "ap-south-1")
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
+# Everything a person reads (emails, digests) is shown in IST; logic stays on UTC `NOW`.
+NOW_IST = NOW.astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
 
 SEVERITY_EMOJI = {"info": "ℹ️", "warn": "⚠️", "critical": "🔴"}
 
@@ -135,8 +137,9 @@ Recent history (past 24h same service):
 Respond in exactly 2-3 sentences: (1) most likely root cause, (2) single most important remediation step."""
 
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-5-5",
             max_tokens=200,
+            extra_body={"thinking": {"type": "disabled"}},   # Haiku 5.5 thinks by default; 200 tokens is the answer; extra_body: pinned SDK predates `thinking`
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text
@@ -177,7 +180,7 @@ def build_alert_email(alert, provider_context, triage):
         {provider_html}
         {triage_html}
         <hr style='margin-top:20px'>
-        <small style='color:#999'>Control Tower · {NOW.strftime("%Y-%m-%d %H:%M UTC")} · Alert ID: {alert["alert_id"]}</small>
+        <small style='color:#999'>Control Tower · {NOW_IST.strftime("%Y-%m-%d %H:%M IST")} · Alert ID: {alert["alert_id"]}</small>
     </div>"""
 
 
@@ -239,7 +242,7 @@ def send_weekly_digest(pg_cur, token):
 
     html = f"""
     <div style='font-family:sans-serif;max-width:640px'>
-        <h2>📊 Weekly Cost Digest — {NOW.strftime("%b %d, %Y")}</h2>
+        <h2>📊 Weekly Cost Digest — {NOW_IST.strftime("%b %d, %Y")}</h2>
         <table style='border-collapse:collapse;width:100%;border:1px solid #dee2e6'>
             <thead style='background:#f8f9fa'>
                 <tr>
@@ -259,10 +262,10 @@ def send_weekly_digest(pg_cur, token):
                 </tr>
             </tfoot>
         </table>
-        <small style='color:#999'>Control Tower · {NOW.strftime("%Y-%m-%d %H:%M UTC")}</small>
+        <small style='color:#999'>Control Tower · {NOW_IST.strftime("%Y-%m-%d %H:%M IST")}</small>
     </div>"""
 
-    send_email(token, f"📊 Weekly Cost Digest — {NOW.strftime('%b %d')}", html)
+    send_email(token, f"📊 Weekly Cost Digest — {NOW_IST.strftime('%b %d')}", html)
     log.info("Weekly digest sent.")
 
 

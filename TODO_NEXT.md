@@ -17,10 +17,33 @@ project overview yet.
 | 3 | Pipeline page redundancy | 🟢 DONE (removed) |
 | 4 | Deeper service monitoring (silent failures) | 🟢 DONE |
 | 5 | Sentinel reconciliation alerting | 🔴 PENDING |
-| 6 | Sentinel freshness cleanup | 🟡 IN_PROGRESS |
+| 6 | Sentinel freshness cleanup | 🟢 DONE for event date / variables / thresholds (2026-10-15 rework) — remaining follow-ups in "Open items" below |
 | 7 | Freshness checks include deleted/tombstone rows (new, found 2026-10-06) | 🟢 DONE |
 
 🟢 DONE · 🟡 IN_PROGRESS · 🔴 PENDING
+
+## Open items after the 2026-10-15 Sentinel freshness rework
+
+Done in that rework (see `document.md` section 7a and `BUILD_PROGRESS.md`): one-time,
+data-verified classification of event date + variables; per-platform cadence; 3-day
+minimum Data window; Event date column visible in the UI; IST everywhere; all Anthropic
+calls on Haiku 5.5. **Still open:**
+
+1. **Finish the re-classification.** Discovery handles 80 tables per run; it runs weekly
+   (Monday 06:45 IST) and continues where it left off. It is deliberately not run
+   manually any more, to save AI cost.
+2. **Ghost tables.** ~220 rows on the Freshness tab are tables in the old
+   `control_tower.watched_tables` list that no longer exist in ClickHouse ("Not checked
+   yet" forever). Once discovery has finished, deactivate watched_tables entries that
+   are not in `sentinel.catalog_overlay`, and/or label them "Not in ClickHouse" in the UI.
+3. **Table Data badge is still the worst of its platforms.** One group of slow platforms
+   can still turn a big table red (e.g. Holistique_Base). Next step: let only major
+   platforms drive the table-level badge.
+4. **Older classified tables carry old variables** (Type/Status-style next to better
+   ones) until they are re-classified; a one-off SQL that retires those variable targets
+   is the shortcut.
+5. **Cloud Scheduler for the other (non-Control-Tower) automations** in the project is
+   partly UTC (~20 jobs in asia-south1). Left untouched on purpose.
 
 ---
 
@@ -184,7 +207,7 @@ current default of "new problems are invisible by design."
 
 ## 6. Sentinel — freshness logic is messy at the variable level
 
-**STATUS: IN_PROGRESS**
+**STATUS: DONE — superseded by the 2026-10-15 rework. The reasoning below is kept as history; the runbook SQL in this section (MAX_DISTINCT / structure_hash nudges, deleting check results) is OBSOLETE — do not run it.**
 
 **What "variable level" means:** Sentinel doesn't just track "is this whole table
 up to date" — for some tables it also tracks up to 3 individual columns inside that
