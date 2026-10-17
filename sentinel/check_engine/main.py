@@ -670,11 +670,10 @@ def _run_checks(cur, ch, target, checks):
 # A target is only "due" every monitor_frequency_weeks (1-4 weeks), so a freshness verdict
 # could be weeks old: a table that stopped updating right after its check still read
 # "fresh". Freshness is cheap (system.parts + one max()/GROUP BY), so it is refreshed for
-# EVERY active target whose latest freshness verdict is older than ~a day, independent of
-# the weekly cadence. Volume / schema drift / coverage / reconciliation stay on their own
+# EVERY active target that has not been refreshed yet today (IST calendar day), i.e. the
+# first run each day (07:30 IST) refreshes everything, independent of the weekly cadence. Volume / schema drift / coverage / reconciliation stay on their own
 # schedule. A time budget keeps one tick bounded; what is left is picked up next tick
 # (the stalest verdicts are the ones still missing, so progress is guaranteed).
-FRESHNESS_REFRESH_HOURS = 20
 FRESHNESS_REFRESH_BUDGET_SECONDS = int(os.environ.get("SENTINEL_FRESHNESS_BUDGET_SECONDS", "1500"))
 
 
@@ -684,7 +683,7 @@ def freshness_refresh_targets(cur):
             SELECT DISTINCT database_name, table_name, COALESCE(variable,'') AS variable, check_type
             FROM sentinel.check_results
             WHERE check_type IN ('freshness', 'variable_freshness')
-              AND run_ts > now() - make_interval(hours => %s)
+              AND run_ts >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')
         )
         SELECT t.id, t.database_name, t.table_name, t.variable,
                t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
@@ -699,7 +698,7 @@ def freshness_refresh_targets(cur):
         WHERE t.status = 'active' AND COALESCE(t.is_static, false) = false
           AND r.database_name IS NULL
         ORDER BY t.last_checked_at NULLS FIRST, t.id
-    """, (FRESHNESS_REFRESH_HOURS,))
+    """)
     return [
         {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
          "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
