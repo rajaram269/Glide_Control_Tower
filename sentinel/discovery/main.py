@@ -473,6 +473,19 @@ def upsert_overlay(pg_cur, row):
            WHERE sentinel.catalog_overlay.updated_by <> 'human'""",  # never overwrite pinned rows
         row,
     )
+    # A human-pinned row keeps its content, but it must still record that this table has
+    # been classified at this structure/version — otherwise its saved fingerprint stays
+    # stale and EVERY run re-sends it to the AI (seen in prod: a pinned table was
+    # re-classified in three consecutive runs).
+    pg_cur.execute(
+        """UPDATE sentinel.catalog_overlay
+           SET structure_hash = %(structure_hash)s,
+               description = jsonb_set(COALESCE(description, '{}'::jsonb), '{_cls_v}',
+                                       to_jsonb(%(cls_v)s::text))
+           WHERE database_name = %(database_name)s AND table_name = %(table_name)s
+             AND updated_by = 'human'""",
+        {**row, "cls_v": CLASSIFIER_VERSION},
+    )
 
 
 # ─── 6+7. LLM pass + authority ────────────────────────────────────────────────
