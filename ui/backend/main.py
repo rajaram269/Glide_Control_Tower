@@ -3,14 +3,14 @@ Control Tower UI — FastAPI backend
 Serves React dashboard at GET / and REST API at /api/*.
 Connects directly to PostgreSQL (same Cloud SQL instance as collectors).
 """
-import os, json, re
+import os, json, re, hmac, time, logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Request, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -147,6 +147,65 @@ def jobs():
             ORDER BY service_name, collected_at DESC
         """)
         return cur.fetchall()
+
+
+# ─── Run a job from the dashboard ─────────────────────────────────────────────
+#
+# Lets developers who have no GCP "execute" permission re-run a job after fixing code
+# (the pipeline deploys from git; the re-run is the missing step). The dashboard itself
+# has NO login, so this is guarded: disabled until RUN_JOB_TOKEN is configured (Secret
+# Manager -> env), the caller must send it, only registered+active Cloud Run jobs can be
+# started, a job that is already running is never started twice, and there is a per-job
+# cooldown. Every attempt is written to the logs. Needs roles/run.developer (or
+# run.jobs.run) on the UI's service account.
+
+RUN_JOB_TOKEN = os.environ.get("RUN_JOB_TOKEN", "").strip()
+RUN_COOLDOWN_SECONDS = 60
+_last_run_at = {}
+audit_log = logging.getLogger("ct.run_job")
+
+
+@app.post("/api/jobs/{name}/run")
+def run_job(name: str, region: str, request: Request, x_run_token: str = Header(default="")):
+    who = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0].strip()
+    if not _RUN_NAME.match(name) or not _RUN_NAME.match(region):
+        raise HTTPException(400, "invalid job name or region")
+    if not RUN_JOB_TOKEN:
+        raise HTTPException(403, "Running jobs from the dashboard is disabled (RUN_JOB_TOKEN is not configured).")
+    if not hmac.compare_digest(x_run_token.encode(), RUN_JOB_TOKEN.encode()):
+        audit_log.warning("RUN DENIED (bad token) job=%s region=%s from=%s", name, region, who)
+        raise HTTPException(403, "Wrong run token.")
+    with get_db() as cur:
+        cur.execute("""SELECT 1 FROM control_tower.registered_services
+                       WHERE active = true AND platform = 'cloud_run_job'
+                         AND service_name = %s AND region = %s""", (name, region))
+        if not cur.fetchone():
+            raise HTTPException(404, "Not a registered, active Cloud Run job.")
+    now = time.time()
+    if now - _last_run_at.get(name, 0) < RUN_COOLDOWN_SECONDS:
+        raise HTTPException(429, f"{name} was just started — wait {RUN_COOLDOWN_SECONDS}s before running it again.")
+    from google.cloud import run_v2
+    from google.api_core import exceptions as gexc
+    try:
+        parent = f"projects/{LOG_PROJECT}/locations/{region}/jobs/{name}"
+        latest = next(iter(run_v2.ExecutionsClient().list_executions(parent=parent)), None)
+        if latest is not None and not latest.completion_time:
+            raise HTTPException(409, f"{name} is already running ({latest.name.split('/')[-1]}).")
+        _last_run_at[name] = now
+        op = run_v2.JobsClient().run_job(request=run_v2.RunJobRequest(name=parent))
+        try:
+            execution = op.metadata.name.split("/")[-1]
+        except Exception:
+            execution = None
+    except HTTPException:
+        raise
+    except gexc.PermissionDenied:
+        raise HTTPException(503, "The dashboard's service account lacks permission to run jobs (needs roles/run.developer).")
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Could not start job: {type(e).__name__}: {first_line}")
+    audit_log.warning("RUN STARTED job=%s region=%s execution=%s from=%s", name, region, execution, who)
+    return {"ok": True, "job": name, "execution": execution}
 
 
 @app.get("/api/scheduler-jobs")

@@ -554,6 +554,37 @@ function ServicesView() {
     </table></div>`;
 }
 
+// Starts a job now (for re-running after a code fix, without GCP access). The backend
+// requires a run token; it is asked for once per browser session and kept in
+// sessionStorage only. Refuses if the job is already running.
+function RunJobButton({ name, region }) {
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    if (!confirm(`Run "${name}" now?
+
+This starts a real execution in production.`)) return;
+    let token = '';
+    try { token = sessionStorage.getItem('ct_run_token') || ''; } catch (e) {}
+    if (!token) token = prompt('Enter the run token:') || '';
+    if (!token) return;
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/jobs/${encodeURIComponent(name)}/run?region=${encodeURIComponent(region)}`,
+        { method: 'POST', headers: { 'X-Run-Token': token } });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status === 403) { try { sessionStorage.removeItem('ct_run_token'); } catch (e) {} }
+        alert(d.detail || `Could not start the job (${r.status}).`);
+      } else {
+        try { sessionStorage.setItem('ct_run_token', token); } catch (e) {}
+        alert(`Started ${name}${d.execution ? ' — ' + d.execution : ''}. Open its row and press Refresh to follow the logs.`);
+      }
+    } catch (e) { alert('Could not reach the server: ' + e); }
+    setBusy(false);
+  };
+  return html`<button class="ack-btn" disabled=${busy} onClick=${run} title="Run this job now">${busy ? 'Starting…' : '▶ Run'}</button>`;
+}
+
 function JobsView() {
   const [rows] = useApi('/api/jobs');
   const [q, setQ] = useState('');
@@ -587,7 +618,7 @@ function JobsView() {
       <thead><tr>
         <th>Job</th><${Th} label="Region" k="region"/>
         <${Th} label="Last outcome" k="job_status" title="Click to sort: problems first → succeeded first"/>
-        <th>Last run</th><th>Duration</th><th>Checked</th>
+        <th>Last run</th><th>Duration</th><th>Checked</th><th></th>
       </tr></thead>
       <tbody>
         ${shown.map(r => html`<${Fragment} key=${r.service_name}>
@@ -600,8 +631,9 @@ function JobsView() {
           </td>
           <td>${fmt.ms(r.job_duration_ms)}${['running','stuck'].includes(r.job_status) ? ' so far' : ''}</td>
           <td style="color:var(--faint);font-size:12px">${fmt.ago(r.collected_at)}</td>
+          <td onClick=${e => e.stopPropagation()}><${RunJobButton} name=${r.service_name} region=${r.region}/></td>
           </tr>
-          ${open === r.service_name && html`<${LogsPanel} kind="job" name=${r.service_name} region=${r.region} colSpan=${6}/>`}
+          ${open === r.service_name && html`<${LogsPanel} kind="job" name=${r.service_name} region=${r.region} colSpan=${7}/>`}
         <//>`)}
       </tbody>
     </table></div>
