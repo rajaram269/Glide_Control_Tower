@@ -399,6 +399,13 @@ def _headline(text):
     return lines[-1] if lines else ""
 
 
+def _latency_secs(entry):
+    try:
+        return float(str((entry.http_request or {}).get("latency") or "0").rstrip("s"))
+    except ValueError:
+        return 0.0
+
+
 def _window_note(client, gcp_logging, base, entry):
     """Apps like Node/Prisma log their error without a trace id. Fall back to the
     app log lines written while this request was running."""
@@ -461,17 +468,22 @@ def _describe_errors(name, samples):
                     {"role": "system", "content": "You explain server errors to a non-expert. For each "
                      "endpoint, write ONE short sentence (max 15 words) in very simple English saying what "
                      "went wrong. Use only the error text given. Reply as JSON: {\"<endpoint>\": \"<sentence>\"}."},
-                    {"role": "user", "content": json.dumps({p: samples[p][:3] for p in todo})[:12000]}],
+                    {"role": "user", "content": json.dumps({p: [m[:700] for m in samples[p][:3]] for p in todo})[:12000]}],
                 "max_tokens": 600, "temperature": 0.2}).encode()
             req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={
                 "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=20) as r:
                 got = json.loads(json.load(r)["choices"][0]["message"]["content"])
             for path, key in todo.items():
-                if isinstance(got.get(path), str) and got[path].strip():
-                    out[path] = _DESC_CACHE[key] = got[path].strip()
-        except Exception:
-            pass
+                val = got.get(path)
+                if val is None and len(todo) == 1 and len(got) == 1:
+                    val = next(iter(got.values()))      # model renamed the single key
+                if isinstance(val, str) and val.strip():
+                    out[path] = _DESC_CACHE[key] = val.strip()
+                else:
+                    logging.getLogger("ct.describe").warning("no summary matched %r in %r", path, list(got)[:5])
+        except Exception as e:
+            logging.getLogger("ct.describe").warning("error summary failed: %s: %s", type(e).__name__, e)
     for path in todo:
         out.setdefault(path, fallback(path))
     return out
@@ -496,6 +508,7 @@ def service_endpoints(name: str, hours: int = 24):
         client = gcp_logging.Client(project=LOG_PROJECT)
         by_path = {}
         trace_path, fail_traces = {}, set()   # request trace -> endpoint; traces of 5xx requests
+        fail_windows = []                     # (start, end) of each 5xx request, for trace-less app errors
         limit = _service_timeout(name)
         for entry in client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
                                           max_results=2000, page_size=1000):
@@ -511,6 +524,7 @@ def service_endpoints(name: str, hours: int = 24):
                 d["errors"] += 1
                 if entry.trace:
                     fail_traces.add(entry.trace)
+                fail_windows.append((entry.timestamp, entry.timestamp + timedelta(seconds=_latency_secs(entry) + 1)))
                 if _is_timeout(entry, limit):
                     d["timeouts"] += 1
                 else:
@@ -532,8 +546,20 @@ def service_endpoints(name: str, hours: int = 24):
                 d["logged"] += 1
                 if len(d["logged_msgs"]) < 5:
                     d["logged_msgs"].append(msg)
-            else:
-                unattributed.append(msg)
+            elif not any(a <= entry.timestamp <= b for a, b in fail_windows):
+                # (lines logged while a failing request ran belong to that request —
+                # they already explain its 5xx, so they are not "background")
+                unattributed.append((entry.timestamp, msg))
+        # One error spreads over many log lines (a Python traceback is dozens) — lines
+        # within 2s of each other are one event, so "92 lines" is not reported as 92 errors.
+        unattributed.sort(key=lambda x: x[0])
+        events, last_ts = [], None
+        for ts, msg in unattributed:
+            if last_ts is None or (ts - last_ts).total_seconds() > 2:
+                events.append([])
+            events[-1].append(msg)
+            last_ts = ts
+        unattributed = ["\n".join(ev) for ev in events]
         # The app's own ERROR line (matched by trace) says *why* a request failed.
         wanted = {e.trace for d in by_path.values() for e in d["fails"] if e.trace and not _request_note(e)}
         app_msgs = {}

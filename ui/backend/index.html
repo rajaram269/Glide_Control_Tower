@@ -492,7 +492,8 @@ function EndpointBreakdownPanel({ name, colSpan }) {
         <div class="table-scroll"><table>
           <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th><th>Description</th></tr></thead>
           <tbody>${data.endpoints.map(e => html`<${Fragment} key=${e.path}>
-            <tr class="clickable" onClick=${() => setOpenPath(openPath === e.path ? null : e.path)}>
+            <tr class="clickable" style=${(e.errors - (e.timeouts || 0) + (e.logged_errors || 0)) > 0 ? 'background:var(--critical-bg)' : ''}
+                onClick=${() => setOpenPath(openPath === e.path ? null : e.path)}>
               <td class="mono clamp wide" title=${e.path} style="font-size:12px">${openPath === e.path ? '▾ ' : '▸ '}${e.path}</td>
               <td>${e.requests}</td>
               <td>${(() => { const real = e.errors - (e.timeouts || 0) + (e.logged_errors || 0);
