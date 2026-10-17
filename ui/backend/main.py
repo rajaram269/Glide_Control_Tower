@@ -495,21 +495,45 @@ def service_endpoints(name: str, hours: int = 24):
         from urllib.parse import urlparse
         client = gcp_logging.Client(project=LOG_PROJECT)
         by_path = {}
+        trace_path, fail_traces = {}, set()   # request trace -> endpoint; traces of 5xx requests
         limit = _service_timeout(name)
         for entry in client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
                                           max_results=2000, page_size=1000):
             req = entry.http_request or {}
             status = req.get("status") or 0
             path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
-            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "fails": []})
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "fails": [],
+                                          "logged": 0, "logged_msgs": []})
             d["requests"] += 1
+            if entry.trace:
+                trace_path[entry.trace] = path
             if status >= 500:
                 d["errors"] += 1
+                if entry.trace:
+                    fail_traces.add(entry.trace)
                 if _is_timeout(entry, limit):
                     d["timeouts"] += 1
                 else:
                     if len(d["fails"]) < 5:
                         d["fails"].append(entry)
+        # Errors the app logged itself while still answering normally (e.g. HTTP 200) —
+        # the "silent failures". Matched to their request by trace so the failing API is
+        # named; any that can't be tied to a request are kept and shown on their own row.
+        unattributed, seen_traces = [], set()
+        for entry in client.list_entries(
+                filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND -httpRequest.status:*"),
+                order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+            msg, tr = _log_line(entry)["message"], entry.trace
+            if tr and tr in trace_path:
+                if tr in fail_traces or tr in seen_traces:
+                    continue    # a 5xx request: explained by its own failure below
+                seen_traces.add(tr)
+                d = by_path[trace_path[tr]]
+                d["logged"] += 1
+                if len(d["logged_msgs"]) < 5:
+                    d["logged_msgs"].append(msg)
+            else:
+                unattributed.append(msg)
         # The app's own ERROR line (matched by trace) says *why* a request failed.
         wanted = {e.trace for d in by_path.values() for e in d["fails"] if e.trace and not _request_note(e)}
         app_msgs = {}
@@ -527,20 +551,30 @@ def service_endpoints(name: str, hours: int = 24):
                 msg = _request_note(e) or app_msgs.get(e.trace) or _window_note(client, gcp_logging, base, e)
                 if msg:
                     msgs.append(msg)
-            samples[p] = msgs
+            samples[p] = msgs + d["logged_msgs"]
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else ""
         raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
 
-    descriptions = _describe_errors(name, {
-        p: samples[p] for p, d in by_path.items() if d["errors"] > d["timeouts"]})
+    to_explain = {p: samples[p] for p, d in by_path.items()
+                  if d["errors"] > d["timeouts"] or d["logged"] > 0}
+    OUTSIDE = "(errors logged outside any request)"
+    if unattributed:
+        to_explain[OUTSIDE] = list(dict.fromkeys(unattributed))[:5]
+    descriptions = _describe_errors(name, to_explain)
     endpoints = [
         {"path": p, "requests": d["requests"], "errors": d["errors"], "timeouts": d["timeouts"],
-         "error_rate_pct": round(100 * d["errors"] / d["requests"], 1),
+         "logged_errors": d["logged"],
+         # container timeouts are not app errors — kept out of the error rate
+         "error_rate_pct": round(100 * (d["errors"] - d["timeouts"] + d["logged"]) / d["requests"], 1),
          "description": descriptions.get(p)}
         for p, d in by_path.items()
     ]
-    endpoints.sort(key=lambda r: (-r["errors"], -r["requests"]))
+    if unattributed:
+        endpoints.append({"path": OUTSIDE, "requests": 0, "errors": 0, "timeouts": 0,
+                          "logged_errors": len(unattributed), "error_rate_pct": 0,
+                          "description": descriptions.get(OUTSIDE), "outside_request": True})
+    endpoints.sort(key=lambda r: (-(r["errors"] - r["timeouts"] + r["logged_errors"]), -r["timeouts"], -r["requests"]))
     return {"since_hours": hours, "endpoints": endpoints}
 
 

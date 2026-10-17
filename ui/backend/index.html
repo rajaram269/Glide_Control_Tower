@@ -454,10 +454,13 @@ function EndpointLogs({ name, path, colSpan }) {
 // off by the container/server timeout, green = no errors.
 function endpointDescription(e) {
   const appErrors = e.errors - (e.timeouts || 0);
-  return html`${appErrors > 0 && html`<div style="color:var(--critical-fg)">${e.description || 'Server error (500)'}</div>`}
-    ${e.timeouts > 0 && html`<div style="color:var(--medium-fg)">Container/server timeout (${e.timeouts} request${e.timeouts > 1 ? 's' : ''} cut off)</div>`}
-    ${e.errors === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}
-    ${e.errors > 0 && html`<div style="color:var(--muted)">Click this row to see its logs</div>`}`;
+  const logged = e.logged_errors || 0;   // app logged an error but still answered normally (e.g. 200)
+  return html`${(appErrors > 0 || logged > 0) && html`<div style="color:var(--critical-fg)">
+      ${e.outside_request ? `${logged} error${logged > 1 ? 's' : ''} logged outside any request: `
+        : appErrors === 0 ? `${logged} request${logged > 1 ? 's' : ''} answered OK but logged an error: ` : ''}${e.description || 'Server error (500)'}</div>`}
+    ${e.timeouts > 0 && html`<div style="color:var(--medium-fg)">Container timeout — ${e.timeouts} request${e.timeouts > 1 ? 's' : ''} cut off (not an app error)</div>`}
+    ${e.errors === 0 && logged === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}
+    ${(e.errors > 0 || logged > 0) && !e.outside_request && html`<div style="color:var(--muted)">Click this row to see its logs</div>`}`;
 }
 
 // Per-URL request/error breakdown for a service — an aggregate error rate can
@@ -489,10 +492,11 @@ function EndpointBreakdownPanel({ name, colSpan }) {
       : html`<div class="table-scroll"><table>
           <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th><th>Description</th></tr></thead>
           <tbody>${data.endpoints.map(e => html`<${Fragment} key=${e.path}>
-            <tr class="clickable" onClick=${() => setOpenPath(openPath === e.path ? null : e.path)}>
-              <td class="mono clamp wide" title=${e.path} style="font-size:12px">${openPath === e.path ? '▾ ' : '▸ '}${e.path}</td>
+            <tr class=${e.outside_request ? '' : 'clickable'} onClick=${() => !e.outside_request && setOpenPath(openPath === e.path ? null : e.path)}>
+              <td class="mono clamp wide" title=${e.path} style="font-size:12px">${e.outside_request ? '' : (openPath === e.path ? '▾ ' : '▸ ')}${e.path}</td>
               <td>${e.requests}</td>
-              <td style=${e.errors ? 'color:var(--critical-fg)' : ''}>${e.errors}</td>
+              <td>${(() => { const real = e.errors - (e.timeouts || 0) + (e.logged_errors || 0);
+                  return html`<span style=${real ? 'color:var(--critical-fg)' : ''}>${real}</span>${e.timeouts > 0 && html`<div style="color:var(--medium-fg);font-size:11px">+${e.timeouts} timeout${e.timeouts > 1 ? 's' : ''}</div>`}`; })()}</td>
               <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
                         : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
               <td style="font-size:12px">${endpointDescription(e)}</td>
