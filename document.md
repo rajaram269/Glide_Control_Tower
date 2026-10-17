@@ -112,6 +112,15 @@ Everything is stored in one Postgres database, split into two sections:
 - **On your own laptop:** follow [docs/RUN_LOCAL.md](docs/RUN_LOCAL.md). It sets up a
   throwaway database with sample data — no company cloud access needed. Good for
   trying out dashboard changes.
+- **Re-running a job without GCP access:** on the Jobs page every job has a **▶ Run**
+  button (for re-running after a code fix, since the pipeline deploys from git). The
+  dashboard has no login, so the button is **disabled until a run token is configured**:
+  create the secret `ct-run-job-token`, give it to `ct-ui` as env `RUN_JOB_TOKEN`
+  (`scripts/deploy.sh` does this automatically when the secret exists), and grant the
+  `ct-ui` service account `roles/run.developer`. Developers enter the token once per
+  browser session. The backend only starts registered, active jobs, never one that is
+  already running, allows one start per job per minute, and logs every attempt
+  (`RUN STARTED` / `RUN DENIED` in the `ct-ui` logs).
 - **Deploying to production:** `scripts/deploy.sh` rebuilds and redeploys everything.
   `scripts/bootstrap.sh` is only for setting the whole thing up from scratch on a new
   Google Cloud project — you won't normally need this one.
