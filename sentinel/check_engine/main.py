@@ -666,6 +666,67 @@ def _run_checks(cur, ch, target, checks):
             resolve_incident_if_open(cur, target, check_type)
 
 
+# ── Daily freshness refresh ─────────────────────────────────────────────────────
+# A target is only "due" every monitor_frequency_weeks (1-4 weeks), so a freshness verdict
+# could be weeks old: a table that stopped updating right after its check still read
+# "fresh". Freshness is cheap (system.parts + one max()/GROUP BY), so it is refreshed for
+# EVERY active target whose latest freshness verdict is older than ~a day, independent of
+# the weekly cadence. Volume / schema drift / coverage / reconciliation stay on their own
+# schedule. A time budget keeps one tick bounded; what is left is picked up next tick
+# (the stalest verdicts are the ones still missing, so progress is guaranteed).
+FRESHNESS_REFRESH_HOURS = 20
+FRESHNESS_REFRESH_BUDGET_SECONDS = int(os.environ.get("SENTINEL_FRESHNESS_BUDGET_SECONDS", "1500"))
+
+
+def freshness_refresh_targets(cur):
+    cur.execute("""
+        WITH recent AS (
+            SELECT DISTINCT database_name, table_name, COALESCE(variable,'') AS variable, check_type
+            FROM sentinel.check_results
+            WHERE check_type IN ('freshness', 'variable_freshness')
+              AND run_ts > now() - make_interval(hours => %s)
+        )
+        SELECT t.id, t.database_name, t.table_name, t.variable,
+               t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
+               t.is_static, t.event_date_column, w.freshness_column
+        FROM sentinel.monitor_targets t
+        LEFT JOIN control_tower.watched_tables w
+               ON w.database_name = t.database_name AND w.table_name = t.table_name
+        LEFT JOIN recent r
+               ON r.database_name = t.database_name AND r.table_name = t.table_name
+              AND r.variable = t.variable
+              AND r.check_type = CASE WHEN t.variable = '' THEN 'freshness' ELSE 'variable_freshness' END
+        WHERE t.status = 'active' AND COALESCE(t.is_static, false) = false
+          AND r.database_name IS NULL
+        ORDER BY t.last_checked_at NULLS FIRST, t.id
+    """, (FRESHNESS_REFRESH_HOURS,))
+    return [
+        {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
+         "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
+         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
+         "freshness_column": r[9]}
+        for r in cur.fetchall()
+    ]
+
+
+def refresh_freshness(cur, pg, ch):
+    start = datetime.datetime.now(datetime.timezone.utc)
+    todo = freshness_refresh_targets(cur)
+    log.info("%d targets need a daily freshness refresh", len(todo))
+    done = 0
+    for target in todo:
+        if (datetime.datetime.now(datetime.timezone.utc) - start).total_seconds() > FRESHNESS_REFRESH_BUDGET_SECONDS:
+            log.info("Freshness refresh budget reached (%d done); rest next tick.", done)
+            break
+        if target["variable"]:
+            _run_checks(cur, ch, target, [("variable_freshness", check_variable_freshness)])
+        else:
+            _run_checks(cur, ch, target, [("freshness", lambda ch_, cur_, t: check_freshness(ch_, t))])
+        pg.commit()   # per-target, same as phase 1
+        done += 1
+    return done
+
+
 def run_table_checks(cur, ch, target):
     """Freshness/volume/schema_drift — table properties. Force variable='' so the
     check_result + incident scope is the TABLE (one per table, not one per variable)."""
@@ -800,6 +861,16 @@ def main():
                 )
                 ran += 1
                 pg.commit()   # per-target: live + timeout-safe (lock survives commits)
+
+            # ── PHASE 1b: daily freshness refresh (see freshness_refresh_targets) ──
+            # Isolated: a problem here must never block reconciliation or the unlock below.
+            try:
+                refreshed = refresh_freshness(cur, pg, ch)
+            except Exception as e:
+                pg.rollback()
+                refreshed = 0
+                log.error("Daily freshness refresh failed (continuing): %s", e)
+            ran += refreshed
 
             # ── PHASE 2: reconciliation (expensive) ──
             # Recon sums/counts whole tables in ClickHouse (dedup'd), sometimes dozens of

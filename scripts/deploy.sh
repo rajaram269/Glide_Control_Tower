@@ -114,7 +114,7 @@ GEMINI_API_KEY=ct-sentinel-gemini-key:latest,\
 ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest" 3600
 
 # Check engine: PG + CH read only, no LLM.
-deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" "" 1800
+deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" "" 3600
 
 # Auto-resolver: adjudicates needs_review rows with a 3rd LLM + evidence. Reuses the
 # discovery introspection + LLM modules — copy them into its build context first.

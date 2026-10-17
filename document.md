@@ -152,7 +152,11 @@ that Control Tower only reads from.
 - **Per-platform rhythm:** each platform value gets its own expected cadence
   (`variable_values.expected_cadence_weeks`, migration 022) so slow reporters are not
   judged on the daily yardstick.
-- **Checks run 3x a day** (07:30 / 13:30 / 19:30 IST) but only on targets that are due.
+- **Checks run 3x a day** (07:30 / 13:30 / 19:30 IST). Volume, schema drift, coverage and
+  reconciliation only run on targets that are due (every 1-4 weeks). **Freshness is
+  refreshed daily for every active table/variable** (any verdict older than ~20 hours is
+  re-run, newest-missing first, within a 25-minute budget per run; leftovers carry to the
+  next run), so a verdict on the Freshness tab is never more than about a day old.
 - **All displayed times are IST** (dashboard, alert emails, Cloud Scheduler). Internal
   logic and Cloud Logging stay on UTC.
 - **AI models:** discovery/resolver cascade is OpenAI `gpt-4o-mini` -> Gemini
