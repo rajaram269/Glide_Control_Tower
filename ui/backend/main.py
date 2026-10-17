@@ -558,7 +558,7 @@ def service_endpoints(name: str, hours: int = 24):
 
     to_explain = {p: samples[p] for p, d in by_path.items()
                   if d["errors"] > d["timeouts"] or d["logged"] > 0}
-    OUTSIDE = "(errors logged outside any request)"
+    OUTSIDE = "(background)"   # errors not tied to any API call: described, but never an endpoint row
     if unattributed:
         to_explain[OUTSIDE] = list(dict.fromkeys(unattributed))[:5]
     descriptions = _describe_errors(name, to_explain)
@@ -570,12 +570,10 @@ def service_endpoints(name: str, hours: int = 24):
          "description": descriptions.get(p)}
         for p, d in by_path.items()
     ]
-    if unattributed:
-        endpoints.append({"path": OUTSIDE, "requests": 0, "errors": 0, "timeouts": 0,
-                          "logged_errors": len(unattributed), "error_rate_pct": 0,
-                          "description": descriptions.get(OUTSIDE), "outside_request": True})
+    background = ({"count": len(unattributed), "description": descriptions.get(OUTSIDE)}
+                  if unattributed else None)
     endpoints.sort(key=lambda r: (-(r["errors"] - r["timeouts"] + r["logged_errors"]), -r["timeouts"], -r["requests"]))
-    return {"since_hours": hours, "endpoints": endpoints}
+    return {"since_hours": hours, "endpoints": endpoints, "background_errors": background}
 
 
 _LOGS_CACHE = {}   # (service, path, hours) -> (fetched_at, lines); a re-open never re-queries Logging
