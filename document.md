@@ -145,12 +145,14 @@ that Control Tower only reads from.
   Platform, Brand, Channel, Region...; Type/Status/Flag-style columns are only used
   when nothing better exists; identifier-style names (`*_id`, `*_no`) never are.
 - **Fresh / Stale / Dead** use the table's expected update interval. Data freshness
-  (business date, per table and per platform) never judges on less than 3 days
-  (`DATA_MIN_DAYS` in `sentinel/check_engine/main.py`): Fresh up to the window, Stale up
-  to 3x it, Dead beyond. Sync (pipeline) freshness stays strict. A table's Data badge is
-  the worst of its own newest date and its per-platform check.
+  (business date, per table and per platform) and Sync (pipeline) both never judge on less
+  than 3 days (`DATA_MIN_DAYS` / `SYNC_MIN_DAYS` in `sentinel/check_engine/main.py`): Fresh
+  up to the window, Stale up to 3x it, Dead beyond. **Only the last 12 months are ever
+  judged** (`LOOKBACK_DAYS`): a table, or a platform inside one, with no data in 12 months
+  is **Inactive** (grey, never alerted). A table's Data badge is the worst of its own newest
+  date and its per-platform check. The Freshness tab shows a legend with these definitions.
 - **How a variable (e.g. Platform) is judged, value by value** (`judge_values` in
-  `sentinel/check_engine/main.py`): values with no data for 180+ days are **dormant** and
+  `sentinel/check_engine/main.py`): values with no data in the last 12 months are **inactive** and
   ignored; values that stopped on the same date as at least 3 others (within 45 days) are
   **in a batch** (e.g. retail platforms delivered once a month) and count as on time; if no
   active value is current the **whole table stopped** and only the table check reports it.
