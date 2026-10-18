@@ -13,7 +13,7 @@ Checks (DATA_MONITOR_SPEC §8 / SENTINEL_BUILD_SPEC §5-6):
  4 schema_drift — columns vs stored structure_hash
  5 reconciliation — deduped metric compare; dedup ON
 """
-import os, json, hashlib, logging, datetime
+import os, re, json, hashlib, logging, datetime
 import psycopg2
 from psycopg2.extras import execute_values, Json
 import clickhouse_connect
@@ -287,6 +287,19 @@ def check_schema_drift(ch, pg_cur, target):
     return "ok", {"drift": False}
 
 
+# Variables whose values are individual entities that come and go (a campaign ends, a
+# keyword is dropped, a SKU is delisted), not stable business segments. A finished campaign
+# is not a failure, so per-value freshness/coverage is not judged on them. (Same pattern as
+# sentinel/discovery/main.py, which also stops tracking them.)
+_ENTITY_NAME = re.compile(
+    r"(campaign|ad[ _]?group|keyword|search[ _]?term|portfolio|journey|report[ _]?name|creative)"
+    r"|((^|[ _])(sku|asin|mat|listing|merchant)([ _]?(code|id|no))?$)", re.I)
+
+
+def _is_entity_name(name):
+    return bool(_ENTITY_NAME.search(name or ""))
+
+
 # ─── 3. Variable coverage ───────────────────────────────────────────────────────
 #
 # For a per-variable target, compare the values seen recently in ClickHouse against
@@ -297,6 +310,8 @@ def check_variable_coverage(ch, pg_cur, target):
     db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
     if not variable:
         return "ok", {"note": "table-level target, no variable"}
+    if _is_entity_name(variable):
+        return "ok", {"note": "entity-like variable (campaign/ad group/code...), not a segment - not checked"}
     pg_cur.execute(
         """SELECT value FROM sentinel.variable_values
            WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
@@ -320,6 +335,45 @@ def check_variable_coverage(ch, pg_cur, target):
     return "ok", {"expected_count": len(expected), "missing_count": 0}
 
 
+# ── Judging each value of a variable (pure logic, no I/O) ──────────────────────
+# 1. DORMANT: no data for DORMANT_DAYS+ -> not expected to report any more; excluded from
+#    the alert and from the dead percentage (it was never a failure).
+# 2. BATCH: values stuck on (about) the same last date as at least BATCH_MIN_PEERS others,
+#    within BATCH_MAX_DAYS, are loaded together by one pipeline (e.g. retail platforms
+#    delivered once a month with daily dates) - they are in step, not individually late.
+# 3. TABLE STOPPED: when no active value is current, the whole table stopped. The table-level
+#    freshness check already reports that, so no extra per-variable alert.
+DORMANT_DAYS = 180
+BATCH_MAX_DAYS = 45
+BATCH_MIN_PEERS = 3
+
+
+def judge_values(value_tolerance, last_seen):
+    active, inactive = {}, []
+    for v in sorted(value_tolerance):
+        last = last_seen.get(v)
+        _, st, age_h = _classify(last, value_tolerance[v], DATA_MIN_DAYS)
+        age_d = None if age_h is None else age_h / 24.0
+        if age_d is None or age_d > DORMANT_DAYS:
+            inactive.append(v)
+            continue
+        active[v] = {"st": st, "age": age_d, "day": last.date() if hasattr(last, "date") else last}
+    in_batch = []
+    for v, a in active.items():
+        if a["st"] == "ok" or a["age"] > BATCH_MAX_DAYS:
+            continue
+        if sum(1 for b in active.values() if abs((b["day"] - a["day"]).days) <= 1) >= BATCH_MIN_PEERS:
+            in_batch.append(v)
+    for v in in_batch:
+        active[v]["st"] = "ok"
+    return {
+        "active": len(active), "inactive": inactive, "in_batch": sorted(in_batch),
+        "table_stopped": bool(active) and all(a["st"] != "ok" for a in active.values()),
+        "stale": sorted(v for v, a in active.items() if a["st"] == "warn"),
+        "dead": sorted(v for v, a in active.items() if a["st"] == "fail"),
+    }
+
+
 # Per-value freshness — coverage (above) only asks "does this value exist anywhere in
 # the table." It misses a segment whose feed died while other segments keep the table
 # looking fresh overall (e.g. one of 40 platforms stops syncing; Base still gets daily
@@ -331,6 +385,8 @@ def check_variable_freshness(ch, pg_cur, target):
     db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
     if not variable:
         return "ok", {"note": "table-level target, no variable"}
+    if _is_entity_name(variable):
+        return "ok", {"note": "entity-like variable (campaign/ad group/code...), not a segment - not checked"}
     edc = target.get("event_date_column")
     if not edc:
         return "ok", {"note": "no business date column — nothing to check per value"}
@@ -362,22 +418,21 @@ def check_variable_freshness(ch, pg_cur, target):
     except Exception as e:
         return "warn", {"error": str(e)}
 
-    stale, dead = [], []
-    for v in sorted(expected):
-        _, vstatus, _age = _classify(last_seen.get(v), value_tolerance[v], DATA_MIN_DAYS)
-        if vstatus == "fail":
-            dead.append(v)
-        elif vstatus == "warn":
-            stale.append(v)
-
+    j = judge_values(value_tolerance, last_seen)
+    stale, dead, n = j["stale"], j["dead"], j["active"]
+    info = {"expected_count": n, "inactive_count": len(j["inactive"]), "in_batch_count": len(j["in_batch"])}
+    if not n:
+        return "ok", {**info, "note": f"all tracked values dormant (no data for {DORMANT_DAYS}+ days)"}
+    if j["table_stopped"]:
+        return "ok", {**info, "note": "no value is current - the whole table stopped; reported by the table freshness check"}
     affected = len(stale) + len(dead)
     if not affected:
-        return "ok", {"expected_count": len(expected), "stale_count": 0, "dead_count": 0}
+        return "ok", {**info, "stale_count": 0, "dead_count": 0}
 
-    affected_pct = affected / len(expected) * 100.0
+    affected_pct = affected / n * 100.0
     status = "fail" if (dead and affected_pct >= 20) or affected_pct >= 50 else "warn"
     return status, {
-        "expected_count": len(expected),
+        **info,
         "stale_values": stale[:50], "stale_count": len(stale),
         "dead_values": dead[:50], "dead_count": len(dead),
         "affected_pct": round(affected_pct, 1),
@@ -674,6 +729,9 @@ def _run_checks(cur, ch, target, checks):
 # first run each day (07:30 IST) refreshes everything, independent of the weekly cadence. Volume / schema drift / coverage / reconciliation stay on their own
 # schedule. A time budget keeps one tick bounded; what is left is picked up next tick
 # (the stalest verdicts are the ones still missing, so progress is guaranteed).
+# SENTINEL_FORCE_REFRESH=1 (set on a single manual execution) re-judges every target even if it
+# was already refreshed today - used after a change to the judging rules.
+FORCE_REFRESH = os.environ.get("SENTINEL_FORCE_REFRESH", "") == "1"
 FRESHNESS_REFRESH_BUDGET_SECONDS = int(os.environ.get("SENTINEL_FRESHNESS_BUDGET_SECONDS", "1500"))
 
 
@@ -696,9 +754,9 @@ def freshness_refresh_targets(cur):
               AND r.variable = t.variable
               AND r.check_type = CASE WHEN t.variable = '' THEN 'freshness' ELSE 'variable_freshness' END
         WHERE t.status = 'active' AND COALESCE(t.is_static, false) = false
-          AND r.database_name IS NULL
+          AND (r.database_name IS NULL OR %s)
         ORDER BY t.last_checked_at NULLS FIRST, t.id
-    """)
+    """, (FORCE_REFRESH,))
     return [
         {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
          "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],

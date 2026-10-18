@@ -10,7 +10,7 @@ Steps (DATA_MONITOR_SPEC §10 / SENTINEL_BUILD_SPEC §3):
  5 PII-safe sample  6 LLM pass (llm.py)  7 authority+conflict (I1-I4)
  8 drift/dropped  9 monitor_targets  10 reconciliation_rules  11 write  12 lock release
 """
-import os, json, hashlib, logging, datetime
+import os, re, json, hashlib, logging, datetime
 import psycopg2
 from psycopg2.extras import execute_values, Json
 import clickhouse_connect
@@ -691,6 +691,13 @@ MIN_SEGMENT_CARD = 3          # a real segment has >=3 distinct values (excludes
 _CDC_PREFIXES = ("_peerdb", "_sign", "_version", "_ver", "__")
 
 
+# Entity-like names (a campaign, ad group, keyword, SKU...) come and go; they are not stable
+# business segments, so they are never tracked (see also the check engine's per-value checks).
+_ENTITY_NAME = re.compile(
+    r"(campaign|ad[ _]?group|keyword|search[ _]?term|portfolio|journey|report[ _]?name|creative)"
+    r"|((^|[ _])(sku|asin|mat|listing|merchant)([ _]?(code|id|no))?$)", re.I)
+
+
 def _is_business_segment_col(col_name, role):
     if role != "segment":
         return False
@@ -700,6 +707,8 @@ def _is_business_segment_col(col_name, role):
     # identifier-style names (document/entry numbers, ids) are never business segments,
     # even when a small table happens to have few distinct values
     if lc == "id" or lc.endswith(("_id", "_no", "entryno", "entry_no")) or lc.startswith("doc_"):
+        return False
+    if _ENTITY_NAME.search(col_name):
         return False
     return True
 
