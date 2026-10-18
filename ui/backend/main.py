@@ -440,13 +440,13 @@ def _is_timeout(entry, limit):
             or secs >= limit - 5)
 
 
-SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-5-mini")
 _DESC_CACHE = {}   # (service, path, error text) -> description; keeps AI calls rare
 
 
 def _describe_errors(name, samples):
     """{path: short plain-English reason} for endpoints with app errors. Only the
-    error text is sent to the AI (never successes), in one cheap gpt-4o-mini call,
+    error text is sent to the AI (never successes), in one cheap gpt-5-mini call,
     and cached. Without OPENAI_API_KEY (or on failure) falls back to the raw error line."""
     import urllib.request
     out, todo = {}, {}
@@ -469,7 +469,12 @@ def _describe_errors(name, samples):
                      "endpoint, write ONE short sentence (max 15 words) in very simple English saying what "
                      "went wrong. Use only the error text given. Reply as JSON: {\"<endpoint>\": \"<sentence>\"}."},
                     {"role": "user", "content": json.dumps({p: [m[:700] for m in samples[p][:3]] for p in todo})[:12000]}],
-                "max_tokens": 600, "temperature": 0.2}).encode()
+                # gpt-5* / o-series are reasoning models: no temperature, max_completion_tokens (reasoning
+                # tokens count toward it, billed as output) and the lowest reasoning effort for a one-line summary.
+                **({"max_completion_tokens": 1500,
+                    "reasoning_effort": "minimal" if SUMMARY_MODEL == "gpt-5" or SUMMARY_MODEL.startswith("gpt-5-") else "low"}
+                   if SUMMARY_MODEL.startswith(("gpt-5", "o1", "o3", "o4"))
+                   else {"max_tokens": 600, "temperature": 0.2})}).encode()
             req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={
                 "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=20) as r:

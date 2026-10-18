@@ -300,6 +300,20 @@ def _prompt(payload, system=None, output_spec=None):
 # Each returns a dict (parsed JSON) or raises. Lazy imports so a missing SDK for
 # one provider doesn't break the others.
 
+def _openai_model_params(model, max_out=8192):
+    """Per-model request settings. gpt-5* and the o-series are REASONING models: they reject
+    `temperature` (only the default is accepted), cap output with max_completion_tokens
+    (reasoning tokens count toward it) and BILL reasoning tokens as output - so reasoning
+    effort is kept as low as the model allows for this extraction task. `reasoning_effort`
+    goes through extra_body because the pinned SDK predates the argument. Older chat models
+    (gpt-4o-mini, gpt-4.1-mini) keep temperature=0."""
+    if model == "gpt-5" or model.startswith("gpt-5-"):
+        return {"max_completion_tokens": max_out, "extra_body": {"reasoning_effort": "minimal"}}
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):          # gpt-5.1+, o-series: "low" is valid everywhere
+        return {"max_completion_tokens": max_out, "extra_body": {"reasoning_effort": "low"}}
+    return {"temperature": 0}
+
+
 def _call_openai(prompt):
     from openai import OpenAI
     # .strip() matters here: a secret stored with a trailing newline (an easy accident
@@ -308,12 +322,13 @@ def _call_openai(prompt):
     # before any request even reaches OpenAI - surfaces as a generic "Connection
     # error" with no indication it was ever about the key's formatting.
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
+    model = os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-5-mini")
     resp = client.chat.completions.create(
-        model=os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-4o-mini"),
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        temperature=0,
-        timeout=60,
+        timeout=120,       # a reasoning model is slower than 4o-mini even at minimal effort
+        **_openai_model_params(model),
     )
     return json.loads(resp.choices[0].message.content)
 

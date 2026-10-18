@@ -170,7 +170,7 @@ that Control Tower only reads from.
   about a day old.
 - **All displayed times are IST** (dashboard, alert emails, Cloud Scheduler). Internal
   logic and Cloud Logging stay on UTC.
-- **AI models:** discovery/resolver cascade is OpenAI `gpt-4o-mini` -> Gemini
+- **AI models:** discovery/resolver cascade is OpenAI `gpt-5-mini` -> Gemini
   `gemini-2.5-flash` -> Anthropic `claude-haiku-5-5` (cheapest, last fallback). The
   alerter's triage also uses `claude-haiku-5-5`. No Sonnet is used anywhere. Providers-tab
   and cost-collector Anthropic calls use no tokens (free).
@@ -205,6 +205,7 @@ that Control Tower only reads from.
 - `BUILD_PROGRESS.md` — a dated log of everything built and every bug found so far.
   Worth skimming top to bottom once.
 - `docs/RUN_LOCAL.md` — step-by-step for running this on your own machine.
-- `docs/LLM_USAGE.md` — every LLM call in the project: which model, when, for what, and what it costs.
+- `LLM_USAGE.md` — every LLM call in the project: which model does what, fallback order, prices and status.
+- `SCHEDULES.md` — every Control Tower job and the dashboard service: what runs when (IST), how long it takes, known issues.
 - `migrations/` — every database change, in order; read these if you want to know
   exactly what data exists.
