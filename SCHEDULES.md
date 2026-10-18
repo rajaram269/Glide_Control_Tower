@@ -13,7 +13,7 @@ Each background job is a **Cloud Run Job** (`ct-…`) started by a **Cloud Sched
 |---|---|---|---|---|---|---|---|
 | `ct-gcp-collector` | Pulls metrics for all Cloud Run services/jobs, polls provider status pages, checks API health in the logs, checks key table freshness (old system), discovers new services | **Every hour at :00** | 5.0 min | 6.7 min | 10 min | 2 | OK |
 | `ct-aws-collector` | Pulls CloudWatch metrics for registered EC2 instances | **Every hour at :00** | — | — | 10 min | 2 | **Failing every run** (see §5) |
-| `ct-anomaly-detector` | Reads the database and runs 8 anomaly checks, writes alerts | **Every hour at :30** | 18 sec | 27 sec | 10 min | 2 | **Fails ~1 run in 4** (see §5) |
+| `ct-anomaly-detector` | Reads the database and runs 8 anomaly checks, writes alerts | **Every hour at :30** | 18 sec | 27 sec | 10 min | 2 | Fixed 2026-10-18 (was failing ~1 run in 4; see §5) |
 | `ct-alerter` | Sends email for new alerts; adds an AI triage paragraph for critical ones | **Every hour at :45** | 25 sec | 46 sec | 10 min | 2 | OK |
 | `ct-cost-collector` | Collects spend (GCP billing export, AWS, ClickHouse Cloud, OpenAI, Anthropic, Cohere) and runs cost anomaly checks | **Daily 06:00** | 23 sec | 42 sec | 10 min | 2 | OK |
 | `ct-alerter-weekly` | Weekly cost-digest email (same code as the alerter with `WEEKLY_DIGEST=true`) | **Mondays 09:00** | 15 sec | 42 sec | 10 min | 2 | OK |
@@ -71,12 +71,12 @@ block each other, but the database is busier for that half hour.
 
 | Issue | Effect | Cause |
 |---|---|---|
-| `ct-aws-collector` fails **every** run | A red failed job every hour; no EC2 metrics | It reads a column `ec2_instance_id` from `registered_services`, but that column exists only on `service_health` (`collectors/aws_collector/main.py:64`) |
-| `ct-anomaly-detector` fails about 1 run in 4 (11 of the last 40) | Alerts it just found are lost for that run | It saves each alert's details as JSON and crashes on database numbers of type `Decimal` ("Object of type Decimal is not JSON serializable", `intelligence/anomaly_detector/main.py:395`) |
+| `ct-aws-collector` fails **every** run | A red failed job every hour; no EC2 metrics | It reads a column `ec2_instance_id` from `registered_services`, but that column exists only on `service_health` (`collectors/aws_collector/main.py:64`). **This is the original code**: identical on `main` and `development`, and only ever touched by the first commit (2026-06-19). **Not changed — decision pending** |
+| ~~`ct-anomaly-detector` fails about 1 run in 4~~ **FIXED 2026-10-18** | It failed in blocks of 5-6 hourly runs every night (about 02:30-07:30 IST); every alert from a failed run was lost, and the checks `error_rate_spike`, `api_degradation`, `ec2_resource_pressure` and `silent_failure` had never saved an alert | It saved each alert's details as JSON and crashed on database numbers of type `Decimal`. The bug is in the original code on `main` too. Fixed by converting `Decimal` to a number when saving (`_json_default`) |
 | `ct-gcp-collector` uses 5–7 min of a 10 min limit | If it gets slower it will time out and be retried | Hourly collection has grown (more services/tables) |
 | OpenAI credits exhausted (2026-10-18) | Catalog runs fall through to Gemini/Haiku (dearer, slower); dashboard shows raw API-error text | Recharge the OpenAI account; see [LLM_USAGE.md](LLM_USAGE.md) |
 
-*Fixed on 2026-10-18:* the cost collector and weekly digest were running at 00:00 IST and Monday 03:15 IST (their crons were written for UTC);
+*Fixed on 2026-10-18:* the anomaly detector (see above); the cost collector and weekly digest were running at 00:00 IST and Monday 03:15 IST (their crons were written for UTC);
 they now run at **06:00 IST daily** and **Monday 09:00 IST** as documented.
 
 ## 6. Not covered here
