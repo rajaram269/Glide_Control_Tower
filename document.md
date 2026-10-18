@@ -205,5 +205,6 @@ that Control Tower only reads from.
 - `BUILD_PROGRESS.md` — a dated log of everything built and every bug found so far.
   Worth skimming top to bottom once.
 - `docs/RUN_LOCAL.md` — step-by-step for running this on your own machine.
+- `docs/LLM_USAGE.md` — every LLM call in the project: which model, when, for what, and what it costs.
 - `migrations/` — every database change, in order; read these if you want to know
   exactly what data exists.
