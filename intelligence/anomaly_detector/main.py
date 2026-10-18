@@ -8,7 +8,7 @@ All checks run against Postgres directly (control_tower schema is the source
 of truth — no ClickHouse mirror). Revisit ClickHouse (via PeerDB CDC) if/when
 row volume makes Postgres aggregation too slow.
 """
-import os, json, uuid, datetime, logging
+import os, json, uuid, datetime, decimal, logging
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -16,6 +16,15 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
+
+
+def _json_default(o):
+    """Postgres NUMERIC columns (error rates, CPU %, latency) arrive as Decimal, which json.dumps
+    cannot serialize - that crashed the whole run (and lost EVERY alert in it) whenever a check
+    that carries such a value fired. Decimal -> float; anything else unknown -> str."""
+    if isinstance(o, decimal.Decimal):
+        return float(o)
+    return str(o)
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 DEDUP_WINDOW_HOURS = 4
@@ -392,7 +401,7 @@ def main():
                             a.get("service_name"),
                             a.get("provider"),
                             a["message"],
-                            json.dumps(a["context_json"]),
+                            json.dumps(a["context_json"], default=_json_default),
                             NOW,
                         )
                         for a in new_alerts
