@@ -930,7 +930,7 @@ function CostsView() {
 
 // Maps a freshness sub-status (fresh/stale/dead/static) to a status-badge class.
 const freshBadge = (s) => s === 'fresh' ? 'operational' : s === 'stale' ? 'degraded'
-  : s === 'dead' ? 'major_outage' : s === 'static' ? 'info' : 'unknown';
+  : s === 'dead' ? 'major_outage' : s === 'static' ? 'info' : 'unknown';   // 'inactive' -> grey
 
 // Decimal weeks → human cadence label ("~daily", "~2h", "weekly", "monthly").
 function cadenceLabel(weeks) {
@@ -954,6 +954,7 @@ function freshDisplay(r) {
   if (s === 'stale')  return { cls: 'degraded', label: 'Stale' };
   if (s === 'dead')   return { cls: 'major_outage', label: 'Dead' };
   if (s === 'static') return { cls: 'info', label: 'Static' };
+  if (s === 'inactive') return { cls: 'unknown', label: 'Inactive' };
   return { cls: 'unknown', label: s };
 }
 
@@ -973,7 +974,7 @@ function FreshnessView() {
     data: r => r.is_static ? 5
       : !r.data_column ? 4   // n/a — no business date column on this table at all
       : r.data_status === 'dead' ? 0 : r.data_status === 'stale' ? 1
-      : r.data_status === 'fresh' ? 3 : 2,
+      : r.data_status === 'fresh' ? 3 : r.data_status === 'inactive' ? 3.5 : 2,
   });
   const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
   const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
@@ -987,6 +988,17 @@ function FreshnessView() {
       ${syncBad > 0 && html`<span style="color:var(--critical-fg)">● ${syncBad} sync stale/dead (pipeline)</span>`}
       ${dataBad > 0 && html`<span style="color:var(--high-fg)">● ${dataBad} data stale/dead (business date old)</span>`}
       ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (daily 07:30 IST)</span>`}
+    </div>
+    <div class="callout" style="margin-bottom:14px;font-size:12px;line-height:1.7;background:var(--raised);border:1px solid var(--border);color:var(--fg-2)">
+      <b>How to read these statuses.</b>
+      <span class="badge operational">Fresh</span> newest data is inside the allowed window.
+      <span class="badge degraded">Stale</span> late: past the window but less than 3× it — a warning, it may still catch up.
+      <span class="badge major_outage">Dead</span> more than 3× the window — the feed has most likely stopped.
+      <span class="badge unknown">Inactive</span> no data in the last 12 months — not judged (old customers/channels never count as dead).
+      <br/>The <b>allowed window</b> is the table's normal update rhythm (daily, weekly, monthly…) and <b>never less than 3 days</b>:
+      a daily table is Fresh up to 3 days old, Stale from 3 to 9 days, Dead after 9 days; a weekly table is Fresh to 7 days, Stale to 21, Dead after.
+      Only the <b>last 12 months</b> of data are ever looked at. <b>Sync</b> = when rows were last written (is the pipeline running);
+      <b>Data</b> = newest business date, for the table and for each platform/brand inside it.
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
@@ -1043,6 +1055,7 @@ function FreshnessView() {
         const syncD = freshDisplay({ ...sel, sentinel_status: sel.sync_status });
         const dataLabel = sel.is_static ? 'not monitored (static)'
           : !sel.data_column ? 'no business date on this table — only sync is tracked'
+          : sel.data_status === 'inactive' ? 'inactive — no data in the last 12 months (not judged)'
           : sel.data_status ? sel.data_status : 'not checked yet';
         return html`
           ${sel.is_static ? html`<div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg);margin-bottom:16px">This is a frozen reference table — freshness is never alarmed on it.</div>` : ''}

@@ -121,6 +121,13 @@ def _maxcol_freshness(ch, db, table, col):
 # on less than this many days, whatever the table's expected interval (a "daily" table
 # is Fresh up to 3 days, Stale up to 9, Dead after). Sync (pipeline) stays strict.
 DATA_MIN_DAYS = 3
+# Sync (pipeline) freshness gets the same 3-day minimum: nothing is called stale or dead
+# until it is more than 3 days late.
+SYNC_MIN_DAYS = 3
+# Only the last 12 months are ever judged. A table - or a platform/brand inside one - with
+# no data in that window is INACTIVE (shown, never alerted), not dead: old, gone customers
+# and channels would otherwise read dead forever.
+LOOKBACK_DAYS = 365
 
 
 def _classify(last, tolerance_weeks, min_days=0):
@@ -175,7 +182,7 @@ def check_freshness(ch, target):
                       "sync_last_write": sync_last.isoformat() if sync_last else None,
                       "mechanism": sync_mech}
 
-    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks)
+    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks, SYNC_MIN_DAYS)
 
     observed = {
         "sub_status": sync_sub,          # back-compat: top-level = sync verdict
@@ -193,14 +200,24 @@ def check_freshness(ch, target):
     if edc:
         try:
             data_last = _maxcol_freshness(ch, db, table, edc)
-            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks, DATA_MIN_DAYS)
-            observed["data"] = {"column": edc, "sub_status": data_sub,
-                                "max_event_date": data_last.isoformat() if data_last else None,
-                                "age_hours": data_age}
-            # a table can be synced-fresh but data-stale (May data in July) — flag it
-            if _RANK[data_status] > _RANK[overall]:
-                overall = data_status
-            observed["sub_status"] = _worst_sub(sync_sub, data_sub)
+            dl = data_last
+            if dl is not None and dl.tzinfo is None:
+                dl = dl.replace(tzinfo=datetime.timezone.utc)
+            if dl is None or (NOW - dl).total_seconds() > LOOKBACK_DAYS * 86400:
+                # nothing in the last 12 months -> not judged (never dead, never an alert)
+                observed["data"] = {"column": edc, "sub_status": "inactive",
+                                    "max_event_date": data_last.isoformat() if data_last else None,
+                                    "age_hours": None,
+                                    "note": f"no data in the last {LOOKBACK_DAYS} days - not judged"}
+            else:
+                data_sub, data_status, data_age = _classify(data_last, tolerance_weeks, DATA_MIN_DAYS)
+                observed["data"] = {"column": edc, "sub_status": data_sub,
+                                    "max_event_date": data_last.isoformat() if data_last else None,
+                                    "age_hours": data_age}
+                # a table can be synced-fresh but data-stale (May data in July) — flag it
+                if _RANK[data_status] > _RANK[overall]:
+                    overall = data_status
+                observed["sub_status"] = _worst_sub(sync_sub, data_sub)
         except Exception as e:
             observed["data"] = {"column": edc, "error": str(e)}
     else:
@@ -336,14 +353,14 @@ def check_variable_coverage(ch, pg_cur, target):
 
 
 # ── Judging each value of a variable (pure logic, no I/O) ──────────────────────
-# 1. DORMANT: no data for DORMANT_DAYS+ -> not expected to report any more; excluded from
-#    the alert and from the dead percentage (it was never a failure).
+# 1. DORMANT: no data in the last 12 months (LOOKBACK_DAYS) -> inactive; excluded from the
+#    alert and from the dead percentage (it was never a failure).
 # 2. BATCH: values stuck on (about) the same last date as at least BATCH_MIN_PEERS others,
 #    within BATCH_MAX_DAYS, are loaded together by one pipeline (e.g. retail platforms
 #    delivered once a month with daily dates) - they are in step, not individually late.
 # 3. TABLE STOPPED: when no active value is current, the whole table stopped. The table-level
 #    freshness check already reports that, so no extra per-variable alert.
-DORMANT_DAYS = 180
+DORMANT_DAYS = LOOKBACK_DAYS   # 365: only the last 12 months are judged
 BATCH_MAX_DAYS = 45
 BATCH_MIN_PEERS = 3
 
