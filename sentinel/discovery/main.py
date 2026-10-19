@@ -351,7 +351,7 @@ def pick_event_date(llm_pick, profile, columns, is_static):
 # Business-segment priority by column-name meaning — Platform and Brand first, then the
 # usual reporting dimensions. Anything else keeps the AI's order after these.
 _SEGMENT_PRIORITY = ("platform", "brand", "channel", "marketplace", "region", "store",
-                     "division", "category", "currency")
+                     "division", "currency")
 _SEGMENT_DEMOTE = ("type", "status", "flag", "is_", "mmm")
 
 
@@ -709,6 +709,10 @@ def _is_business_segment_col(col_name, role):
     if lc == "id" or lc.endswith(("_id", "_no", "entryno", "entry_no")) or lc.startswith("doc_"):
         return False
     if _ENTITY_NAME.search(col_name):
+        return False
+    if "categor" in lc:
+        # product/catalog attribute (category, l2_category, ItemCategoryCode...): says WHAT was
+        # sold, not which feed delivered it - never tracked (the check engine skips it too)
         return False
     return True
 

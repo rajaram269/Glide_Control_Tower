@@ -158,7 +158,10 @@ that Control Tower only reads from.
   active value is current the **whole table stopped** and only the table check reports it.
   Variables named like individual entities (campaign, ad group, keyword, portfolio,
   journey, report name, SKU/ASIN/merchant codes) are never tracked or judged - a finished
-  campaign is not a failure.
+  campaign is not a failure. **Product-category columns** (`category`, `l2_category`,
+  `ItemCategoryCode`...) are not judged for freshness either (a category with no sales for a
+  week is normal) and discovery no longer tracks them. **Spelling/case variants of one value**
+  (`BELIF`, `belif`, `Belif`) count as one value, judged by the newest of them.
 - **Per-platform rhythm:** each platform value gets its own expected cadence
   (`variable_values.expected_cadence_weeks`, migration 022) so slow reporters are not
   judged on the daily yardstick.

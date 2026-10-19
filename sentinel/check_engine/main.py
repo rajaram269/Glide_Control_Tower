@@ -317,6 +317,16 @@ def _is_entity_name(name):
     return bool(_ENTITY_NAME.search(name or ""))
 
 
+# Product/catalog ATTRIBUTE columns (category, l2_category, sub-category, ItemCategoryCode...)
+# describe WHAT was sold, not WHICH feed delivered it. A category with no sales for a week is
+# normal business, not a broken feed, so these are never judged for freshness.
+_ATTRIBUTE_NAME = re.compile(r"categor", re.I)
+
+
+def _is_attribute_name(name):
+    return bool(_ATTRIBUTE_NAME.search(name or ""))
+
+
 # ─── 3. Variable coverage ───────────────────────────────────────────────────────
 #
 # For a per-variable target, compare the values seen recently in ClickHouse against
@@ -366,6 +376,17 @@ BATCH_MIN_PEERS = 3
 
 
 def judge_values(value_tolerance, last_seen):
+    # Spelling / case / spacing variants of one value (BELIF, belif, Belif) are ONE value,
+    # judged by the newest of them - otherwise an old spelling that nobody uses any more
+    # reads as a dead brand while the brand itself is alive.
+    groups = {}
+    for v in value_tolerance:
+        groups.setdefault(v.strip().casefold(), []).append(v)
+    tol, seen = {}, {}
+    for variants in groups.values():
+        best = max(variants, key=lambda x: (last_seen.get(x) is not None, last_seen.get(x)))
+        tol[best], seen[best] = value_tolerance[best], last_seen.get(best)
+    value_tolerance, last_seen = tol, seen
     active, inactive = {}, []
     for v in sorted(value_tolerance):
         last = last_seen.get(v)
@@ -404,6 +425,8 @@ def check_variable_freshness(ch, pg_cur, target):
         return "ok", {"note": "table-level target, no variable"}
     if _is_entity_name(variable):
         return "ok", {"note": "entity-like variable (campaign/ad group/code...), not a segment - not checked"}
+    if _is_attribute_name(variable):
+        return "ok", {"note": "product-category attribute, not a data feed - not judged for freshness"}
     edc = target.get("event_date_column")
     if not edc:
         return "ok", {"note": "no business date column — nothing to check per value"}

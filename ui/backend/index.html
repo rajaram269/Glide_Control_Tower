@@ -1067,8 +1067,16 @@ function FreshnessView() {
               <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
           <div class="kv"><div class="kv-label">Event date column (used for Data freshness)</div>
             <div class="mono">${sel.is_static ? '—' : (sel.data_column || sel.picked_event_column || 'none identified')}</div></div>
-          ${(['stale','dead'].includes(sel.data_status) && !['stale','dead'].includes(sel.sync_status)) && html`
-            <div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`}
+          ${(() => {
+            if (!['stale','dead'].includes(sel.data_status) || ['stale','dead'].includes(sel.sync_status)) return null;
+            // the table's OWN date vs the same allowed window the checks use (cadence, never under 3 days)
+            const win = Math.max((Number(sel.expected_cadence_weeks) || 0.1428) * 7, 3);
+            const ageDays = sel.data_last ? (Date.now() - new Date(sel.data_last)) / 86400000 : Infinity;
+            if (ageDays > win) return html`<div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`;
+            const det = Array.isArray(sel.variable_freshness_detail) ? sel.variable_freshness_detail : [];
+            const n = det.reduce((a, d) => a + (d.dead_values || []).length + (d.stale_values || []).length, 0);
+            return html`<div class="callout bad">⚠ The table itself is <b>current</b> (newest ${sel.data_column || 'date'} ${fmt.ago(sel.data_last)}), but <b>${n} value${n === 1 ? '' : 's'}</b> inside it (${det.map(d => d.variable).join(', ')}) have no recent data — see the list below.</div>`;
+          })()}
           ${Array.isArray(sel.variable_freshness_detail) && sel.variable_freshness_detail.length > 0 && html`
             <div class="callout bad" style="margin-top:8px">
               <b>⚠ Specific values with stale/dead data</b> — this is why Data shows ${sel.data_status} even if most of the table looks fine:
