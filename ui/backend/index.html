@@ -1276,7 +1276,9 @@ function CoverageView() {
     <div class="table-scroll"><table>
       <thead><tr>
         <th>Table</th><th>Variable</th><th>Active values</th><th>Retired</th>
-        <th>Last check</th><th>Missing values</th><th>Last seen</th>
+        <th title="Result of the most recent coverage check">Last check</th>
+        <th title="When that check ran (IST)">Checked</th><th>Missing values</th>
+        <th title="When discovery last re-read this variable's list of values (weekly) - not when data arrived">Values refreshed</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => {
@@ -1287,7 +1289,8 @@ function CoverageView() {
             <td style="color:var(--accent)">${r.variable}</td>
             <td>${fmt.num(r.active_values)}</td>
             <td style="color:var(--muted)">${fmt.num(r.retired_values)}</td>
-            <td>${r.last_check_status ? html`<${StatusBadge} status=${r.last_check_status}/>` : '—'}</td>
+            <td>${r.last_check_status ? html`<${StatusBadge} status=${r.last_check_status}/>` : html`<span style="color:var(--faint)" title="Checks run when a variable is due (every 1-4 weeks); a new variable waits for its first run">not yet</span>`}</td>
+            <td style="color:var(--muted);font-size:12px" title=${r.last_check_at ? fmt.ist(r.last_check_at) : ''}>${r.last_check_at ? fmt.ago(r.last_check_at) : '—'}</td>
             <td class="clamp" style="color:var(--medium-fg);font-size:12px" title=${missing.join(', ')}>${missing.length
               ? `${missing.slice(0,5).join(', ')}${missing.length>5?` +${missing.length-5}`:''}`
               : html`<span style="color:var(--faint)">—</span>`}</td>
