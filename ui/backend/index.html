@@ -1169,7 +1169,7 @@ function CatalogView() {
   const [sel, setSel] = useState(null);
   const [q, setQ] = useState('');
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs daily at 06:45 IST.</div>`;
+  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs weekly, Mondays at 06:45 IST.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
   return html`
     <div class="view-head">
