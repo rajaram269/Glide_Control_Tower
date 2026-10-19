@@ -49,9 +49,9 @@ for s in ct-ses-access-key-id ct-ses-secret-access-key ct-ses-region; do
     && echo "  ✓ $s (SES enabled)" || echo "  – $s absent (alerter stays on MS Graph)"
 done
 
-# ── 2. Migrations 011–014 ─────────────────────────────────────────────────
+# ── 2. Migrations 011–023 ─────────────────────────────────────────────────
 echo ""
-echo "[2/6] Applying migrations (011–017, sentinel schema)..."
+echo "[2/6] Applying migrations (011–023, sentinel schema)..."
 PG_CONN=$(gcloud secrets versions access latest --secret=ct-pg-connection-string --project="$PROJECT")
 PG_PW=$(echo "$PG_CONN" | grep -oE '(:)[^:@]+(@)' | head -1 | tr -d ':@')
 
@@ -76,7 +76,8 @@ psql "$LOCAL" -tc "SELECT current_database()" | grep -q control_tower \
   || { echo "ERROR: not connected to control_tower via proxy" >&2; exit 1; }
 for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql \
          migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql \
-         migrations/018_*.sql migrations/019_*.sql migrations/020_*.sql migrations/021_*.sql migrations/022_*.sql; do
+         migrations/018_*.sql migrations/019_*.sql migrations/020_*.sql migrations/021_*.sql migrations/022_*.sql \
+         migrations/023_*.sql; do
   echo "  → $m"
   psql "$LOCAL" -v ON_ERROR_STOP=1 -qf "$m"
 done
@@ -128,25 +129,41 @@ ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest" 3600
 # ── 4. Cloud Scheduler triggers ───────────────────────────────────────────
 echo ""
 echo "[4/6] Creating Cloud Scheduler triggers..."
+# Create, else update in place. Schedulers run in Asia/Kolkata (SCHEDULES.md), so the
+# crons below are IST and --time-zone is always set — an update without it would keep
+# the job's existing zone and silently shift the run time.
 create_schedule() {
   local job=$1 sched=$2 desc=$3
-  gcloud scheduler jobs create http "trigger-${job}" \
-    --location="$REGION" --schedule="$sched" \
+  if gcloud scheduler jobs create http "trigger-${job}" \
+    --location="$REGION" --schedule="$sched" --time-zone="Asia/Kolkata" \
     --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${job}:run" \
     --http-method=POST --oauth-service-account-email="$SA_EMAIL" \
-    --description="$desc" --project="$PROJECT" 2>/dev/null \
-    && echo "  Created trigger-${job} ($sched)" || echo "  trigger-${job} exists"
+    --description="$desc" --project="$PROJECT" 2>/dev/null; then
+    echo "  Created trigger-${job} ($sched IST)"
+  else
+    gcloud scheduler jobs update http "trigger-${job}" \
+      --location="$REGION" --schedule="$sched" --time-zone="Asia/Kolkata" \
+      --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${job}:run" \
+      --http-method=POST --oauth-service-account-email="$SA_EMAIL" \
+      --description="$desc" --project="$PROJECT" --quiet >/dev/null
+    echo "  Updated trigger-${job} ($sched IST)"
+  fi
 }
 # Discovery WEEKLY (steady-state only re-LLMs new/changed tables via the structure_hash
-# gate, so a daily catalog scan is wasteful) → resolver + check DAILY (they act on the
-# catalog + live data). Mon 06:45 IST → resolver 07:10 IST → check tick 07:30 IST.
-create_schedule "ct-sentinel-discovery" "15 1 * * 1" "Sentinel discovery — weekly Mon 06:45 IST"
-create_schedule "ct-sentinel-resolver"  "40 1 * * *" "Sentinel auto-resolver — daily 07:10 IST"
-create_schedule "ct-sentinel-check"     "0 2 * * *"  "Sentinel check tick — daily 07:30 IST"
+# gate, so a daily catalog scan is wasteful) → resolver DAILY → check 3x/day (the first
+# run of each IST day refreshes every freshness verdict; later runs pick up leftovers).
+create_schedule "ct-sentinel-discovery" "45 6 * * 1"        "Sentinel discovery — weekly Mon 06:45 IST"
+create_schedule "ct-sentinel-resolver"  "10 7 * * *"        "Sentinel auto-resolver — daily 07:10 IST"
+create_schedule "ct-sentinel-check"     "30 7,13,19 * * *"  "Sentinel check tick — 07:30/13:30/19:30 IST"
 
 # ── 5. Redeploy UI (Atlas-styled + /api/sentinel/*) ───────────────────────
 echo ""
 echo "[5/6] Redeploying UI..."
+# --set-secrets/--set-env-vars REPLACE the service's whole list, so every secret/env var
+# ct-ui reads must be listed here or the deploy wipes it.
+# TODO: HIKER_API_KEY (Providers-tab Hiker balance check) is also read by ct-ui, but its
+# Secret Manager name is not recorded in this repo — add ",HIKER_API_KEY=<secret>:latest"
+# to --set-secrets below once confirmed, or this deploy removes it from the live service.
 # Optional: enables the dashboard's Run job button when the secret exists (see document.md).
 RUN_TOKEN_SECRET=""
 gcloud secrets describe ct-run-job-token --project="$PROJECT" >/dev/null 2>&1 \
@@ -156,7 +173,8 @@ gcloud run deploy ct-ui \
   --image="gcr.io/${PROJECT}/ct-ui:latest" \
   --region="$REGION" --service-account="$SA_EMAIL" \
   --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
-  --set-secrets="PG_CONN=ct-pg-connection-string:latest${RUN_TOKEN_SECRET}" \
+  --set-secrets="PG_CONN=ct-pg-connection-string:latest,OPENAI_API_KEY=ct-openai-api-key:latest,GEMINI_API_KEY=ct-gemini-api-key:latest${RUN_TOKEN_SECRET}" \
+  --set-env-vars="PROJECT=${PROJECT},REGION=${REGION},SENTINEL_CHECK_JOB=ct-sentinel-check" \
   --allow-unauthenticated --min-instances=1 --max-instances=2 --memory=512Mi \
   --project="$PROJECT" --quiet
 echo "  UI: $(gcloud run services describe ct-ui --region=$REGION --project=$PROJECT --format='value(status.url)' 2>/dev/null)"
