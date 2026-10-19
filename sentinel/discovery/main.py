@@ -104,6 +104,20 @@ def pg_connect():
     return psycopg2.connect(PG_CONN)
 
 
+def _pg_reconnect(pg):
+    """Replace a dropped discovery connection: new session, lock re-acquired."""
+    try:
+        pg.close()
+    except Exception:
+        pass
+    pg = pg_connect()
+    cur = pg.cursor()
+    # Session-scoped lock released automatically when the old session died —
+    # safe to block for it again on the new one.
+    cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+    return pg, cur
+
+
 # Hard per-query ceiling so one slow introspection/stat query can't wedge the run
 # (see check_engine for the failure mode). Discovery already commits per table, so a
 # raised query just skips that table; the next run retries it.
@@ -860,12 +874,16 @@ def infer_value_cadences(ch, db, tbl, col, event_date_column):
         return {}
 
 
-def populate_variable_values(pg_cur, ch, meta, inferred):
+def probe_variable_values(ch, meta, inferred):
+    """ClickHouse half of variable tracking: [(column, values_seen, {value: cadence})].
+    Kept apart from the PG writes so no transaction is held open across these queries —
+    on a slow view they take a minute or more, long enough for the Cloud SQL connection
+    to be dropped mid-transaction (seen in prod), which lost the table on every run."""
     db, tbl = meta["database_name"], meta["table_name"]
     edc = inferred.get("event_date_column")
-    tracked = []
+    probes = []
     for var in (inferred.get("variables") or []):     # already priority-ordered by LLM
-        if len(tracked) >= MAX_TRACKED_VARIABLES:
+        if len(probes) >= MAX_TRACKED_VARIABLES:
             break
         col = var.get("column")
         role = (var.get("role") or "").lower()
@@ -887,9 +905,15 @@ def populate_variable_values(pg_cur, ch, meta, inferred):
             continue
         if not seen_now:
             continue
-        tracked.append(col)
-        value_cadence = infer_value_cadences(ch, db, tbl, col, edc)
+        probes.append((col, seen_now, infer_value_cadences(ch, db, tbl, col, edc)))
+    return probes
 
+
+def populate_variable_values(pg_cur, meta, inferred, probes):
+    db, tbl = meta["database_name"], meta["table_name"]
+    tracked = []
+    for col, seen_now, value_cadence in probes:
+        tracked.append(col)
         for value in seen_now:
             pg_cur.execute(
                 """INSERT INTO sentinel.variable_values
@@ -1198,10 +1222,17 @@ def main():
                      db, tbl, maker, checker, agree, review, conf)
 
             overlay_row = build_overlay_row(meta, columns, inferred, review)
-            # The LLM cascade above can leave the PG connection idle long enough that
-            # Postgres or a network intermediary drops it silently (seen in prod: same
-            # table, same spot, twice in one session) — reconnect and keep going rather
-            # than losing the whole run's remaining tables over one slow table's writes.
+            var_probes = probe_variable_values(ch, meta, inferred)
+            # The LLM cascade and probes above can leave the PG connection idle long
+            # enough that Postgres or a network intermediary drops it silently (seen in
+            # prod: same table, same spot, every run) — check it before writing and
+            # reconnect if it's gone, so the table is written instead of skipped.
+            try:
+                cur.execute("SELECT 1")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                log.warning("PG connection lost before writing %s.%s — reconnecting: %s",
+                            db, tbl, e)
+                pg, cur = _pg_reconnect(pg)
             try:
                 upsert_overlay(cur, overlay_row)
                 # Views are catalogued but NOT monitored. A view stores nothing, so it has
@@ -1211,7 +1242,7 @@ def main():
                 # are monitored on their own. Monitoring both would double-alert one fault.
                 if not viewish:
                     upsert_target(cur, meta, inferred)
-                tracked_vars = populate_variable_values(cur, ch, meta, inferred)
+                tracked_vars = populate_variable_values(cur, meta, inferred, var_probes)
                 # authority (use_instead) is set later in reconcile_authority, so
                 # duplicate-concept rules for this run use the prior authority state;
                 # they converge on the next run — acceptable for observe-stage rules.
@@ -1224,15 +1255,7 @@ def main():
                 log.warning("PG connection lost writing %s.%s (likely idle during the LLM "
                             "calls above) — reconnecting and re-acquiring the lock: %s",
                             db, tbl, e)
-                try:
-                    pg.close()
-                except Exception:
-                    pass
-                pg = pg_connect()
-                cur = pg.cursor()
-                # Session-scoped lock released automatically when the old session died —
-                # safe to block for it again on the new one.
-                cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+                pg, cur = _pg_reconnect(pg)
                 continue
 
         # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
