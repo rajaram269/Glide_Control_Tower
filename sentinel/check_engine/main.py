@@ -28,6 +28,9 @@ CH_PASS = os.environ["CH_PASS"]
 HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "")
 # Lapse 4: let ops force the proven mechanism if system.parts proves unreliable
 FRESHNESS_MECHANISM = os.environ.get("SENTINEL_FRESHNESS", "auto")  # auto|system_parts|max_col
+# Manual scoped run ("db.table", set by the UI Freshness drawer): re-judge only that
+# table's freshness, then exit without the due/heavy phases.
+ONLY_TABLE = os.environ.get("SENTINEL_ONLY_TABLE", "").strip()
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 ADVISORY_LOCK_KEY = 0x53454E43  # "SENC"
@@ -100,17 +103,48 @@ def _parts_freshness(ch, db, table):
     return r[0][0] if r and r[0][0] else None
 
 
-def _maxcol_freshness(ch, db, table, col):
+def _coerce_datetime(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, datetime.date):
+        return datetime.datetime.combine(value, datetime.time.min)
+    return value
+
+
+def _native_datetime_type(ch_type):
+    if not ch_type:
+        return False
+    t = ch_type.replace("Nullable(", "").replace(")", "")
+    return t in ("Date", "Date32") or t.startswith("DateTime")
+
+
+def _maxcol_freshness(ch, db, table, col, ch_type=None):
     """max of a date/datetime column, parsing robustly across formats (String dates
     in DD/MM/YYYY or ISO, Date/DateTime/Date32, epoch strings). Returns tz-aware
     datetime or None. parseDateTimeBestEffortOrNull tolerates the value-format
     variations these ClickHouse tables have (many store dates as String).
+    Native Date/DateTime columns use a direct max(col) — no per-row string parsing.
     Excludes deleted rows (see _live_only_clause) — a tombstone row's date is
     not real data and must never count as "the newest data in this table"."""
     live = _live_only_clause(ch, db, table)
     where = f" WHERE {live}" if live else ""
+    expr = f"max(`{col}`)" if _native_datetime_type(ch_type) \
+        else f"max(parseDateTimeBestEffortOrNull(toString(`{col}`)))"
     res = ch.query(
-        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`{where}"
+        f"SELECT {expr} FROM `{db}`.`{table}`{where}"
+    )
+    r = res.result_rows
+    return _coerce_datetime(r[0][0]) if r and r[0][0] else None
+
+
+def _column_type(ch, db, table, col):
+    res = ch.query(
+        "SELECT type FROM system.columns "
+        "WHERE database = {db:String} AND table = {tbl:String} AND name = {col:String} "
+        "LIMIT 1",
+        parameters={"db": db, "tbl": table, "col": col},
     )
     r = res.result_rows
     return r[0][0] if r and r[0][0] else None
@@ -147,6 +181,55 @@ def _classify(last, tolerance_weeks, min_days=0):
     return "dead", "fail", age_hours
 
 
+def _window_date_column(col):
+    """Common campaign/report window date column names."""
+    if not col:
+        return False
+    n = col.lower().replace(" ", "_")
+    return n in {
+        "start_date", "startdate", "campaign_start_date", "campaign_start",
+        "end_date", "enddate", "campaign_end_date", "campaign_end",
+    }
+
+
+def _ignore_window_date_for_data_freshness(target):
+    """Only sync-only metadata/reference tables ignore start/end window dates.
+
+    Ignoring every start_date/end_date column would hide real data freshness on
+    Hector report/fact tables. If discovery selected business dimensions for a
+    table, treat its event_date_column as a real business date and monitor it.
+    """
+    return _window_date_column(target.get("event_date_column")) and not target.get("has_business_dimensions")
+
+
+def _data_monitoring_exclusion_reason(target):
+    """Tables that should not use business-date freshness.
+
+    They are still sync-monitored through insert/part freshness. This is important
+    for app/cloud-job populated tables that do not have a Sentinel catalog concept:
+    lack of business-date classification should not mean lack of insert monitoring.
+    """
+    table = (target.get("table_name") or "").lower()
+    concept = (target.get("concept") or "").lower()
+    source_type = (target.get("source_type") or "").lower()
+
+    if not target.get("catalog_exists"):
+        return "legacy-only target has no Sentinel catalog classification; sync freshness still applies"
+    if "_resync" in table or table.endswith("_resync"):
+        return "resync/shadow table has no business-date freshness; sync freshness still applies"
+    if any(part in table for part in (
+        "log", "cache", "token", "state", "scheduler", "migration", "backfill",
+        "control_tower", "sync_session", "sync_status",
+    )):
+        return "operational log/cache/state table has no business-date freshness; sync freshness still applies"
+    if source_type == "reference" or concept in {
+        "reference", "authentication", "file uploads", "schema migrations",
+        "data synchronization", "user access control", "access tokens",
+    }:
+        return "reference/config table should not use business-date freshness; sync freshness still applies"
+    return None
+
+
 # Overall status = worst of the checks that apply.
 _RANK = {"ok": 0, "warn": 1, "fail": 2}
 
@@ -172,7 +255,8 @@ def check_freshness(ch, target):
     if sync_last is None and FRESHNESS_MECHANISM in ("auto", "max_col"):
         col = target.get("freshness_column") or "_peerdb_synced_at"
         try:
-            sync_last = _maxcol_freshness(ch, db, table, col); sync_mech = "max_col"
+            sync_type = _column_type(ch, db, table, col)
+            sync_last = _maxcol_freshness(ch, db, table, col, sync_type); sync_mech = "max_col"
         except Exception as e:
             log.warning("max_col freshness failed %s.%s: %s", db, table, e)
 
@@ -197,9 +281,17 @@ def check_freshness(ch, target):
 
     # ── DATA freshness (business date), if the table has one ──
     edc = target.get("event_date_column")
-    if edc:
+    data_excluded = _data_monitoring_exclusion_reason(target)
+    if data_excluded:
+        observed["data"] = {"column": edc, "sub_status": "not_monitored",
+                            "note": data_excluded}
+    elif _ignore_window_date_for_data_freshness(target):
+        observed["data"] = {"column": edc, "sub_status": "ignored",
+                            "note": "sync-only metadata/reference table; window date not used for data freshness"}
+    elif edc:
         try:
-            data_last = _maxcol_freshness(ch, db, table, edc)
+            data_type = _column_type(ch, db, table, edc)
+            data_last = _maxcol_freshness(ch, db, table, edc, data_type)
             dl = data_last
             if dl is not None and dl.tzinfo is None:
                 dl = dl.replace(tzinfo=datetime.timezone.utc)
@@ -665,6 +757,15 @@ def open_or_update_incident(pg_cur, target, check_type, status, observed, check_
     )
     existing = pg_cur.fetchone()
     if existing:
+        # keep the open incident's latest severity/message/result current (no re-fire)
+        severity = SEVERITY.get(status, "warn")
+        message = f"{check_type} {status} on {db}.{table}" + (f" [{variable}]" if variable else "")
+        pg_cur.execute(
+            """UPDATE sentinel.incidents
+               SET severity = %s, message = %s, check_result_id = %s
+               WHERE id = %s""",
+            (severity, message, check_result_id, existing[0]),
+        )
         return existing[0]  # already open — dedup, no re-fire
 
     severity = SEVERITY.get(status, "warn")
@@ -706,24 +807,46 @@ def resolve_incident_if_open(pg_cur, target, check_type):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+# Extra per-target context for check_freshness (window-date ignore + business-date
+# exclusion): whether the table has tracked business dimensions, and its catalog row.
+_TARGET_CONTEXT_COLS = """EXISTS (
+                 SELECT 1 FROM sentinel.monitor_targets v
+                 WHERE v.database_name = t.database_name
+                   AND v.table_name = t.table_name
+                   AND COALESCE(v.variable,'') <> ''
+                   AND v.status = 'active'
+               ) AS has_business_dimensions,
+               c.database_name IS NOT NULL AS catalog_exists,
+               c.concept,
+               c.source_type"""
+_TARGET_CONTEXT_JOIN = """LEFT JOIN sentinel.catalog_overlay c
+               ON c.database_name = t.database_name
+              AND c.table_name = t.table_name
+              AND c.retired = false"""
+
+
+def _target_row(r):
+    return {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
+            "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
+            "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
+            "freshness_column": r[9], "has_business_dimensions": r[10],
+            "catalog_exists": r[11], "concept": r[12], "source_type": r[13]}
+
+
 def due_targets(pg_cur):
-    pg_cur.execute("""
+    pg_cur.execute(f"""
         SELECT t.id, t.database_name, t.table_name, t.variable,
                t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
-               t.is_static, t.event_date_column, w.freshness_column
+               t.is_static, t.event_date_column, w.freshness_column,
+               {_TARGET_CONTEXT_COLS}
         FROM sentinel.monitor_targets t
         LEFT JOIN control_tower.watched_tables w
                ON w.database_name = t.database_name AND w.table_name = t.table_name
+        {_TARGET_CONTEXT_JOIN}
         WHERE t.status = 'active' AND (t.next_due_at IS NULL OR t.next_due_at <= now())
         ORDER BY t.next_due_at NULLS FIRST
     """)
-    return [
-        {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
-         "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
-         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
-         "freshness_column": r[9]}
-        for r in pg_cur.fetchall()
-    ]
+    return [_target_row(r) for r in pg_cur.fetchall()]
 
 
 # Two kinds of check:
@@ -776,7 +899,7 @@ FRESHNESS_REFRESH_BUDGET_SECONDS = int(os.environ.get("SENTINEL_FRESHNESS_BUDGET
 
 
 def freshness_refresh_targets(cur):
-    cur.execute("""
+    cur.execute(f"""
         WITH recent AS (
             SELECT DISTINCT database_name, table_name, COALESCE(variable,'') AS variable, check_type
             FROM sentinel.check_results
@@ -785,25 +908,22 @@ def freshness_refresh_targets(cur):
         )
         SELECT t.id, t.database_name, t.table_name, t.variable,
                t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
-               t.is_static, t.event_date_column, w.freshness_column
+               t.is_static, t.event_date_column, w.freshness_column,
+               {_TARGET_CONTEXT_COLS}
         FROM sentinel.monitor_targets t
         LEFT JOIN control_tower.watched_tables w
                ON w.database_name = t.database_name AND w.table_name = t.table_name
+        {_TARGET_CONTEXT_JOIN}
         LEFT JOIN recent r
                ON r.database_name = t.database_name AND r.table_name = t.table_name
               AND r.variable = t.variable
               AND r.check_type = CASE WHEN t.variable = '' THEN 'freshness' ELSE 'variable_freshness' END
         WHERE t.status = 'active' AND COALESCE(t.is_static, false) = false
           AND (r.database_name IS NULL OR %s)
+          AND (%s = '' OR t.database_name || '.' || t.table_name = %s)
         ORDER BY t.last_checked_at NULLS FIRST, t.id
-    """, (FORCE_REFRESH,))
-    return [
-        {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
-         "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
-         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
-         "freshness_column": r[9]}
-        for r in cur.fetchall()
-    ]
+    """, (FORCE_REFRESH or bool(ONLY_TABLE), ONLY_TABLE, ONLY_TABLE))
+    return [_target_row(r) for r in cur.fetchall()]
 
 
 def refresh_freshness(cur, pg, ch):
@@ -878,10 +998,56 @@ def roll_up_incidents(cur):
     database_name, group them under a synthetic per-database parent so the alert
     bridge/consumer sees one cluster instead of N. Parent carries rolled_up_children."""
     cur.execute("""
+        WITH parents AS (
+          SELECT scope->>'database_name' AS db, min(id) AS keep_id, array_agg(id) AS parent_ids
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND check_type = 'rollup'
+          GROUP BY scope->>'database_name'
+        )
+        UPDATE sentinel.incidents child
+        SET parent_incident_id = parents.keep_id
+        FROM parents
+        WHERE child.resolved_at IS NULL
+          AND child.parent_incident_id = ANY(parents.parent_ids)
+          AND child.parent_incident_id <> parents.keep_id
+    """)
+    cur.execute("""
+        WITH parents AS (
+          SELECT scope->>'database_name' AS db, min(id) AS keep_id
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND check_type = 'rollup'
+          GROUP BY scope->>'database_name'
+        )
+        UPDATE sentinel.incidents child
+        SET parent_incident_id = parents.keep_id
+        FROM parents
+        WHERE child.resolved_at IS NULL
+          AND child.parent_incident_id IS NULL
+          AND child.scope_level = 'table'
+          AND child.check_type <> 'rollup'
+          AND child.scope->>'database_name' = parents.db
+    """)
+    cur.execute("""
+        WITH parents AS (
+          SELECT scope->>'database_name' AS db, min(id) AS keep_id
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND check_type = 'rollup'
+          GROUP BY scope->>'database_name'
+        )
+        UPDATE sentinel.incidents p
+        SET resolved_at = now()
+        FROM parents
+        WHERE p.resolved_at IS NULL
+          AND p.check_type = 'rollup'
+          AND p.scope->>'database_name' = parents.db
+          AND p.id <> parents.keep_id
+    """)
+    cur.execute("""
         SELECT scope->>'database_name' AS db, array_agg(id) AS ids
         FROM sentinel.incidents
         WHERE resolved_at IS NULL AND parent_incident_id IS NULL
           AND scope_level = 'table'
+          AND check_type <> 'rollup'
         GROUP BY scope->>'database_name'
         HAVING count(*) >= 3
     """)
@@ -898,18 +1064,19 @@ def roll_up_incidents(cur):
         )
         existing = cur.fetchone()
         if existing:
-            parent_id, prior = existing[0], existing[1] or 0
+            parent_id = existing[0]
             cur.execute(
                 """UPDATE sentinel.incidents
-                   SET rolled_up_children = %s, message = %s
+                   SET resolved_at = NULL, severity = 'critical',
+                       rolled_up_children = %s, message = %s
                    WHERE id = %s""",
-                (prior + len(ids), f"{prior + len(ids)} open incidents in {db}", parent_id),
+                (len(ids), f"{len(ids)} open incidents in {db}", parent_id),
             )
         else:
             cur.execute(
                 """INSERT INTO sentinel.incidents
                    (opened_at, scope, scope_level, check_type, severity, message, rolled_up_children)
-                   VALUES (now(), %s, 'schema', 'rollup', 'warn', %s, %s)
+                   VALUES (now(), %s, 'schema', 'rollup', 'critical', %s, %s)
                    RETURNING id""",
                 (Json({"database_name": db}), f"{len(ids)} open incidents in {db}", len(ids)),
             )
@@ -918,10 +1085,75 @@ def roll_up_incidents(cur):
             "UPDATE sentinel.incidents SET parent_incident_id = %s WHERE id = ANY(%s)",
             (parent_id, ids),
         )
+    cur.execute("""
+        WITH child AS (
+          SELECT parent_incident_id, count(*) AS n
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND parent_incident_id IS NOT NULL
+          GROUP BY parent_incident_id
+        )
+        UPDATE sentinel.incidents p
+        SET severity = 'critical',
+            rolled_up_children = child.n,
+            message = child.n || ' open incidents in ' || COALESCE(p.scope->>'database_name','unknown')
+        FROM child
+        WHERE p.id = child.parent_incident_id
+          AND child.n >= 3
+    """)
+    cur.execute("""
+        WITH child AS (
+          SELECT parent_incident_id, count(*) AS n
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND parent_incident_id IS NOT NULL
+          GROUP BY parent_incident_id
+        ),
+        retiring AS (
+          SELECT p.id
+          FROM sentinel.incidents p
+          LEFT JOIN child ON child.parent_incident_id = p.id
+          WHERE p.resolved_at IS NULL
+            AND p.check_type = 'rollup'
+            AND COALESCE(child.n, 0) < 3
+        )
+        UPDATE sentinel.incidents child_incident
+        SET parent_incident_id = NULL
+        FROM retiring
+        WHERE child_incident.resolved_at IS NULL
+          AND child_incident.parent_incident_id = retiring.id
+    """)
+    cur.execute("""
+        WITH child AS (
+          SELECT parent_incident_id, count(*) AS n
+          FROM sentinel.incidents
+          WHERE resolved_at IS NULL AND parent_incident_id IS NOT NULL
+          GROUP BY parent_incident_id
+        )
+        UPDATE sentinel.incidents p
+        SET resolved_at = now()
+        FROM child
+        WHERE p.resolved_at IS NULL
+          AND p.check_type = 'rollup'
+          AND p.id = child.parent_incident_id
+          AND child.n < 3
+    """)
+    cur.execute("""
+        UPDATE sentinel.incidents p
+        SET resolved_at = now()
+        WHERE p.resolved_at IS NULL
+          AND p.check_type = 'rollup'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sentinel.incidents child
+            WHERE child.resolved_at IS NULL
+              AND child.parent_incident_id = p.id
+          )
+    """)
 
 
 def main():
     log.info("Sentinel check engine starting @ %s", NOW)
+    if ONLY_TABLE:
+        log.info("Manual scoped freshness run requested for %s", ONLY_TABLE)
     pg = pg_connect()
     ch = ch_connect()
     ran = 0
@@ -931,6 +1163,15 @@ def main():
             cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
             if not cur.fetchone()[0]:
                 log.warning("Another check run holds the lock. Exiting.")
+                return
+
+            if ONLY_TABLE:
+                # Manual scoped run (UI "Run freshness check"): re-judge this table's
+                # freshness (table + its variables) only; skip due/heavy phases.
+                ran = refresh_freshness(cur, pg, ch)
+                cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+                pg.commit()
+                log.info("Manual scoped freshness run committed. Ran %d targets.", ran)
                 return
 
             targets = due_targets(cur)
