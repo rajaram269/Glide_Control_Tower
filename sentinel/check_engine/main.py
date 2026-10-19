@@ -13,7 +13,7 @@ Checks (DATA_MONITOR_SPEC §8 / SENTINEL_BUILD_SPEC §5-6):
  4 schema_drift — columns vs stored structure_hash
  5 reconciliation — deduped metric compare; dedup ON
 """
-import os, json, hashlib, logging, datetime
+import os, re, json, hashlib, logging, datetime
 import psycopg2
 from psycopg2.extras import execute_values, Json
 import clickhouse_connect
@@ -63,6 +63,32 @@ def ch_connect():
 
 # ─── 1. Freshness ──────────────────────────────────────────────────────────────
 
+_live_filter_cache = {}
+
+
+def _live_only_clause(ch, db, table):
+    """WHERE fragment excluding PeerDB tombstone rows (_peerdb_is_deleted=1),
+    for whichever database/table actually has that column — a deleted row is
+    never real data, regardless of which table it's on. None if the table
+    doesn't have this column at all (e.g. a non-CDC/manually-added table).
+    Cached per (db, table) for this run so repeated calls for the same table
+    don't re-check column existence each time."""
+    key = (db, table)
+    if key in _live_filter_cache:
+        return _live_filter_cache[key]
+    try:
+        r = ch.query(
+            "SELECT count() FROM system.columns WHERE database={db:String} "
+            "AND table={tbl:String} AND name='_peerdb_is_deleted'",
+            parameters={"db": db, "tbl": table},
+        )
+        result = "`_peerdb_is_deleted` = 0" if r.result_rows[0][0] else None
+    except Exception:
+        result = None
+    _live_filter_cache[key] = result
+    return result
+
+
 def _parts_freshness(ch, db, table):
     """Cheap metadata read — no data scan. Returns latest modification_time or None."""
     res = ch.query(
@@ -78,15 +104,33 @@ def _maxcol_freshness(ch, db, table, col):
     """max of a date/datetime column, parsing robustly across formats (String dates
     in DD/MM/YYYY or ISO, Date/DateTime/Date32, epoch strings). Returns tz-aware
     datetime or None. parseDateTimeBestEffortOrNull tolerates the value-format
-    variations these ClickHouse tables have (many store dates as String)."""
+    variations these ClickHouse tables have (many store dates as String).
+    Excludes deleted rows (see _live_only_clause) — a tombstone row's date is
+    not real data and must never count as "the newest data in this table"."""
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
     res = ch.query(
-        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`"
+        f"SELECT max(parseDateTimeBestEffortOrNull(toString(`{col}`))) FROM `{db}`.`{table}`{where}"
     )
     r = res.result_rows
     return r[0][0] if r and r[0][0] else None
 
 
-def _classify(last, tolerance_weeks):
+# Business dates (SalesDate etc.) are date-only and many channels report with a lag
+# (on the 12th you may only have data up to the 9th). So Data freshness never judges
+# on less than this many days, whatever the table's expected interval (a "daily" table
+# is Fresh up to 3 days, Stale up to 9, Dead after). Sync (pipeline) stays strict.
+DATA_MIN_DAYS = 3
+# Sync (pipeline) freshness gets the same 3-day minimum: nothing is called stale or dead
+# until it is more than 3 days late.
+SYNC_MIN_DAYS = 3
+# Only the last 12 months are ever judged. A table - or a platform/brand inside one - with
+# no data in that window is INACTIVE (shown, never alerted), not dead: old, gone customers
+# and channels would otherwise read dead forever.
+LOOKBACK_DAYS = 365
+
+
+def _classify(last, tolerance_weeks, min_days=0):
     """(sub_status, status, age_hours) for a timestamp vs a tolerance. last=None → dead."""
     if last is None:
         return "dead", "fail", None
@@ -94,7 +138,8 @@ def _classify(last, tolerance_weeks):
         last = last.replace(tzinfo=datetime.timezone.utc)
     age = NOW - last
     age_hours = round(age.total_seconds() / 3600, 1)
-    limit = datetime.timedelta(weeks=float(tolerance_weeks))
+    limit = max(datetime.timedelta(weeks=float(tolerance_weeks)),
+                datetime.timedelta(days=min_days))
     if age <= limit:
         return "fresh", "ok", age_hours
     if age <= limit * 3:
@@ -137,7 +182,7 @@ def check_freshness(ch, target):
                       "sync_last_write": sync_last.isoformat() if sync_last else None,
                       "mechanism": sync_mech}
 
-    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks)
+    sync_sub, sync_status, sync_age = _classify(sync_last, tolerance_weeks, SYNC_MIN_DAYS)
 
     observed = {
         "sub_status": sync_sub,          # back-compat: top-level = sync verdict
@@ -155,14 +200,24 @@ def check_freshness(ch, target):
     if edc:
         try:
             data_last = _maxcol_freshness(ch, db, table, edc)
-            data_sub, data_status, data_age = _classify(data_last, tolerance_weeks)
-            observed["data"] = {"column": edc, "sub_status": data_sub,
-                                "max_event_date": data_last.isoformat() if data_last else None,
-                                "age_hours": data_age}
-            # a table can be synced-fresh but data-stale (May data in July) — flag it
-            if _RANK[data_status] > _RANK[overall]:
-                overall = data_status
-            observed["sub_status"] = _worst_sub(sync_sub, data_sub)
+            dl = data_last
+            if dl is not None and dl.tzinfo is None:
+                dl = dl.replace(tzinfo=datetime.timezone.utc)
+            if dl is None or (NOW - dl).total_seconds() > LOOKBACK_DAYS * 86400:
+                # nothing in the last 12 months -> not judged (never dead, never an alert)
+                observed["data"] = {"column": edc, "sub_status": "inactive",
+                                    "max_event_date": data_last.isoformat() if data_last else None,
+                                    "age_hours": None,
+                                    "note": f"no data in the last {LOOKBACK_DAYS} days - not judged"}
+            else:
+                data_sub, data_status, data_age = _classify(data_last, tolerance_weeks, DATA_MIN_DAYS)
+                observed["data"] = {"column": edc, "sub_status": data_sub,
+                                    "max_event_date": data_last.isoformat() if data_last else None,
+                                    "age_hours": data_age}
+                # a table can be synced-fresh but data-stale (May data in July) — flag it
+                if _RANK[data_status] > _RANK[overall]:
+                    overall = data_status
+                observed["sub_status"] = _worst_sub(sync_sub, data_sub)
         except Exception as e:
             observed["data"] = {"column": edc, "error": str(e)}
     else:
@@ -249,6 +304,29 @@ def check_schema_drift(ch, pg_cur, target):
     return "ok", {"drift": False}
 
 
+# Variables whose values are individual entities that come and go (a campaign ends, a
+# keyword is dropped, a SKU is delisted), not stable business segments. A finished campaign
+# is not a failure, so per-value freshness/coverage is not judged on them. (Same pattern as
+# sentinel/discovery/main.py, which also stops tracking them.)
+_ENTITY_NAME = re.compile(
+    r"(campaign|ad[ _]?group|keyword|search[ _]?term|portfolio|journey|report[ _]?name|creative)"
+    r"|((^|[ _])(sku|asin|mat|listing|merchant)([ _]?(code|id|no))?$)", re.I)
+
+
+def _is_entity_name(name):
+    return bool(_ENTITY_NAME.search(name or ""))
+
+
+# Product/catalog ATTRIBUTE columns (category, l2_category, sub-category, ItemCategoryCode...)
+# describe WHAT was sold, not WHICH feed delivered it. A category with no sales for a week is
+# normal business, not a broken feed, so these are never judged for freshness.
+_ATTRIBUTE_NAME = re.compile(r"categor", re.I)
+
+
+def _is_attribute_name(name):
+    return bool(_ATTRIBUTE_NAME.search(name or ""))
+
+
 # ─── 3. Variable coverage ───────────────────────────────────────────────────────
 #
 # For a per-variable target, compare the values seen recently in ClickHouse against
@@ -259,6 +337,8 @@ def check_variable_coverage(ch, pg_cur, target):
     db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
     if not variable:
         return "ok", {"note": "table-level target, no variable"}
+    if _is_entity_name(variable):
+        return "ok", {"note": "entity-like variable (campaign/ad group/code...), not a segment - not checked"}
     pg_cur.execute(
         """SELECT value FROM sentinel.variable_values
            WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
@@ -268,7 +348,9 @@ def check_variable_coverage(ch, pg_cur, target):
     if not expected:
         return "ok", {"note": "no active values tracked yet"}
     try:
-        res = ch.query(f"SELECT DISTINCT toString(`{variable}`) FROM `{db}`.`{table}`")
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        res = ch.query(f"SELECT DISTINCT toString(`{variable}`) FROM `{db}`.`{table}`{where}")
         present = {r[0] for r in res.result_rows}
     except Exception as e:
         return "warn", {"error": str(e)}
@@ -278,6 +360,123 @@ def check_variable_coverage(ch, pg_cur, target):
         return status, {"missing_values": missing[:50], "missing_count": len(missing),
                         "expected_count": len(expected)}
     return "ok", {"expected_count": len(expected), "missing_count": 0}
+
+
+# ── Judging each value of a variable (pure logic, no I/O) ──────────────────────
+# 1. DORMANT: no data in the last 12 months (LOOKBACK_DAYS) -> inactive; excluded from the
+#    alert and from the dead percentage (it was never a failure).
+# 2. BATCH: values stuck on (about) the same last date as at least BATCH_MIN_PEERS others,
+#    within BATCH_MAX_DAYS, are loaded together by one pipeline (e.g. retail platforms
+#    delivered once a month with daily dates) - they are in step, not individually late.
+# 3. TABLE STOPPED: when no active value is current, the whole table stopped. The table-level
+#    freshness check already reports that, so no extra per-variable alert.
+DORMANT_DAYS = LOOKBACK_DAYS   # 365: only the last 12 months are judged
+BATCH_MAX_DAYS = 45
+BATCH_MIN_PEERS = 3
+
+
+def judge_values(value_tolerance, last_seen):
+    # Spelling / case / spacing variants of one value (BELIF, belif, Belif) are ONE value,
+    # judged by the newest of them - otherwise an old spelling that nobody uses any more
+    # reads as a dead brand while the brand itself is alive.
+    groups = {}
+    for v in value_tolerance:
+        groups.setdefault(v.strip().casefold(), []).append(v)
+    tol, seen = {}, {}
+    for variants in groups.values():
+        best = max(variants, key=lambda x: (last_seen.get(x) is not None, last_seen.get(x)))
+        tol[best], seen[best] = value_tolerance[best], last_seen.get(best)
+    value_tolerance, last_seen = tol, seen
+    active, inactive = {}, []
+    for v in sorted(value_tolerance):
+        last = last_seen.get(v)
+        _, st, age_h = _classify(last, value_tolerance[v], DATA_MIN_DAYS)
+        age_d = None if age_h is None else age_h / 24.0
+        if age_d is None or age_d > DORMANT_DAYS:
+            inactive.append(v)
+            continue
+        active[v] = {"st": st, "age": age_d, "day": last.date() if hasattr(last, "date") else last}
+    in_batch = []
+    for v, a in active.items():
+        if a["st"] == "ok" or a["age"] > BATCH_MAX_DAYS:
+            continue
+        if sum(1 for b in active.values() if abs((b["day"] - a["day"]).days) <= 1) >= BATCH_MIN_PEERS:
+            in_batch.append(v)
+    for v in in_batch:
+        active[v]["st"] = "ok"
+    return {
+        "active": len(active), "inactive": inactive, "in_batch": sorted(in_batch),
+        "table_stopped": bool(active) and all(a["st"] != "ok" for a in active.values()),
+        "stale": sorted(v for v, a in active.items() if a["st"] == "warn"),
+        "dead": sorted(v for v, a in active.items() if a["st"] == "fail"),
+    }
+
+
+# Per-value freshness — coverage (above) only asks "does this value exist anywhere in
+# the table." It misses a segment whose feed died while other segments keep the table
+# looking fresh overall (e.g. one of 40 platforms stops syncing; Base still gets daily
+# writes from the other 39). This asks "is each value's OWN data still current."
+# One GROUP BY query gets every value's last business date in a single pass — cost is
+# one query per tracked variable per table, not one per value. One alert per variable,
+# listing affected values, keeps volume bounded regardless of how many values exist.
+def check_variable_freshness(ch, pg_cur, target):
+    db, table, variable = target["database_name"], target["table_name"], target.get("variable", "")
+    if not variable:
+        return "ok", {"note": "table-level target, no variable"}
+    if _is_entity_name(variable):
+        return "ok", {"note": "entity-like variable (campaign/ad group/code...), not a segment - not checked"}
+    if _is_attribute_name(variable):
+        return "ok", {"note": "product-category attribute, not a data feed - not judged for freshness"}
+    edc = target.get("event_date_column")
+    if not edc:
+        return "ok", {"note": "no business date column — nothing to check per value"}
+    default_tolerance = target.get("expected_cadence_weeks") or target["monitor_frequency_weeks"]
+
+    pg_cur.execute(
+        """SELECT value, expected_cadence_weeks FROM sentinel.variable_values
+           WHERE database_name = %s AND table_name = %s AND variable = %s AND lifecycle = 'active'""",
+        (db, table, variable),
+    )
+    # Each value's own inferred cadence (discovery) when there's enough history for one,
+    # else the variable/table default — a value that genuinely reports slower than the
+    # table's norm (an offline channel vs. a live marketplace) gets judged against its
+    # own real pattern instead of being flagged dead on everyone else's yardstick.
+    value_tolerance = {r[0]: (r[1] if r[1] else default_tolerance) for r in pg_cur.fetchall()}
+    expected = set(value_tolerance)
+    if not expected:
+        return "ok", {"note": "no active values tracked yet"}
+
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
+    try:
+        res = ch.query(
+            f"SELECT toString(`{variable}`), "
+            f"max(parseDateTimeBestEffortOrNull(toString(`{edc}`))) "
+            f"FROM `{db}`.`{table}`{where} GROUP BY toString(`{variable}`)"
+        )
+        last_seen = {r[0]: r[1] for r in res.result_rows}
+    except Exception as e:
+        return "warn", {"error": str(e)}
+
+    j = judge_values(value_tolerance, last_seen)
+    stale, dead, n = j["stale"], j["dead"], j["active"]
+    info = {"expected_count": n, "inactive_count": len(j["inactive"]), "in_batch_count": len(j["in_batch"])}
+    if not n:
+        return "ok", {**info, "note": f"all tracked values dormant (no data for {DORMANT_DAYS}+ days)"}
+    if j["table_stopped"]:
+        return "ok", {**info, "note": "no value is current - the whole table stopped; reported by the table freshness check"}
+    affected = len(stale) + len(dead)
+    if not affected:
+        return "ok", {**info, "stale_count": 0, "dead_count": 0}
+
+    affected_pct = affected / n * 100.0
+    status = "fail" if (dead and affected_pct >= 20) or affected_pct >= 50 else "warn"
+    return status, {
+        **info,
+        "stale_values": stale[:50], "stale_count": len(stale),
+        "dead_values": dead[:50], "dead_count": len(dead),
+        "affected_pct": round(affected_pct, 1),
+    }
 
 
 # ─── 5. Cross-table reconciliation (dedup ON) ────────────────────────────────────
@@ -335,7 +534,11 @@ def _deduped_count(ch, ref, dedup):
             inner = f"SELECT DISTINCT {keys} FROM `{db}`.`{table}`"
         sql = f"SELECT count() FROM ({inner})"
     else:
-        sql = f"SELECT count() FROM `{db}`.`{table}`"
+        # No dedup key configured for this table — still exclude deleted rows
+        # when the column exists, rather than counting tombstones as real data.
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        sql = f"SELECT count() FROM `{db}`.`{table}`{where}"
     return float(ch.query(sql).result_rows[0][0] or 0)
 
 
@@ -353,7 +556,10 @@ def _deduped_sum(ch, ref, dedup):
                f"FROM `{db}`.`{table}` GROUP BY {keys} "
                f"HAVING argMax(`{dedup['delete']}`, `{dedup['version']}`) = 0)")
     else:
-        sql = f"SELECT sum({q}) FROM `{db}`.`{table}`"
+        # No dedup key configured — still exclude deleted rows when present.
+        live = _live_only_clause(ch, db, table)
+        where = f" WHERE {live}" if live else ""
+        sql = f"SELECT sum({q}) FROM `{db}`.`{table}`{where}"
     return float(ch.query(sql).result_rows[0][0] or 0)
 
 
@@ -535,6 +741,7 @@ TABLE_CHECKS = [
 ]
 VARIABLE_CHECKS = [
     ("variable_coverage", check_variable_coverage),
+    ("variable_freshness", check_variable_freshness),
 ]
 
 
@@ -552,6 +759,69 @@ def _run_checks(cur, ch, target, checks):
             open_or_update_incident(cur, target, check_type, status, observed, crid)
         else:
             resolve_incident_if_open(cur, target, check_type)
+
+
+# ── Daily freshness refresh ─────────────────────────────────────────────────────
+# A target is only "due" every monitor_frequency_weeks (1-4 weeks), so a freshness verdict
+# could be weeks old: a table that stopped updating right after its check still read
+# "fresh". Freshness is cheap (system.parts + one max()/GROUP BY), so it is refreshed for
+# EVERY active target that has not been refreshed yet today (IST calendar day), i.e. the
+# first run each day (07:30 IST) refreshes everything, independent of the weekly cadence. Volume / schema drift / coverage / reconciliation stay on their own
+# schedule. A time budget keeps one tick bounded; what is left is picked up next tick
+# (the stalest verdicts are the ones still missing, so progress is guaranteed).
+# SENTINEL_FORCE_REFRESH=1 (set on a single manual execution) re-judges every target even if it
+# was already refreshed today - used after a change to the judging rules.
+FORCE_REFRESH = os.environ.get("SENTINEL_FORCE_REFRESH", "") == "1"
+FRESHNESS_REFRESH_BUDGET_SECONDS = int(os.environ.get("SENTINEL_FRESHNESS_BUDGET_SECONDS", "1500"))
+
+
+def freshness_refresh_targets(cur):
+    cur.execute("""
+        WITH recent AS (
+            SELECT DISTINCT database_name, table_name, COALESCE(variable,'') AS variable, check_type
+            FROM sentinel.check_results
+            WHERE check_type IN ('freshness', 'variable_freshness')
+              AND run_ts >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')
+        )
+        SELECT t.id, t.database_name, t.table_name, t.variable,
+               t.monitor_frequency_weeks, t.expected_cadence_weeks, t.cheap_source,
+               t.is_static, t.event_date_column, w.freshness_column
+        FROM sentinel.monitor_targets t
+        LEFT JOIN control_tower.watched_tables w
+               ON w.database_name = t.database_name AND w.table_name = t.table_name
+        LEFT JOIN recent r
+               ON r.database_name = t.database_name AND r.table_name = t.table_name
+              AND r.variable = t.variable
+              AND r.check_type = CASE WHEN t.variable = '' THEN 'freshness' ELSE 'variable_freshness' END
+        WHERE t.status = 'active' AND COALESCE(t.is_static, false) = false
+          AND (r.database_name IS NULL OR %s)
+        ORDER BY t.last_checked_at NULLS FIRST, t.id
+    """, (FORCE_REFRESH,))
+    return [
+        {"id": r[0], "database_name": r[1], "table_name": r[2], "variable": r[3],
+         "monitor_frequency_weeks": r[4], "expected_cadence_weeks": r[5],
+         "cheap_source": r[6], "is_static": r[7], "event_date_column": r[8],
+         "freshness_column": r[9]}
+        for r in cur.fetchall()
+    ]
+
+
+def refresh_freshness(cur, pg, ch):
+    start = datetime.datetime.now(datetime.timezone.utc)
+    todo = freshness_refresh_targets(cur)
+    log.info("%d targets need a daily freshness refresh", len(todo))
+    done = 0
+    for target in todo:
+        if (datetime.datetime.now(datetime.timezone.utc) - start).total_seconds() > FRESHNESS_REFRESH_BUDGET_SECONDS:
+            log.info("Freshness refresh budget reached (%d done); rest next tick.", done)
+            break
+        if target["variable"]:
+            _run_checks(cur, ch, target, [("variable_freshness", check_variable_freshness)])
+        else:
+            _run_checks(cur, ch, target, [("freshness", lambda ch_, cur_, t: check_freshness(ch_, t))])
+        pg.commit()   # per-target, same as phase 1
+        done += 1
+    return done
 
 
 def run_table_checks(cur, ch, target):
@@ -688,6 +958,16 @@ def main():
                 )
                 ran += 1
                 pg.commit()   # per-target: live + timeout-safe (lock survives commits)
+
+            # ── PHASE 1b: daily freshness refresh (see freshness_refresh_targets) ──
+            # Isolated: a problem here must never block reconciliation or the unlock below.
+            try:
+                refreshed = refresh_freshness(cur, pg, ch)
+            except Exception as e:
+                pg.rollback()
+                refreshed = 0
+                log.error("Daily freshness refresh failed (continuing): %s", e)
+            ran += refreshed
 
             # ── PHASE 2: reconciliation (expensive) ──
             # Recon sums/counts whole tables in ClickHouse (dedup'd), sometimes dozens of

@@ -10,7 +10,7 @@ Steps (DATA_MONITOR_SPEC §10 / SENTINEL_BUILD_SPEC §3):
  5 PII-safe sample  6 LLM pass (llm.py)  7 authority+conflict (I1-I4)
  8 drift/dropped  9 monitor_targets  10 reconciliation_rules  11 write  12 lock release
 """
-import os, json, hashlib, logging, datetime
+import os, re, json, hashlib, logging, datetime
 import psycopg2
 from psycopg2.extras import execute_values, Json
 import clickhouse_connect
@@ -36,8 +36,17 @@ ADVISORY_LOCK_KEY = 0x53454E54  # "SENT"
 MAX_TABLES_PER_RUN = int(os.environ.get("SENTINEL_MAX_TABLES_PER_RUN", "80"))
 
 # PII-safe sampling caps (§10.3)
-MAX_DISTINCT = 50
+MAX_DISTINCT = 65    # was 50, briefly 150, briefly 55 — 150 counted a table's entire
+                     # history (dead platforms/customers included), which is why it had
+                     # to go that high. Cardinality is now scoped to the last 1 year
+                     # (see _segment_cardinality), but 55 was still too tight: confirmed
+                     # in prod that Holistique_Base's Platform genuinely has 58 active
+                     # values within the last year — real data, not noise — so 55
+                     # wrongly excluded it. 65 gives real dimensions like this headroom
+                     # while still rejecting true identifiers (seen: 1,830 / 17,908).
 MAX_STR_LEN = 64
+# Bump when the classification logic improves: every table is re-classified once.
+CLASSIFIER_VERSION = "3"    # + per-value cadence inference (infer_value_cadences)
 # Never sample raw row values from these databases — schema + stats only (R5)
 PII_DATABASES = {"recruitment_hr"}
 
@@ -62,8 +71,51 @@ def source_type_heuristic(db, table):
     return None
 
 
+# Deterministic event_date_column fallback — the LLM's prompt already explains this
+# field well, but it still misses obvious cases (seen in prod: Holistique_Base has a
+# plain SalesDate column and the LLM said null). Only fires when the LLM said null
+# (never overrides an explicit LLM pick) and never on a table the LLM already judged
+# static (a lookup table can have an effective_date column and correctly have no
+# business event date). Unambiguous name matches only — two+ "*Date" columns means
+# we don't know which one is "the" business date, so it stays null rather than guess.
+# Priority order (first listed present column wins): the date a sale/transaction
+# actually happened, before order/document stage dates, before fulfilment dates.
+_EVENT_DATE_NAMES = (
+    "salesdate", "postingdate", "invoicedate", "transactiondate", "orderdate",
+    "documentdate", "billdate", "eventdate", "shipdate", "deliverydate",
+)
+_NON_EVENT_DATE_PREFIXES = ("_peerdb", "created", "updated", "modified", "synced", "inserted")
+
+
+def event_date_column_heuristic(columns, is_static):
+    if is_static:
+        return None
+    names = [c["name"] for c in columns]
+    by_lower = {n.lower(): n for n in names}
+    for pref in _EVENT_DATE_NAMES:
+        if pref in by_lower:
+            return by_lower[pref]
+    date_like = [n for n in names if n.lower().endswith("date")
+                 and not n.lower().startswith(_NON_EVENT_DATE_PREFIXES)]
+    return date_like[0] if len(date_like) == 1 else None
+
+
 def pg_connect():
     return psycopg2.connect(PG_CONN)
+
+
+def _pg_reconnect(pg):
+    """Replace a dropped discovery connection: new session, lock re-acquired."""
+    try:
+        pg.close()
+    except Exception:
+        pass
+    pg = pg_connect()
+    cur = pg.cursor()
+    # Session-scoped lock released automatically when the old session died —
+    # safe to block for it again on the new one.
+    cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+    return pg, cur
 
 
 # Hard per-query ceiling so one slow introspection/stat query can't wedge the run
@@ -83,20 +135,38 @@ def ch_connect():
 # ─── 2. Enumerate ─────────────────────────────────────────────────────────────
 # Same universe the legacy collector uses (gcp_collector auto_discover_watched_tables):
 # skip raw-mirror staging, backups, and system databases.
+#
+# Plain Views ARE catalogued: they are the curated, business-facing interface over the
+# raw tables and are what consumers should query. Excluded engine classes:
+#   MaterializedView — an MV is a trigger, not a dataset; its rows live in a separate
+#     target table (.inner.* or an explicit TO table) which enumeration picks up on its
+#     own. Cataloguing both would double-count one dataset as two competing sources.
+#   LiveView / WindowView — experimental, stateful, not a stable catalog subject.
+
+_VIEW_ENGINES = ("View",)   # plain view only (MaterializedView is excluded at the query)
+
+
+def is_view(meta):
+    return (meta.get("engine") or "") in _VIEW_ENGINES
+
 
 def enumerate_tables(ch):
     result = ch.query("""
-        SELECT database, name, engine, sorting_key, total_rows
+        SELECT database, name, engine, sorting_key, total_rows, create_table_query
         FROM system.tables
         WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema', 'default')
           AND name NOT LIKE '\\_peerdb\\_raw\\_mirror%'
           AND name NOT LIKE '%\\_backup\\_2%'
-          AND engine NOT LIKE '%View%'
+          AND engine NOT IN ('MaterializedView', 'LiveView', 'WindowView')
         ORDER BY database, name
     """)
     return [
         {"database_name": r[0], "table_name": r[1], "engine": r[2],
-         "sorting_key": r[3], "total_rows": r[4]}
+         "sorting_key": r[3], "total_rows": r[4],
+         # Only meaningful for views — the SELECT that defines them. For a plain table
+         # this is the CREATE TABLE DDL, which adds nothing over the column list, so it
+         # is carried only for views (see the payload build in main()).
+         "create_query": r[5]}
         for r in result.result_rows
     ]
 
@@ -130,11 +200,24 @@ def _is_sampleable(col):
     return False
 
 
-def pii_safe_samples(ch, db, table, columns):
+def pii_safe_samples(ch, db, table, columns, event_date_column=None):
     """Return {column: [distinct values]} for low-cardinality columns only.
-    Never touches PII databases (schema+stats only there)."""
+    Never touches PII databases (schema+stats only there).
+
+    Scoped to the last 1 year when a business date is already known from a prior
+    run — without this, a borderline column (seen in prod: Platform, 74 distinct
+    all-time vs. 58 within the last year) can exceed MAX_DISTINCT on full history
+    and get silently dropped from here entirely. That left the AI deciding whether
+    it's a "segment" from the column NAME ALONE, with zero real values to look at —
+    the actual reason its answer kept flip-flopping between runs. A brand-new table
+    with no known event date yet falls back to full-history sampling, same as before."""
     if db in PII_DATABASES:
         return {}
+    date_clause = ""
+    if event_date_column:
+        date_clause = (
+            f" AND parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+            f">= today() - INTERVAL 1 YEAR")
     samples = {}
     for col in columns:
         if not _is_sampleable(col):
@@ -146,7 +229,7 @@ def pii_safe_samples(ch, db, table, columns):
             # column false-flags as "all values missing" (caught in real E2E).
             res = ch.query(
                 f"SELECT DISTINCT toString(`{col['name']}`) AS v FROM `{db}`.`{table}` "
-                f"WHERE length(toString(`{col['name']}`)) <= {MAX_STR_LEN} "
+                f"WHERE length(toString(`{col['name']}`)) <= {MAX_STR_LEN}{date_clause} "
                 f"LIMIT {MAX_DISTINCT + 1}"
             )
             vals = [r[0] for r in res.result_rows]
@@ -214,17 +297,167 @@ def measure_stats(ch, db, table, columns):
     return stats
 
 
+# ─── Date + segment evidence (one-time classification) ────────────────────────
+#
+# The AI used to see column NAMES and samples of LowCardinality/Enum columns only, so a
+# plain String Platform/Brand column got judged by name alone and a date column had no
+# evidence at all. These two profiles give it real facts, and let the code verify its
+# answers: a date must actually hold recent, non-future values; a segment must show
+# real recurring values.
+
+_DATE_TYPE_HINTS = ("Date",)   # matches Date, Date32, DateTime, DateTime64
+_DATE_NAME_HINTS = ("date", "time", "day", "month", "period")
+MAX_DATE_CANDIDATES = 12
+MAX_SEGMENT_CANDIDATES = 40
+_SEGMENT_TYPE_HINTS = ("String", "LowCardinality", "Enum")
+
+
+def _is_cdc_name(name):
+    return name.lower().startswith(("_peerdb", "_sign", "_version", "_ver", "__"))
+
+
+def _date_candidates(columns):
+    out = []
+    for c in columns:
+        if _is_cdc_name(c["name"]):
+            continue
+        if (any(h in c["type"] for h in _DATE_TYPE_HINTS)
+                or any(h in c["name"].lower() for h in _DATE_NAME_HINTS)):
+            out.append(c["name"])
+    return out[:MAX_DATE_CANDIDATES]
+
+
+def date_profile(ch, db, table, columns):
+    """{column: {min, max, nonnull, future, active_days_90}} per candidate date column.
+    Aggregates only (no row values). Skips PII databases."""
+    if db in PII_DATABASES:
+        return {}
+    live = _live_only_clause(ch, db, table)
+    where = f" WHERE {live}" if live else ""
+    prof = {}
+    for col in _date_candidates(columns):
+        try:
+            res = ch.query(
+                f"SELECT min(d), max(d), count(d), countIf(d > now() + INTERVAL 1 DAY), "
+                f"uniqIf(toDate(d), d >= now() - INTERVAL 90 DAY) FROM "
+                f"(SELECT parseDateTimeBestEffortOrNull(toString(`{col}`)) AS d "
+                f"FROM `{db}`.`{table}`{where})"
+            )
+            mn, mx, nn, fut, days = res.result_rows[0]
+            if nn:
+                prof[col] = {"min": str(mn)[:10], "max": str(mx)[:10], "nonnull": int(nn),
+                             "future": int(fut or 0), "active_days_90": int(days or 0)}
+        except Exception as e:
+            log.warning("date profile failed %s.%s.%s: %s", db, table, col, e)
+    return prof
+
+
+def _valid_date(p):
+    """A usable business date: real values, not epoch junk, not mostly future-dated."""
+    return bool(p and p["nonnull"] > 0 and p["max"] >= "2000-01-01"
+                and p["future"] / p["nonnull"] < 0.5)
+
+
+def pick_event_date(llm_pick, profile, columns, is_static):
+    """Final event date column. Trusts the AI's pick when the data backs it up; when the
+    AI said null or picked a bad column, falls back to name-priority among columns whose
+    data is genuinely valid. Static tables never get one."""
+    if is_static:
+        return None
+    colset = {c["name"] for c in columns}
+    if llm_pick and llm_pick in colset and not _is_cdc_name(llm_pick):
+        # not profiled (query failed / not a candidate) → no evidence against it, trust it
+        if llm_pick not in profile or _valid_date(profile[llm_pick]):
+            return llm_pick
+        log.info("AI event date %r rejected (no valid recent data)", llm_pick)
+    valid = {n: p for n, p in profile.items()
+             if _valid_date(p) and not n.lower().startswith(_NON_EVENT_DATE_PREFIXES)}
+    by_lower = {n.lower(): n for n in valid}
+    for pref in _EVENT_DATE_NAMES:
+        if pref in by_lower:
+            return by_lower[pref]
+    heur = event_date_column_heuristic(columns, False)
+    return heur if heur in valid else None
+
+
+# Business-segment priority by column-name meaning — Platform and Brand first, then the
+# usual reporting dimensions. Anything else keeps the AI's order after these.
+_SEGMENT_PRIORITY = ("platform", "brand", "channel", "marketplace", "region", "store",
+                     "division", "currency")
+_SEGMENT_DEMOTE = ("type", "status", "flag", "is_", "mmm")
+
+
+def segment_profile(ch, db, table, columns, event_date_column=None):
+    """{column: {distinct, top_values}} for categorical-looking string columns, scoped to
+    the last year of business data. Gives the AI real values for plain String columns
+    (Platform, Brand) that the low-cardinality sampler never saw. Same PII policy as the
+    sampler: only columns with a small value set, values capped at MAX_STR_LEN."""
+    if db in PII_DATABASES:
+        return {}
+    cands = [c["name"] for c in columns
+             if any(h in c["type"] for h in _SEGMENT_TYPE_HINTS) and not _is_cdc_name(c["name"])
+             ][:MAX_SEGMENT_CANDIDATES]
+    if not cands:
+        return {}
+    live = _live_only_clause(ch, db, table)
+    clauses = [live] if live else []
+    if event_date_column:
+        clauses.append(f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+                       f">= today() - INTERVAL 1 YEAR")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        res = ch.query("SELECT " + ", ".join(f"uniq(toString(`{c}`))" for c in cands)
+                       + f" FROM `{db}`.`{table}`{where}")
+        counts = dict(zip(cands, res.result_rows[0]))
+        small = [c for c in cands if MIN_SEGMENT_CARD <= int(counts[c] or 0) <= MAX_DISTINCT]
+        if not small:
+            return {}
+        res = ch.query("SELECT " + ", ".join(
+            f"topK(8)(substring(toString(`{c}`), 1, {MAX_STR_LEN}))" for c in small)
+            + f" FROM `{db}`.`{table}`{where}")
+        return {c: {"distinct": int(counts[c]), "top_values": list(v)}
+                for c, v in zip(small, res.result_rows[0])}
+    except Exception as e:
+        log.warning("segment profile failed %s.%s: %s", db, table, e)
+        return {}
+
+
+def rank_variables(inferred, seg_prof, columns):
+    """Final ordered variable list for tracking: the AI's segments, plus any priority
+    segment (Platform/Brand/...) it missed that really has categorical values, ordered by
+    business priority; type/status/flag-style columns last."""
+    colset = {c["name"] for c in columns}
+    variables = list(inferred.get("variables") or [])
+    have = {v.get("column") for v in variables}
+    for col in seg_prof:
+        if col not in have and any(k in col.lower() for k in _SEGMENT_PRIORITY):
+            variables.append({"column": col, "role": "segment", "note": "added by profile"})
+
+    def rank(v):
+        n = (v.get("column") or "").lower()
+        for i, k in enumerate(_SEGMENT_PRIORITY):
+            if k in n:
+                return i
+        return 90 if any(k in n for k in _SEGMENT_DEMOTE) else 50
+    # stable sort: ties keep the AI's own priority order
+    ranked = sorted((v for v in variables if v.get("column") in colset), key=rank)
+    # type/status/flag-style columns are tracked only when the table has nothing better
+    good = [v for v in ranked if rank(v) < 90]
+    return good or ranked
+
+
 # ─── Overlay read/write ────────────────────────────────────────────────────────
 
 def load_existing_overlay(pg_cur):
     pg_cur.execute(
         "SELECT database_name, table_name, structure_hash, updated_by, authoritative, "
-        "       concept, scope, source_type "
+        "       concept, scope, source_type, event_date_column, description->>'_cls_v' "
         "FROM sentinel.catalog_overlay"
     )
     return {
         (r[0], r[1]): {"structure_hash": r[2], "updated_by": r[3], "authoritative": r[4],
-                       "concept": r[5], "scope": r[6], "source_type": r[7]}
+                       "concept": r[5], "scope": r[6], "source_type": r[7],
+                       "event_date_column": r[8], "cls_v": r[9]}
         for r in pg_cur.fetchall()
     }
 
@@ -272,6 +505,19 @@ def upsert_overlay(pg_cur, row):
            WHERE sentinel.catalog_overlay.updated_by <> 'human'""",  # never overwrite pinned rows
         row,
     )
+    # A human-pinned row keeps its content, but it must still record that this table has
+    # been classified at this structure/version — otherwise its saved fingerprint stays
+    # stale and EVERY run re-sends it to the AI (seen in prod: a pinned table was
+    # re-classified in three consecutive runs).
+    pg_cur.execute(
+        """UPDATE sentinel.catalog_overlay
+           SET structure_hash = %(structure_hash)s,
+               description = jsonb_set(COALESCE(description, '{}'::jsonb), '{_cls_v}',
+                                       to_jsonb(%(cls_v)s::text))
+           WHERE database_name = %(database_name)s AND table_name = %(table_name)s
+             AND updated_by = 'human'""",
+        {**row, "cls_v": CLASSIFIER_VERSION},
+    )
 
 
 # ─── 6+7. LLM pass + authority ────────────────────────────────────────────────
@@ -287,11 +533,23 @@ def build_overlay_row(meta, columns, inferred, review):
     version_col, delete_col = _cdc_cols(columns)
     # A CDC/Replacing table with no dedup key is an I3 violation → unresolved_dedup
     requires_dedup = bool(inferred["requires_dedup"]) or "Replacing" in (meta["engine"] or "")
-    dedup_key = inferred.get("dedup_key") or []
+    # The AI sometimes names a key column that is not in the table (e.g. LineNo on a view
+    # that has no such column) — keep only real columns.
+    real = {c["name"] for c in columns}
+    dedup_key = [k for k in (inferred.get("dedup_key") or []) if k in real]
     conflict = "none"
     if requires_dedup and not dedup_key:
         conflict = "unresolved_dedup"
-    desc = inferred.get("description") or {}
+    # Views: the engine string is 'View' regardless of what the view reads, so the
+    # "Replacing" test above can never fire — the LLM's verdict (made from the view's
+    # actual SQL) is the only signal, and it is the correct one either way: a view that
+    # already applies FINAL/argMax needs no further dedup, while one that selects from a
+    # CDC source raw does. Treating a missing dedup_key as an I3 violation would be wrong
+    # here: dedup inside the view is resolved WITHOUT the consumer supplying a key, so
+    # flagging it unresolved would raise a permanent false conflict on every clean view.
+    if is_view(meta) and conflict == "unresolved_dedup":
+        conflict = "none"
+    desc = {**(inferred.get("description") or {}), "_cls_v": CLASSIFIER_VERSION}
     # summary is a compact derivative; prefer the model's, else what_it_is
     summary = inferred.get("summary") or desc.get("what_it_is")
     return {
@@ -410,6 +668,18 @@ def upsert_target(pg_cur, meta, inferred):
     expected = inferred.get("expected_cadence_weeks")           # how stale = bad (freshness)
     static = bool(inferred.get("is_static"))
     event_col = inferred.get("event_date_column")               # business date → data freshness
+    # A human-pinned event_date_column must survive reprocessing — the AI re-guesses
+    # from scratch every time a table's structure changes, with no memory of a prior
+    # correction, and can silently flip a working pick back to null (seen in prod:
+    # Holistique_Base's SalesDate got wiped on a later re-run after being fixed once).
+    pg_cur.execute(
+        "SELECT event_date_column FROM sentinel.catalog_overlay "
+        "WHERE database_name = %s AND table_name = %s AND updated_by = 'human'",
+        (meta["database_name"], meta["table_name"]),
+    )
+    pinned = pg_cur.fetchone()
+    if pinned and pinned[0]:
+        event_col = pinned[0]
     # system.parts is validated at check time; default cheap_source = system_parts,
     # check engine falls back to light_scan if unreliable (Lapse 4).
     pg_cur.execute(
@@ -422,11 +692,25 @@ def upsert_target(pg_cur, meta, inferred):
                monitor_frequency_weeks = EXCLUDED.monitor_frequency_weeks,
                expected_cadence_weeks = EXCLUDED.expected_cadence_weeks,
                is_static = EXCLUDED.is_static,
+               -- a newly picked/changed event date must be checked now, not after the
+               -- normal interval (otherwise Data stays blank for up to a week)
+               next_due_at = CASE WHEN sentinel.monitor_targets.event_date_column
+                                       IS DISTINCT FROM EXCLUDED.event_date_column
+                                  THEN now() ELSE sentinel.monitor_targets.next_due_at END,
                event_date_column = EXCLUDED.event_date_column,
                status = CASE WHEN sentinel.monitor_targets.status = 'retired'
                              THEN 'active' ELSE sentinel.monitor_targets.status END,
                iteration = sentinel.monitor_targets.iteration + 1""",
         (meta["database_name"], meta["table_name"], weeks, expected, static, event_col),
+    )
+    # Per-variable targets (Platform, Brand, ...) must carry the same event date, or the
+    # per-value freshness check has no date to group by and silently does nothing.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets
+           SET event_date_column = %s, next_due_at = now()
+           WHERE database_name = %s AND table_name = %s AND variable <> ''
+             AND event_date_column IS DISTINCT FROM %s""",
+        (event_col, meta["database_name"], meta["table_name"], event_col),
     )
 
 
@@ -451,68 +735,198 @@ MIN_SEGMENT_CARD = 3          # a real segment has >=3 distinct values (excludes
 _CDC_PREFIXES = ("_peerdb", "_sign", "_version", "_ver", "__")
 
 
+# Entity-like names (a campaign, ad group, keyword, SKU...) come and go; they are not stable
+# business segments, so they are never tracked (see also the check engine's per-value checks).
+_ENTITY_NAME = re.compile(
+    r"(campaign|ad[ _]?group|keyword|search[ _]?term|portfolio|journey|report[ _]?name|creative)"
+    r"|((^|[ _])(sku|asin|mat|listing|merchant)([ _]?(code|id|no))?$)", re.I)
+
+
 def _is_business_segment_col(col_name, role):
     if role != "segment":
         return False
     lc = col_name.lower()
     if any(lc.startswith(p) for p in _CDC_PREFIXES):
         return False
+    # identifier-style names (document/entry numbers, ids) are never business segments,
+    # even when a small table happens to have few distinct values
+    if lc == "id" or lc.endswith(("_id", "_no", "entryno", "entry_no")) or lc.startswith("doc_"):
+        return False
+    if _ENTITY_NAME.search(col_name):
+        return False
+    if "categor" in lc:
+        # product/catalog attribute (category, l2_category, ItemCategoryCode...): says WHAT was
+        # sold, not which feed delivered it - never tracked (the check engine skips it too)
+        return False
     return True
 
 
-def _segment_cardinality(ch, db, tbl, col):
-    """Cheap distinct-count probe. Returns int or None on error."""
+_live_filter_cache = {}
+
+
+def _live_only_clause(ch, db, table):
+    """WHERE fragment excluding PeerDB tombstone rows (_peerdb_is_deleted=1),
+    for whichever database/table actually has that column — a deleted row is
+    never real data, regardless of which table it's on. None if the table
+    doesn't have this column at all. Cached per (db, table) for this run."""
+    key = (db, table)
+    if key in _live_filter_cache:
+        return _live_filter_cache[key]
     try:
-        r = ch.query(f"SELECT uniqExact(`{col}`) FROM `{db}`.`{tbl}`")
+        r = ch.query(
+            "SELECT count() FROM system.columns WHERE database={db:String} "
+            "AND table={tbl:String} AND name='_peerdb_is_deleted'",
+            parameters={"db": db, "tbl": table},
+        )
+        result = "`_peerdb_is_deleted` = 0" if r.result_rows[0][0] else None
+    except Exception:
+        result = None
+    _live_filter_cache[key] = result
+    return result
+
+
+def _segment_cardinality(ch, db, tbl, col, event_date_column=None):
+    """Cheap distinct-count probe, scoped to the last 1 year of business data when a
+    business date column is known. Without this, a platform/customer nobody has done
+    business with in years still counts toward cardinality forever — that's what let
+    MAX_DISTINCT get bloated upward in the first place. Falls back to full table
+    history when there's no business date to scope by. Excludes deleted rows too."""
+    try:
+        live = _live_only_clause(ch, db, tbl)
+        clauses = [live] if live else []
+        if event_date_column:
+            clauses.append(
+                f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+                f">= today() - INTERVAL 1 YEAR")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        r = ch.query(f"SELECT uniqExact(`{col}`) FROM `{db}`.`{tbl}`{where}")
         return int(r.result_rows[0][0] or 0)
     except Exception as e:
         log.warning("cardinality probe failed %s.%s.%s: %s", db, tbl, col, e)
         return None
 
 
-def _segment_values(ch, db, tbl, col):
+def _segment_values(ch, db, tbl, col, event_date_column=None):
     """Fetch the current distinct value set (as toString, matching the coverage
-    check). Bounded by MAX_DISTINCT. Reuses cached samples when present."""
+    check), scoped to the last 1 year the same way as _segment_cardinality — a value
+    not seen in over a year ages out of 'active' tracking on its own via the existing
+    retire-on-disappearance logic below, no separate cleanup needed. Bounded by
+    MAX_DISTINCT. Excludes deleted rows."""
+    live = _live_only_clause(ch, db, tbl)
+    clauses = [live] if live else []
+    if event_date_column:
+        clauses.append(
+            f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+            f">= today() - INTERVAL 1 YEAR")
+    extra = f" AND {' AND '.join(clauses)}" if clauses else ""
     r = ch.query(
         f"SELECT DISTINCT toString(`{col}`) FROM `{db}`.`{tbl}` "
-        f"WHERE length(toString(`{col}`)) <= {MAX_STR_LEN} LIMIT {MAX_DISTINCT}"
+        f"WHERE length(toString(`{col}`)) <= {MAX_STR_LEN}{extra} LIMIT {MAX_DISTINCT}"
     )
     return {row[0] for row in r.result_rows}
 
 
-def populate_variable_values(pg_cur, ch, meta, inferred, samples):
+# A platform/segment value can be perfectly healthy while reporting far slower than
+# the table's own daily default (an offline retail channel vs. a live marketplace,
+# say) — judging every value against the same table-wide cadence flags the slow-but-
+# fine ones as "dead" forever (seen in prod: Holistique_Base marked 50+ real platforms
+# dead, several of which are legitimately slower-reporting, not broken). Instead of
+# guessing or asking for manual per-platform config, infer each value's OWN natural
+# cadence from how far apart its own active days actually land, historically.
+MIN_CADENCE_SAMPLES = 3       # need a few real gaps before trusting a median
+CADENCE_FLOOR_WEEKS = 0.14    # never inferred tighter than ~daily
+CADENCE_CEIL_WEEKS = 8.0      # never inferred looser than ~2 months (sparse-data guard)
+
+
+def infer_value_cadences(ch, db, tbl, col, event_date_column):
+    """{value: expected_cadence_weeks} for values with enough history to infer one.
+    A value absent from the result keeps inheriting the variable/table-level cadence,
+    unchanged from today's behavior — this only ever makes a value's bar more
+    accurate, never removes the existing fallback."""
+    if not event_date_column:
+        return {}
+    live = _live_only_clause(ch, db, tbl)
+    clauses = [live] if live else []
+    clauses.append(
+        f"parseDateTimeBestEffortOrNull(toString(`{event_date_column}`)) "
+        f">= today() - INTERVAL 180 DAY")
+    where = f" WHERE {' AND '.join(clauses)}"
+    try:
+        res = ch.query(f"""
+            WITH days AS (
+                SELECT toString(`{col}`) AS value,
+                       toDate(parseDateTimeBestEffortOrNull(toString(`{event_date_column}`))) AS d
+                FROM `{db}`.`{tbl}`{where}
+                GROUP BY value, d
+            ),
+            gaps AS (
+                SELECT value, d - lagInFrame(d) OVER (PARTITION BY value ORDER BY d) AS gap
+                FROM days
+            )
+            SELECT value, median(gap) AS gap_days, count() AS n
+            FROM gaps WHERE gap > 0
+            GROUP BY value HAVING n >= {MIN_CADENCE_SAMPLES}
+        """)
+        out = {}
+        for value, gap_days, _n in res.result_rows:
+            weeks = max(CADENCE_FLOOR_WEEKS, min(CADENCE_CEIL_WEEKS, float(gap_days) / 7))
+            out[value] = round(weeks, 3)
+        return out
+    except Exception as e:
+        log.warning("cadence inference failed %s.%s.%s: %s", db, tbl, col, e)
+        return {}
+
+
+def probe_variable_values(ch, meta, inferred):
+    """ClickHouse half of variable tracking: [(column, values_seen, {value: cadence})].
+    Kept apart from the PG writes so no transaction is held open across these queries —
+    on a slow view they take a minute or more, long enough for the Cloud SQL connection
+    to be dropped mid-transaction (seen in prod), which lost the table on every run."""
     db, tbl = meta["database_name"], meta["table_name"]
-    tracked = []
+    edc = inferred.get("event_date_column")
+    probes = []
     for var in (inferred.get("variables") or []):     # already priority-ordered by LLM
-        if len(tracked) >= MAX_TRACKED_VARIABLES:
+        if len(probes) >= MAX_TRACKED_VARIABLES:
             break
         col = var.get("column")
         role = (var.get("role") or "").lower()
         if not col or not _is_business_segment_col(col, role):
             continue
         # cardinality probe: keep genuine segments only (excludes bool flags + runaway)
-        card = _segment_cardinality(ch, db, tbl, col)
+        card = _segment_cardinality(ch, db, tbl, col, edc)
         if card is None or card < MIN_SEGMENT_CARD or card > MAX_DISTINCT:
             log.info("skip variable %s.%s.%s (cardinality=%s not in [%d,%d])",
                      db, tbl, col, card, MIN_SEGMENT_CARD, MAX_DISTINCT)
             continue
         try:
-            seen_now = set(samples[col]) if col in samples else _segment_values(ch, db, tbl, col)
+            # Always query fresh (not the cached pii_safe_samples) — that cache isn't
+            # scoped to the last year or to live rows, so reusing it here would quietly
+            # defeat both filters for whichever columns happened to be cached.
+            seen_now = _segment_values(ch, db, tbl, col, edc)
         except Exception as e:
             log.warning("value fetch failed %s.%s.%s: %s", db, tbl, col, e)
             continue
         if not seen_now:
             continue
-        tracked.append(col)
+        probes.append((col, seen_now, infer_value_cadences(ch, db, tbl, col, edc)))
+    return probes
 
+
+def populate_variable_values(pg_cur, meta, inferred, probes):
+    db, tbl = meta["database_name"], meta["table_name"]
+    tracked = []
+    for col, seen_now, value_cadence in probes:
+        tracked.append(col)
         for value in seen_now:
             pg_cur.execute(
                 """INSERT INTO sentinel.variable_values
-                   (database_name, table_name, variable, value, first_seen, last_seen, lifecycle)
-                   VALUES (%s, %s, %s, %s, now(), now(), 'active')
+                   (database_name, table_name, variable, value, first_seen, last_seen,
+                    lifecycle, expected_cadence_weeks)
+                   VALUES (%s, %s, %s, %s, now(), now(), 'active', %s)
                    ON CONFLICT (database_name, table_name, variable, value) DO UPDATE SET
-                       last_seen = now(), lifecycle = 'active', retired_at = NULL""",
-                (db, tbl, col, value),
+                       last_seen = now(), lifecycle = 'active', retired_at = NULL,
+                       expected_cadence_weeks = EXCLUDED.expected_cadence_weeks""",
+                (db, tbl, col, value, value_cadence.get(value)),
             )
         pg_cur.execute(
             """UPDATE sentinel.variable_values
@@ -521,6 +935,13 @@ def populate_variable_values(pg_cur, ch, meta, inferred, samples):
                  AND lifecycle = 'active' AND value <> ALL(%s)""",
             (db, tbl, col, list(seen_now)),
         )
+        # Views: snapshot the value set above (useful catalog metadata, and the probe has
+        # already run) but do NOT create a coverage TARGET. Same reasoning as the
+        # table-level target in main(): a view's values are its base tables' values, which
+        # are monitored in their own right, so a target here re-executes the whole view
+        # definition on every check to re-derive coverage that is already being watched.
+        if is_view(meta):
+            continue
         pg_cur.execute(
             """INSERT INTO sentinel.monitor_targets
                (database_name, table_name, variable, monitor_frequency_weeks,
@@ -536,6 +957,35 @@ def populate_variable_values(pg_cur, ch, meta, inferred, samples):
              inferred.get("expected_cadence_weeks")),
         )
     log.info("%s.%s tracked %d variables: %s", db, tbl, len(tracked), tracked)
+
+    # A variable the AI no longer recommends (e.g. it correctly stops treating
+    # CustomerCode as a segment on a later run) must stop being tracked too — without
+    # this, its monitor_targets row and value list just sit there active forever,
+    # since nothing above touches a column that isn't in THIS run's `tracked` list.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets SET status = 'retired'
+           WHERE database_name = %s AND table_name = %s AND variable <> ''
+             AND status = 'active' AND variable <> ALL(%s)""",
+        (db, tbl, tracked),
+    )
+    pg_cur.execute(
+        """UPDATE sentinel.variable_values SET lifecycle = 'retired', retired_at = now()
+           WHERE database_name = %s AND table_name = %s AND lifecycle = 'active'
+             AND variable <> ALL(%s)""",
+        (db, tbl, tracked),
+    )
+    # Variable targets inherit the table-level event date (incl. a human pin) — without
+    # it the per-value freshness check has no date to group by and never runs.
+    pg_cur.execute(
+        """UPDATE sentinel.monitor_targets v
+           SET event_date_column = t.event_date_column, next_due_at = now()
+           FROM sentinel.monitor_targets t
+           WHERE t.database_name = v.database_name AND t.table_name = v.table_name
+             AND t.variable = '' AND v.variable <> ''
+             AND v.database_name = %s AND v.table_name = %s
+             AND v.event_date_column IS DISTINCT FROM t.event_date_column""",
+        (db, tbl),
+    )
     return tracked
 
 
@@ -664,140 +1114,205 @@ def main():
     llm_count = skip_count = 0
 
     try:
-        with pg.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
-            if not cur.fetchone()[0]:
-                log.warning("Another discovery run holds the lock. Exiting.")
-                return
+        cur = pg.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+        if not cur.fetchone()[0]:
+            log.warning("Another discovery run holds the lock. Exiting.")
+            return
 
-            existing = load_existing_overlay(cur)
-            tables = enumerate_tables(ch)
-            log.info("Enumerated %d ClickHouse tables", len(tables))
+        existing = load_existing_overlay(cur)
+        tables = enumerate_tables(ch)
+        log.info("Enumerated %d ClickHouse tables", len(tables))
 
-            seen_keys = set()
-            full_pass = True   # False if we break early on the batch cap
-            for meta in tables:
-                db, tbl = meta["database_name"], meta["table_name"]
-                key = (db, tbl)
-                seen_keys.add(key)
-                columns = introspect_columns(ch, db, tbl)
-                if not columns:
-                    continue
-                meta["structure_hash"] = structure_hash(columns)
+        seen_keys = set()
+        full_pass = True   # False if we break early on the batch cap
+        for meta in tables:
+            db, tbl = meta["database_name"], meta["table_name"]
+            key = (db, tbl)
+            seen_keys.add(key)
+            columns = introspect_columns(ch, db, tbl)
+            if not columns:
+                continue
+            meta["structure_hash"] = structure_hash(columns)
 
-                prior = existing.get(key)
-                # 4. Incremental gate — unchanged structure skips the LLM. This is what
-                # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
-                # are skipped here, so each run advances the frontier of new/changed
-                # tables until the whole catalog is filled, then steady-state is cheap.
-                if prior and prior["structure_hash"] == meta["structure_hash"]:
-                    skip_count += 1
-                    continue
+            prior = existing.get(key)
+            # Self-heal: a stored dedup key naming a column the table does not have is
+            # dropped without re-classifying (no AI cost). Applies to pinned rows too —
+            # it is a fact about the schema, not a judgement.
+            cur.execute(
+                """UPDATE sentinel.catalog_overlay
+                   SET dedup_key = ARRAY(SELECT k FROM unnest(dedup_key) k WHERE k = ANY(%s))
+                   WHERE database_name = %s AND table_name = %s
+                     AND EXISTS (SELECT 1 FROM unnest(dedup_key) k WHERE NOT (k = ANY(%s)))""",
+                ([c["name"] for c in columns], db, tbl, [c["name"] for c in columns]))
+            # 4. Incremental gate — unchanged structure skips the LLM. This is what
+            # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
+            # are skipped here, so each run advances the frontier of new/changed
+            # tables until the whole catalog is filled, then steady-state is cheap.
+            # ONE-TIME classification: a table is classified once, then skipped until its
+            # structure changes (or CLASSIFIER_VERSION is bumped because the logic itself
+            # improved — that re-classifies every table exactly once, then they settle).
+            # Human-pinned rows are never re-run just for a version bump.
+            up_to_date = (prior and prior["structure_hash"] == meta["structure_hash"]
+                          and (prior["cls_v"] == CLASSIFIER_VERSION
+                               or prior["updated_by"] == "human"))
+            if up_to_date:
+                skip_count += 1
+                continue
 
-                # Per-run batch cap: only process up to MAX_TABLES_PER_RUN new/changed
-                # tables, so a run over 450 tables never risks the Cloud Run task timeout.
-                # The next scheduled (or stacked manual) run picks up the rest.
-                if llm_count >= MAX_TABLES_PER_RUN:
-                    log.info("Batch cap reached (%d tables this run); remaining tables "
-                             "will be picked up next run.", MAX_TABLES_PER_RUN)
-                    full_pass = False
-                    break
+            # Per-run batch cap: only process up to MAX_TABLES_PER_RUN new/changed
+            # tables, so a run over 450 tables never risks the Cloud Run task timeout.
+            # The next scheduled (or stacked manual) run picks up the rest.
+            if llm_count >= MAX_TABLES_PER_RUN:
+                log.info("Batch cap reached (%d tables this run); remaining tables "
+                         "will be picked up next run.", MAX_TABLES_PER_RUN)
+                full_pass = False
+                break
 
-                # 5. PII-safe sample
-                samples = pii_safe_samples(ch, db, tbl, columns)
-                mstats = measure_stats(ch, db, tbl, columns)
-                payload = {**meta, "columns": columns, "samples": samples,
-                           "measure_stats": mstats}
+            # 5. PII-safe sample — scoped to the last year using whatever business date
+            # a prior run already found for this table, if any (brand-new tables fall
+            # back to full-history sampling inside pii_safe_samples).
+            # Date profile first (real min/max/future/active-days per date column): it
+            # gives the AI evidence and scopes the value profiles below to the last year
+            # even for a brand-new table with no prior date.
+            dprof = date_profile(ch, db, tbl, columns)
+            prior_edc = pick_event_date((prior or {}).get("event_date_column"),
+                                        dprof, columns, False)
+            samples = pii_safe_samples(ch, db, tbl, columns, prior_edc)
+            sprof = segment_profile(ch, db, tbl, columns, prior_edc)
+            # Views: a view has no stored rows, so every stat query re-executes the
+            # whole view definition. measure_stats issues one such query PER measure
+            # column, which reliably hits CH_MAX_EXECUTION_SECONDS on a non-trivial
+            # view. The base tables carry those stats; the view's SELECT (fed to the
+            # LLM) is stronger evidence anyway. So: skip measure stats on views.
+            viewish = is_view(meta)
+            mstats = {} if viewish else measure_stats(ch, db, tbl, columns)
+            payload = {**meta, "columns": columns, "samples": samples,
+                       "measure_stats": mstats, "date_profile": dprof,
+                       "segment_profile": sprof, "is_view": viewish}
 
-                # 6. LLM pass + heuristic pre-fill for source_type
-                try:
-                    inferred, maker = llm.infer_overlay(payload)
-                except Exception as e:
-                    log.error("LLM failed for %s.%s, skipping: %s", db, tbl, e)
-                    continue
-                heur = source_type_heuristic(db, tbl)
-                if heur:
-                    inferred["source_type"] = heur
-                # Guard the LLM's event_date_column — must be a real column, and never a
-                # sync/CDC column (those are sync freshness, not data freshness).
-                edc = inferred.get("event_date_column")
-                colset = {c["name"] for c in columns}
-                if edc and (edc not in colset or edc.startswith("_peerdb") or edc in ("_sign",)):
-                    log.info("dropping bad event_date_column %r for %s.%s", edc, db, tbl)
-                    inferred["event_date_column"] = None
-                llm_count += 1
+            # 6. LLM pass + heuristic pre-fill for source_type. This cascades across up
+            # to 3 providers (maker + checker) with retries on a bad response — a single
+            # table can legitimately take 100+ seconds here with zero DB activity.
+            try:
+                inferred, maker = llm.infer_overlay(payload)
+            except Exception as e:
+                log.error("LLM failed for %s.%s, skipping: %s", db, tbl, e)
+                continue
+            heur = source_type_heuristic(db, tbl)
+            if heur:
+                inferred["source_type"] = heur
+            # Verify the AI's event date against the data (real column, never a sync/CDC
+            # column, actual recent non-future values); when it's null or wrong, fall back
+            # to name-priority over columns whose data is valid. Then order the tracked
+            # variables by business priority (Platform, Brand, ...).
+            llm_edc = inferred.get("event_date_column")
+            edc = pick_event_date(llm_edc, dprof, columns, bool(inferred.get("is_static")))
+            if edc != llm_edc:
+                log.info("event_date_column %r -> %r for %s.%s", llm_edc, edc, db, tbl)
+            inferred["event_date_column"] = edc
+            inferred["variables"] = rank_variables(inferred, sprof, columns)
+            llm_count += 1
 
-                # maker-checker — only material disagreements (source_type/dedup) flag review.
-                # When a deterministic name heuristic set source_type, it is authoritative —
-                # exclude source_type from the checker comparison (else the checker's free
-                # guess always "disagrees" with the heuristic and flags every table).
-                agree, checker, disagree_reason = llm.check(
-                    payload, inferred, maker, skip_source_type=bool(heur))
-                review = llm.needs_review(inferred, agree)
-                conf = float(inferred.get("authority_confidence") or 0)
-                # human-readable reason for the UI (why this row needs review)
-                if not review:
-                    review_reason = None
-                elif not agree:
-                    review_reason = f"maker/checker disagree — {disagree_reason}"
-                else:
-                    review_reason = f"low confidence ({conf:.2f} < {llm.CONFIRM_THRESHOLD})"
-                inferred["_review_reason"] = review_reason
-                log.info("%s.%s inferred by %s (checker=%s agree=%s review=%s conf=%.2f)",
-                         db, tbl, maker, checker, agree, review, conf)
+            # maker-checker — only material disagreements (source_type/dedup) flag review.
+            # When a deterministic name heuristic set source_type, it is authoritative —
+            # exclude source_type from the checker comparison (else the checker's free
+            # guess always "disagrees" with the heuristic and flags every table).
+            agree, checker, disagree_reason = llm.check(
+                payload, inferred, maker, skip_source_type=bool(heur))
+            review = llm.needs_review(inferred, agree)
+            conf = float(inferred.get("authority_confidence") or 0)
+            # human-readable reason for the UI (why this row needs review)
+            if not review:
+                review_reason = None
+            elif not agree:
+                review_reason = f"maker/checker disagree — {disagree_reason}"
+            else:
+                review_reason = f"low confidence ({conf:.2f} < {llm.CONFIRM_THRESHOLD})"
+            inferred["_review_reason"] = review_reason
+            log.info("%s.%s inferred by %s (checker=%s agree=%s review=%s conf=%.2f)",
+                     db, tbl, maker, checker, agree, review, conf)
 
-                overlay_row = build_overlay_row(meta, columns, inferred, review)
+            overlay_row = build_overlay_row(meta, columns, inferred, review)
+            var_probes = probe_variable_values(ch, meta, inferred)
+            # The LLM cascade and probes above can leave the PG connection idle long
+            # enough that Postgres or a network intermediary drops it silently (seen in
+            # prod: same table, same spot, every run) — check it before writing and
+            # reconnect if it's gone, so the table is written instead of skipped.
+            try:
+                cur.execute("SELECT 1")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                log.warning("PG connection lost before writing %s.%s — reconnecting: %s",
+                            db, tbl, e)
+                pg, cur = _pg_reconnect(pg)
+            try:
                 upsert_overlay(cur, overlay_row)
-                upsert_target(cur, meta, inferred)
-                tracked_vars = populate_variable_values(cur, ch, meta, inferred, samples)
+                # Views are catalogued but NOT monitored. A view stores nothing, so it has
+                # no rows in system.parts and _parts_freshness would return null on every
+                # check, forever. More fundamentally a view cannot be stale independently
+                # of its sources — its freshness IS its base tables' freshness, and those
+                # are monitored on their own. Monitoring both would double-alert one fault.
+                if not viewish:
+                    upsert_target(cur, meta, inferred)
+                tracked_vars = populate_variable_values(cur, meta, inferred, var_probes)
                 # authority (use_instead) is set later in reconcile_authority, so
                 # duplicate-concept rules for this run use the prior authority state;
                 # they converge on the next run — acceptable for observe-stage rules.
                 generate_recon_rules(cur, overlay_row, inferred, tracked_vars)
-
                 # Commit each table immediately: catalog populates live (visible in the
                 # UI as it goes), and a timeout/crash never loses completed work — the
-                # incremental gate skips them on the next run. Advisory lock is
-                # session-scoped so it survives these commits.
+                # incremental gate skips them on the next run.
                 pg.commit()
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                log.warning("PG connection lost writing %s.%s (likely idle during the LLM "
+                            "calls above) — reconnecting and re-acquiring the lock: %s",
+                            db, tbl, e)
+                pg, cur = _pg_reconnect(pg)
+                continue
 
-            # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
-            # unvisited tables are absent from seen_keys and would be wrongly retired.
-            if full_pass:
-                gone = set(existing) - seen_keys
-                for db, tbl in gone:
-                    cur.execute(
-                        "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
-                        "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
-                        (db, tbl),
-                    )
-                    cur.execute(
-                        "UPDATE sentinel.monitor_targets SET status = 'retired' "
-                        "WHERE database_name = %s AND table_name = %s",
-                        (db, tbl),
-                    )
-                if gone:
-                    log.info("Retired %d dropped tables", len(gone))
-            else:
-                log.info("Partial run (batch cap) — skipping dropped-table retirement.")
+        # 8. Dropped tables → retire — ONLY on a full pass. On a capped run,
+        # unvisited tables are absent from seen_keys and would be wrongly retired.
+        if full_pass:
+            gone = set(existing) - seen_keys
+            for db, tbl in gone:
+                cur.execute(
+                    "UPDATE sentinel.catalog_overlay SET retired = true, updated_at = now() "
+                    "WHERE database_name = %s AND table_name = %s AND updated_by <> 'human'",
+                    (db, tbl),
+                )
+                cur.execute(
+                    "UPDATE sentinel.monitor_targets SET status = 'retired' "
+                    "WHERE database_name = %s AND table_name = %s",
+                    (db, tbl),
+                )
+            if gone:
+                log.info("Retired %d dropped tables", len(gone))
+        else:
+            log.info("Partial run (batch cap) — skipping dropped-table retirement.")
 
-            # 7. Global authority reconciliation (I1/I2) after all upserts
-            reconcile_authority(cur, seen_keys)
+        # 7. Global authority reconciliation (I1/I2) after all upserts
+        reconcile_authority(cur, seen_keys)
 
-            # 8. Cross-source agreement rules — MUST run after authority is set (§9.4)
-            generate_cross_source_rules(cur)
+        # 8. Cross-source agreement rules — MUST run after authority is set (§9.4)
+        generate_cross_source_rules(cur)
 
-            cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
-            pg.commit()
-            log.info("Discovery committed. LLM ran on %d tables, skipped %d unchanged.",
-                     llm_count, skip_count)
+        cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+        pg.commit()
+        log.info("Discovery committed. LLM ran on %d tables, skipped %d unchanged.",
+                 llm_count, skip_count)
 
     except Exception as e:
-        pg.rollback()
+        try:
+            pg.rollback()
+        except Exception:
+            pass
         log.error("Discovery failed: %s", e)
         raise
     finally:
-        pg.close()
+        try:
+            pg.close()
+        except Exception:
+            pass
         ch.close()
 
     if HEALTHCHECK_URL:

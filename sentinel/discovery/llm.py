@@ -11,7 +11,7 @@ The prompt builder receives only a PII-safe payload (schema + stats + low-card
 DISTINCT samples). It has no path to raw rows; recruitment_hr is schema+stats only,
 asserted by the caller (see sample.py / main.py). — DATA_MONITOR_SPEC §10.3, §7.4
 """
-import os, json, logging
+import os, json, logging, re
 
 log = logging.getLogger(__name__)
 
@@ -192,9 +192,23 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       leaves useful tables with zero monitored variables (a real problem on ERP/ledger
       tables). Aim to surface the 3 most monitoring-worthy segments even on wide tables.
       Do NOT label as segment: unique identifiers (id, entryNo, sku, order_name,
-      customer_id, document_no), free-text or high-cardinality strings (names, titles,
-      city, postal_code, narration), monetary/numeric measures, timestamps, or
+      document_no), free-text or high-cardinality strings (names, titles, city,
+      postal_code, narration), monetary/numeric measures, timestamps, or
       CDC/technical columns (_peerdb*, _sign, _version).
+      The test that matters is MEANING, not the column's naming pattern: does this
+      column tell you WHICH BUSINESS CATEGORY a row belongs to (platform, channel,
+      region, brand — a handful of recurring values many different rows/customers
+      share), or does it tell you WHICH SPECIFIC CUSTOMER/VENDOR/ENTITY the row
+      belongs to? Any column identifying a specific customer or vendor — by whatever
+      name it uses (customer_id, CustomerCode, Customer_Code, client_no, vendor_id,
+      VendorCode, account_no — "id"/"code"/"no" are equally identifiers here) — is
+      NEVER a segment, even if it happens to have few distinct values in a sample
+      window (a business with only 40 active customers this year still has
+      customer identity as an IDENTITY column, not a business category). If a
+      "code" column's values are generic business categories (currency_code,
+      payment_method_code), it IS a segment; if its values are specific named
+      parties (a customer, a vendor, a company), it is NEVER a segment regardless
+      of the word "code" in its name.
       Those get role measure / key / timestamp / other.
       ORDER variables by monitoring priority — most important business segments FIRST
       (brand/channel/region/currency before minor enums). Only the top few are monitored.
@@ -218,10 +232,91 @@ _OUTPUT_SPEC = """Return a JSON object with EXACTLY these keys (use these exact 
       to detect stale business data (e.g. a sales table whose newest SalesDate is May
       even though it synced today). It is DIFFERENT from sync/load columns
       (_peerdb_synced_at, created_at/updated_at that record when the row was loaded, not
-      when the business event happened). Pick the single most representative event date.
-      Use null if the table has no such business/event date (dimension/reference/master/
-      snapshot tables). Must be an actual column name present in the schema.
+      when the business event happened).
+      Some tables (a sales/purchase HEADER especially) have MANY date columns for
+      different stages of the same transaction (order date, posting date, shipment
+      date, due date, requested/promised delivery date, expiry date). Pick ONE, in
+      this priority when several are present:
+        1. The date the document was POSTED/COMPLETED (posting_date, invoice_date) —
+           this is when the transaction became final/actual, the strongest signal of
+           "is new business activity actually happening."
+        2. Else the date the document was CREATED/PLACED (order_date, document_date).
+        3. Else the SHIPMENT/fulfillment date, if that's the table's whole subject
+           (a shipment/delivery table).
+      Never pick a column that is a FUTURE PLAN rather than a recorded fact — due_date,
+      requested_delivery_date, promised_delivery_date, expiry_date describe something
+      expected to happen, not something that already happened, so they make a poor
+      freshness signal (a row can sit there with an old creation date but a due_date
+      far in the future, making the table look artificially "fresh"). Use null if the
+      table has no such business/event date (dimension/reference/master/snapshot
+      tables). Must be an actual column name present in the schema.
+      A table of sales, orders, invoices or transactions must NEVER be null: a column
+      named SalesDate, OrderDate, InvoiceDate or PostingDate IS the answer. Null is only
+      for pure reference/master/lookup tables.
 Do not add, rename, or omit keys. Do not wrap in markdown."""
+
+
+# Max characters of view SQL sent to the model. A view definition is normally well under
+# this; the cap only stops a pathological generated view from blowing the context window.
+MAX_VIEW_SQL_CHARS = 6000
+
+
+def _view_block(payload):
+    """For a VIEW, its defining SELECT is the strongest evidence available — it states
+    the grain, the joins (= real lineage), the filters (= scope), and how derived columns
+    are computed. Views also carry no measure stats (they are not sampled — see main.py),
+    so this block replaces that evidence rather than merely supplementing it."""
+    if not payload.get("is_view"):
+        return ""
+    sql = (payload.get("create_query") or "").strip()
+    if not sql:
+        return ""
+    if len(sql) > MAX_VIEW_SQL_CHARS:
+        sql = sql[:MAX_VIEW_SQL_CHARS] + "\n-- [truncated]"
+    return (
+        "\n\nTHIS OBJECT IS A VIEW, not a stored table. Its defining SQL is below and is "
+        "your PRIMARY evidence — read it rather than guessing from column names:\n"
+        "  • grain: derive from the GROUP BY (or the join grain if not aggregated).\n"
+        "  • relationships: every table in FROM/JOIN is real, verified lineage — list them "
+        "in \"relationships\" as db.table with the join column in \"on\".\n"
+        "  • scope: a WHERE clause that restricts to a brand/channel/date-range IS the "
+        "scope, and belongs in when_not_to_use (the view cannot answer outside it).\n"
+        "  • computable_metrics: read how each measure is actually computed. If the SELECT "
+        "subtracts discounts/returns from a gross amount, net sales IS computable here — "
+        "say so and name the expression. Do not require negatives/measure-stats evidence: "
+        "views are not stat-sampled, so the SQL is the evidence.\n"
+        "  • requires_dedup: TRUE only if the view reads a CDC/ReplacingMergeTree source "
+        "WITHOUT resolving it (no FINAL, no argMax, no dedup GROUP BY, no filter on "
+        "_peerdb_is_deleted). If the SQL already applies FINAL/argMax/deleted-row filtering, "
+        "the dedup is handled inside the view: set requires_dedup=false, dedup_method=none. "
+        "Note which it is in key_facts, since a consumer cannot see this SQL.\n"
+        "  • A view is the curated, business-facing interface over raw tables, so it is "
+        "usually the RIGHT thing to query. Judge it on its own merits, not as a duplicate.\n"
+        f"View definition SQL:\n{sql}"
+    )
+
+
+def _stats_block(payload):
+    """Measure-stat evidence. Views are deliberately not stat-sampled (main.py), so for a
+    view this must NOT present an empty stats object as evidence: the standard wording
+    ("negatives ~0 means returns are absent → gross-only") would read absence-of-sampling
+    as proof-of-absence and push every view's metrics into not_computable. For views, the
+    defining SQL in _view_block carries this burden instead."""
+    if payload.get("is_view"):
+        return (
+            "\n\nAggregate measure stats: NOT COLLECTED for views (a view stores no rows). "
+            "Their absence is NOT evidence that returns/discounts are missing — judge "
+            "computability from the view's SQL above and from the base tables it reads."
+        )
+    return (
+        "\n\nAggregate stats for measure columns (sum/avg/min/max/negatives over the "
+        "whole column — use these to judge WHAT a measure really is and what can be "
+        "computed). A 'negatives' count > 0 means returns/refunds are represented, so "
+        "a net figure is derivable; negatives ~0 means returns are absent (likely "
+        "gross-only). Very different magnitudes for a same-named measure across tables "
+        "mean they are NOT the same metric.\n"
+        + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+    )
 
 
 def _evidence_block(payload):
@@ -233,15 +328,21 @@ def _evidence_block(payload):
         f"Approx rows: {payload.get('total_rows')}\n"
         f"Columns (name: type):\n"
         + "\n".join(f"  {c['name']}: {c['type']}" for c in payload["columns"])
+        + _view_block(payload)
         + "\n\nLow-cardinality sample values (PII-safe only):\n"
         + json.dumps(payload.get("samples", {}), ensure_ascii=False)
-        + "\n\nAggregate stats for measure columns (sum/avg/min/max/negatives over the "
-          "whole column — use these to judge WHAT a measure really is and what can be "
-          "computed). A 'negatives' count > 0 means returns/refunds are represented, so "
-          "a net figure is derivable; negatives ~0 means returns are absent (likely "
-          "gross-only). Very different magnitudes for a same-named measure across tables "
-          "mean they are NOT the same metric.\n"
-        + json.dumps(payload.get("measure_stats", {}), ensure_ascii=False)
+        + _stats_block(payload)
+        + "\n\nDate column profile (real data: min/max date, non-null rows, rows dated in "
+          "the FUTURE, distinct active days in the last 90). Choose event_date_column "
+          "from THESE: the business date whose max is recent, not future-dated, and has "
+          "many active days. A column that is all future, epoch junk or load-time is not "
+          "the business date.\n"
+        + json.dumps(payload.get("date_profile", {}), ensure_ascii=False)
+        + "\n\nCategorical column profile (distinct values in the last year + the most "
+          "common real values). Judge segments from these REAL values, not the column "
+          "name: a handful of recurring business categories (platform, brand, channel, "
+          "region) is a segment; specific customers/entities, ids or free text is not.\n"
+        + json.dumps(payload.get("segment_profile", {}), ensure_ascii=False)
     )
 
 
@@ -257,44 +358,81 @@ def _prompt(payload, system=None, output_spec=None):
 # Each returns a dict (parsed JSON) or raises. Lazy imports so a missing SDK for
 # one provider doesn't break the others.
 
+def _openai_model_params(model, max_out=8192):
+    """Per-model request settings. gpt-5* and the o-series are REASONING models: they reject
+    `temperature` (only the default is accepted), cap output with max_completion_tokens
+    (reasoning tokens count toward it) and BILL reasoning tokens as output - so reasoning
+    effort is kept as low as the model allows for this extraction task. `reasoning_effort`
+    goes through extra_body because the pinned SDK predates the argument. Older chat models
+    (gpt-4o-mini, gpt-4.1-mini) keep temperature=0."""
+    if model == "gpt-5" or model.startswith("gpt-5-"):
+        return {"max_completion_tokens": max_out, "extra_body": {"reasoning_effort": "minimal"}}
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):          # gpt-5.1+, o-series: "low" is valid everywhere
+        return {"max_completion_tokens": max_out, "extra_body": {"reasoning_effort": "low"}}
+    return {"temperature": 0}
+
+
 def _call_openai(prompt):
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    # .strip() matters here: a secret stored with a trailing newline (an easy accident
+    # via --data-file on a heredoc-written file) makes the Bearer header contain a
+    # literal \n, which httpx's h11 layer rejects outright as an illegal header value
+    # before any request even reaches OpenAI - surfaces as a generic "Connection
+    # error" with no indication it was ever about the key's formatting.
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
+    model = os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-5-mini")
     resp = client.chat.completions.create(
-        model=os.environ.get("SENTINEL_OPENAI_MODEL", "gpt-4o-mini"),
+        model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        temperature=0,
-        timeout=60,
+        timeout=120,       # a reasoning model is slower than 4o-mini even at minimal effort
+        **_openai_model_params(model),
     )
     return json.loads(resp.choices[0].message.content)
 
 
 def _call_gemini(prompt):
     from google import genai
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
     resp = client.models.generate_content(
         model=os.environ.get("SENTINEL_GEMINI_MODEL", "gemini-2.5-flash"),
         contents=prompt + "\n\nRespond with a single JSON object only, no markdown.",
         config={"response_mime_type": "application/json", "temperature": 0},
     )
-    return json.loads(resp.text)
+    return _loads_lenient(resp.text)
+
+
+def _loads_lenient(text):
+    """json.loads that first strips a ```json fence and trailing commas — the two
+    near-misses Gemini/Claude produce on otherwise-valid answers, which used to burn a
+    retry (and then fall through to a more expensive provider)."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1].lstrip("json").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", text))
 
 
 def _call_anthropic(prompt):
     import anthropic
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
     msg = client.messages.create(
-        model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        max_tokens=2048,   # 1024 truncated the full discovery JSON → unterminated string
-        temperature=0,
+        model=os.environ.get("SENTINEL_ANTHROPIC_MODEL", "claude-haiku-5-5"),
+        max_tokens=8192,   # 1024, then 2048, then 4096 ALL still truncated on wider
+                           # tables — a truncated response fails validation and the
+                           # retry uses the same budget, so it fails identically every
+                           # time, wasting a full extra round trip (seen in prod:
+                           # consistent on attempt 1 AND 2, not transient flakiness,
+                           # cutting off at nearly the same ~14k-char mark regardless
+                           # of table size — doubling again for real headroom)
+        # Haiku 5.5 rejects non-default sampling (no temperature=0) and bills thinking as
+        # output - structured extraction needs neither, so thinking is switched off.
+        extra_body={"thinking": {"type": "disabled"}},   # via extra_body: pinned SDK predates `thinking`
         messages=[{"role": "user", "content": prompt + "\n\nReturn a single JSON object only."}],
     )
-    text = msg.content[0].text.strip()
-    # strip a ```json fence if present
-    if text.startswith("```"):
-        text = text.split("```", 2)[1].lstrip("json").strip()
-    return json.loads(text)
+    return _loads_lenient(msg.content[0].text)
 
 
 _CALLERS = {"openai": _call_openai, "gemini": _call_gemini, "anthropic": _call_anthropic}
@@ -322,7 +460,19 @@ def _validate(obj):
         raise ValueError("description.not_computable must be an array")
     if not isinstance(obj["variables"], list):
         raise ValueError("variables must be a list")
-    if obj["dedup_method"] not in ("argmax", "final", "none"):
+    # Models sometimes answer with the table ENGINE ("ReplacingMergeTree") or a variant
+    # spelling instead of the method — map those to the intended value rather than
+    # failing the whole answer (which falls through to a pricier provider).
+    dm = str(obj["dedup_method"] or "none").strip().lower().replace("_", "")
+    if dm in ("argmax", "final", "none"):
+        obj["dedup_method"] = dm
+    elif "final" in dm:
+        obj["dedup_method"] = "final"
+    elif "argmax" in dm or "replacing" in dm or "version" in dm:
+        obj["dedup_method"] = "argmax"
+    elif dm in ("", "null", "n/a", "no"):
+        obj["dedup_method"] = "none"
+    else:
         raise ValueError(f"bad dedup_method: {obj['dedup_method']}")
     w = obj["monitor_frequency_weeks"]
     if not (isinstance(w, int) and 1 <= w <= 4):
@@ -337,6 +487,20 @@ def _validate(obj):
         raise ValueError(f"event_date_column must be string or null: {edc}")
     obj.setdefault("event_date_column", None)
     return obj
+
+
+def _exc_detail(e):
+    """str(e) on an SDK connection error is often just "Connection error" with the
+    real cause (DNS failure, TLS error, timeout, refused connection) thrown away in
+    __cause__ — walk the chain so the actual problem shows up in logs instead of a
+    generic, undiagnosable message."""
+    parts = [f"{type(e).__name__}: {e}"]
+    cause, seen = e.__cause__, set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+        cause = cause.__cause__
+    return " | ".join(parts)
 
 
 def _run(provider, prompt):
@@ -359,7 +523,7 @@ def infer_overlay(payload):
             return _run(provider, _prompt(payload)), provider
         except Exception as e:
             last_err = e
-            log.warning("maker %s failed, falling through: %s", provider, e)
+            log.warning("maker %s failed, falling through: %s", provider, _exc_detail(e))
     raise RuntimeError(f"all LLM providers failed: {last_err}")
 
 
@@ -386,7 +550,7 @@ def check(payload, maker_result, maker_provider, skip_source_type=False):
         try:
             other = _run(provider, _prompt(payload))
         except Exception as e:
-            log.warning("checker %s failed: %s", provider, e)
+            log.warning("checker %s failed: %s", provider, _exc_detail(e))
             continue
         reasons = []
         if not skip_source_type and not _same_source(other["source_type"], maker_result["source_type"]):

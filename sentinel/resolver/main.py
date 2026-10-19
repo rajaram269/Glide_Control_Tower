@@ -102,11 +102,20 @@ def main():
                     columns = disc.introspect_columns(ch, db, tbl)
                     if not columns:
                         continue
+                    # Views get the same treatment as in discovery: their defining SQL
+                    # is the evidence, and measure stats are skipped (each stat query
+                    # re-executes the whole view and times out on non-trivial ones).
+                    r = ch.query("SELECT engine, create_table_query FROM system.tables "
+                                 "WHERE database = {db:String} AND name = {tbl:String}",
+                                 parameters={"db": db, "tbl": tbl}).result_rows
+                    engine, create_query = r[0] if r else ("?", "")
+                    viewish = disc.is_view({"engine": engine})
                     payload = {
-                        "database_name": db, "table_name": tbl, "engine": "?",
+                        "database_name": db, "table_name": tbl, "engine": engine,
                         "sorting_key": "?", "total_rows": 0, "columns": columns,
                         "samples": disc.pii_safe_samples(ch, db, tbl, columns),
-                        "measure_stats": disc.measure_stats(ch, db, tbl, columns),
+                        "measure_stats": {} if viewish else disc.measure_stats(ch, db, tbl, columns),
+                        "is_view": viewish, "create_query": create_query,
                     }
                     adj = llm.adjudicate(payload, row, row.get("review_reason"))
                 except Exception as e:

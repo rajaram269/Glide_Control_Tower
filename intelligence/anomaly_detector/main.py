@@ -1,14 +1,14 @@
 """
 Anomaly Detector — Control Tower
 Hourly Cloud Run job (at :30, offset from collector at :00).
-Reads PostgreSQL only, runs 5 anomaly checks, writes alerts to PostgreSQL.
+Reads PostgreSQL only, runs 8 anomaly checks, writes alerts to PostgreSQL.
 Deduplicates: skips if identical (alert_type, service_name) alert fired < 4h ago.
 
 All checks run against Postgres directly (control_tower schema is the source
 of truth — no ClickHouse mirror). Revisit ClickHouse (via PeerDB CDC) if/when
 row volume makes Postgres aggregation too slow.
 """
-import os, json, uuid, datetime, logging
+import os, json, uuid, datetime, decimal, logging
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -16,6 +16,15 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
+
+
+def _json_default(o):
+    """Postgres NUMERIC columns (error rates, CPU %, latency) arrive as Decimal, which json.dumps
+    cannot serialize - that crashed the whole run (and lost EVERY alert in it) whenever a check
+    that carries such a value fired. Decimal -> float; anything else unknown -> str."""
+    if isinstance(o, decimal.Decimal):
+        return float(o)
+    return str(o)
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
 DEDUP_WINDOW_HOURS = 4
@@ -231,6 +240,113 @@ def check_ec2_pressure(pg_cur):
     return alerts
 
 
+_JOB_PROBLEM_SEVERITY = {"failed": "critical", "missed": "critical", "cancelled": "warn", "stuck": "warn"}
+_JOB_PROBLEM_TEXT = {
+    "failed": "failed its last run",
+    "missed": "hasn't run when its own schedule says it should have",
+    "cancelled": "had its last run cancelled",
+    "stuck": "has been running far longer than usual",
+}
+
+
+def check_job_problems(pg_cur):
+    """Check 6: a Cloud Run job's CURRENT status (its latest check, not any
+    older one) is failed / missed / cancelled / stuck (see gcp_collector's
+    fetch_run_job_metrics + detect_missed_schedules for how these are set).
+    Restricted to active registered jobs — a deleted job shouldn't alert."""
+    pg_cur.execute("""
+        WITH latest AS (
+            SELECT DISTINCT ON (h.service_name)
+                   h.service_name, h.job_status, h.job_last_execution_at, h.job_duration_ms
+            FROM control_tower.service_health h
+            JOIN control_tower.registered_services r
+                ON r.service_name = h.service_name AND r.active = true
+            WHERE h.platform = 'cloud_run_job'
+            ORDER BY h.service_name, h.collected_at DESC
+        )
+        SELECT service_name, job_status, job_last_execution_at, job_duration_ms
+        FROM latest
+        WHERE job_status IN ('failed', 'missed', 'cancelled', 'stuck')
+    """)
+    alerts = []
+    for service, status, last_exec, duration_ms in pg_cur.fetchall():
+        alerts.append({
+            "alert_type": f"job_{status}",
+            "severity": _JOB_PROBLEM_SEVERITY[status],
+            "service_name": service,
+            "message": f"{service} {_JOB_PROBLEM_TEXT[status]}",
+            "context_json": {
+                "job_status": status,
+                "job_last_execution_at": last_exec.isoformat() if last_exec else None,
+                "job_duration_ms": duration_ms,
+            },
+        })
+    return alerts
+
+
+def check_silent_failures(pg_cur):
+    """Check 7: a service is logging its own internal errors (no 5xx attached
+    to them) while its HTTP error rate looks fine — the work is failing but
+    hidden from a plain 5xx-based check. See gcp_collector's
+    _service_log_signals for how error_log_count is computed. Near-zero
+    services log at this level today, so this rarely fires yet — but it
+    activates automatically for any service the moment it starts."""
+    pg_cur.execute("""
+        SELECT DISTINCT ON (service_name) service_name, error_log_count, error_rate_pct
+        FROM control_tower.service_health
+        WHERE platform = 'cloud_run_service'
+        ORDER BY service_name, collected_at DESC
+    """)
+    alerts = []
+    for service, error_logs, error_rate in pg_cur.fetchall():
+        if error_logs and error_logs >= 3 and (error_rate or 0) < 5:
+            alerts.append({
+                "alert_type": "silent_failure",
+                "severity": "warn",
+                "service_name": service,
+                "message": (
+                    f"{service}: {error_logs} internal error log(s) in the last check, "
+                    f"but HTTP error rate is only {error_rate or 0:.1f}%"
+                ),
+                "context_json": {"error_log_count": error_logs, "error_rate_pct": error_rate},
+            })
+    return alerts
+
+
+def check_endpoint_failures(pg_cur):
+    """Check 8: at least one specific URL on a service is failing badly
+    (>=3 requests, >=50% erroring — see gcp_collector's
+    _BAD_ENDPOINT_MIN_REQUESTS/_ERROR_FRACTION) even though the service's
+    OVERALL error rate can look fine — one broken endpoint hiding inside
+    otherwise-healthy traffic."""
+    pg_cur.execute("""
+        SELECT DISTINCT ON (service_name) service_name, bad_endpoints
+        FROM control_tower.service_health
+        WHERE platform = 'cloud_run_service'
+          AND bad_endpoints IS NOT NULL
+          AND jsonb_array_length(bad_endpoints) > 0
+        ORDER BY service_name, collected_at DESC
+    """)
+    alerts = []
+    for service, bad in pg_cur.fetchall():
+        bad = json.loads(bad) if isinstance(bad, str) else (bad or [])
+        if not bad:
+            continue
+        worst = bad[0]
+        extra = f" (+{len(bad) - 1} more)" if len(bad) > 1 else ""
+        alerts.append({
+            "alert_type": "endpoint_failure",
+            "severity": "warn",
+            "service_name": service,
+            "message": (
+                f"{service}: {worst['path']} failing {worst['error_rate_pct']:.0f}% "
+                f"({worst['errors']}/{worst['requests']} requests){extra}"
+            ),
+            "context_json": {"bad_endpoints": bad},
+        })
+    return alerts
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -248,6 +364,9 @@ def main():
                 check_idle_sinks,
                 check_api_degradation,
                 check_ec2_pressure,
+                check_job_problems,
+                check_silent_failures,
+                check_endpoint_failures,
             ]
             for check_fn in checks:
                 try:
@@ -282,7 +401,7 @@ def main():
                             a.get("service_name"),
                             a.get("provider"),
                             a["message"],
-                            json.dumps(a["context_json"]),
+                            json.dumps(a["context_json"], default=_json_default),
                             NOW,
                         )
                         for a in new_alerts

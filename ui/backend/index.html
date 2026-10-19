@@ -141,6 +141,29 @@
     .badge.accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
     .badge.unknown, .badge.low { background: var(--low-bg); color: var(--low-fg); border-color: var(--low-bd); }
 
+    /* Click-to-expand logs under a job/service row */
+    tr.clickable { cursor: pointer; }
+    tr.logs-row, tr.logs-row:hover { background: var(--sunken); }
+    tr.logs-row > td { padding: 12px 14px 16px; }
+    .logs-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+                font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .logs-bar button, .logs-bar select { font: inherit; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+                       border: 1px solid var(--border-strong); background: var(--surface); color: var(--fg-2); }
+    .logs-box { max-height: 420px; overflow: auto; background: var(--surface);
+                border: 1px solid var(--border); border-radius: 8px;
+                font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+    .log-line { display: grid; grid-template-columns: 150px 70px 1fr; gap: 10px; padding: 3px 10px;
+                border-top: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+    .log-line:first-child { border-top: none; }
+    .log-line .ts { color: var(--faint); }
+    .log-line.sev-ERROR, .log-line.sev-CRITICAL, .log-line.sev-ALERT, .log-line.sev-EMERGENCY {
+      background: var(--critical-bg); color: var(--critical-fg); }
+    .log-line.sev-WARNING, .log-line.timeout { background: var(--medium-bg); color: var(--medium-fg); }
+    /* Full raw log entry, shown when a summarized line is clicked open */
+    .log-raw { margin: 0 10px 6px; padding: 8px 10px; background: var(--sunken);
+               border-radius: 6px; font-size: 11px; white-space: pre-wrap; word-break: break-word;
+               color: var(--muted); max-height: 300px; overflow: auto; }
+
     /* Provider cards */
     .provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
     .provider-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
@@ -152,11 +175,6 @@
     .ack-btn { padding: 4px 12px; border: 1px solid var(--border); border-radius: 8px;
                background: var(--surface); color: var(--fg-2); cursor: pointer; font-size: 12px; transition: all .12s; }
     .ack-btn:hover { background: var(--raised); border-color: var(--border-strong); }
-
-    /* Pipeline number chips */
-    .num-badge { padding: 2px 8px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, monospace; }
-    .num-ok   { background: var(--success-bg); color: var(--success-fg); }
-    .num-fail { background: var(--critical-bg); color: var(--critical-fg); }
 
     /* wide tables get a comfortable min-width and scroll inside the card */
     .table-scroll table { min-width: 640px; }
@@ -235,6 +253,8 @@ const fmt = {
     return `${Math.floor(d/86400)}d ago`;
   },
   pct: (n) => n == null ? '—' : `${Number(n).toFixed(1)}%`,
+  // Absolute timestamps are always shown in IST, whatever the viewer's browser zone.
+  ist: (ts) => ts ? new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) + ' IST' : '—',
 };
 
 // Freshness color for "time since X" columns — same idea as data_freshness status,
@@ -246,6 +266,50 @@ function agoColor(ts, { freshHours = 2, staleHours = 26 } = {}) {
   if (hours <= staleHours) return 'var(--muted)';
   return 'var(--medium-fg)';
 }
+
+// Generic 3-way column sort, reusable by any table: click cycles
+// ascending -> descending -> back to the table's own default order.
+// `getters[key]` maps a column key to a comparable value from a row; missing
+// values always sort last regardless of direction (e.g. "never run").
+function useSort() {
+  const [sort, setSort] = useState(null); // { key, dir: 'asc'|'desc' } | null
+  const cycle = (key) => setSort(s =>
+    !s || s.key !== key ? { key, dir: 'asc' }
+    : s.dir === 'asc' ? { key, dir: 'desc' }
+    : null);
+  const apply = (rows, getters) => {
+    if (!sort) return rows;
+    const get = getters[sort.key] || (r => r[sort.key]);
+    const sorted = [...rows].sort((a, b) => {
+      const av = get(a), bv = get(b);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return av < bv ? -1 : av > bv ? 1 : 0;
+    });
+    return sort.dir === 'asc' ? sorted : sorted.reverse();
+  };
+  const Th = ({ label, k, title }) => html`<th style="cursor:pointer;user-select:none"
+      onClick=${() => cycle(k)} title=${title || 'Click to sort'}>
+      ${label} ${sort?.key === k ? (sort.dir === 'asc' ? '▲' : '▼') : '⇅'}
+    </th>`;
+  return { apply, Th };
+}
+
+// Cloud Run job statuses beyond plain succeeded/failed: a run still in progress
+// ("running", or "stuck" if it's well past how long this job normally takes),
+// a run Cloud Run itself cancelled, and "missed" — the job's own cron schedule
+// says it should have fired again by now but hasn't (see detect_missed_schedules
+// in the collector). Badge color = how urgent it is; label text = the reason.
+const JOB_STATUS_BADGE = {
+  succeeded: ['operational', 'succeeded'],
+  running:   ['info', 'running'],
+  stuck:     ['warn', 'stuck'],
+  cancelled: ['high', 'cancelled'],
+  failed:    ['major_outage', 'major outage'],
+  missed:    ['major_outage', 'missed'],
+};
+const jobBadge = (status) => JOB_STATUS_BADGE[status] || ['unknown', status || 'no data'];
 
 const StatusBadge = ({ status }) => {
   const label = (status || 'unknown').replace(/_/g, ' ');
@@ -285,106 +349,358 @@ function SearchBox({ value, onInput, placeholder, count }) {
     </div>`;
 }
 
+// ─── Logs panel ────────────────────────────────────────────────────────────────
+// Rendered as an extra table row under a clicked job/service. Logs are read live
+// from Cloud Logging by the backend, so developers don't need GCP console access.
+function LogsPanel({ kind, name, region, colSpan }) {
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [executions, setExecutions] = useState(null);   // job runs, for the picker
+  const [execution, setExecution] = useState('');       // '' = latest (server default)
+  const [expanded, setExpanded] = useState(() => new Set()); // line indices showing raw JSON
+
+  // A job can run more than once a day — list its recent runs so a specific one
+  // can be picked instead of always seeing only the latest.
+  useEffect(() => {
+    if (kind !== 'job') return;
+    fetch(`/api/logs/job/${encodeURIComponent(name)}/executions?region=${encodeURIComponent(region)}`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setExecutions)
+      .catch(() => setExecutions([]));
+  }, [kind, name, region]);
+
+  const load = useCallback(() => {
+    setData(null); setErr(null); setExpanded(new Set());
+    const execParam = execution ? `&execution=${encodeURIComponent(execution)}` : '';
+    fetch(`/api/logs/${kind}/${encodeURIComponent(name)}?errors_only=${errorsOnly}${execParam}`)
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(setData)
+      .catch(e => setErr(String(e.message || e)));
+  }, [kind, name, errorsOnly, execution]);
+  useEffect(load, [load]);
+
+  const toggleLine = (i) => setExpanded(s => {
+    const next = new Set(s);
+    next.has(i) ? next.delete(i) : next.add(i);
+    return next;
+  });
+
+  const scope = kind === 'job'
+    ? (execution ? `execution ${execution}` : data?.execution ? `latest execution ${data.execution}` : 'last 2 days')
+    : 'last 24 hours';
+  return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
+    <div class="logs-bar">
+      <b style="color:var(--fg-2)">Logs</b><span>${scope} · newest first</span>
+      ${kind === 'job' && executions && executions.length > 0 && html`
+        <select value=${execution} onChange=${e => setExecution(e.target.value)}>
+          <option value="">Latest run</option>
+          ${executions.map((ex, i) => html`<option value=${ex.execution}>
+            Execution ${executions.length - i} — ${ex.status}${ex.started_at ? ' · ' + fmt.ist(ex.started_at) : ''}
+          </option>`)}
+        </select>`}
+      <label style="cursor:pointer"><input type="checkbox" checked=${errorsOnly}
+        onChange=${e => setErrorsOnly(e.target.checked)}/> errors only</label>
+      <button onClick=${load}>Refresh</button>
+    </div>
+    ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
+      : !data ? html`<div style="color:var(--muted);font-size:12px">Loading logs…</div>`
+      : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No log entries${errorsOnly ? ' at ERROR or above' : ''}.</div>`
+      : html`<div class="logs-box">${data.lines.map((l, i) => html`
+          <div class=${`log-line sev-${l.severity}`} style=${l.raw ? 'cursor:pointer' : ''}
+               onClick=${() => l.raw && toggleLine(i)} title=${l.raw ? 'Click for full log entry' : ''}>
+            <span class="ts">${fmt.ist(l.timestamp)}</span>
+            <span>${l.severity}</span>
+            <span>${l.raw ? (expanded.has(i) ? '▾ ' : '▸ ') : ''}${l.message}</span>
+          </div>
+          ${l.raw && expanded.has(i) && html`<pre class="log-raw">${l.raw}</pre>`}`)}</div>`}
+  </td></tr>`;
+}
+
+// Recent request logs for one endpoint (click any row in the breakdown below).
+// Failed requests carry the app's own error line from the same request. Fetched
+// once per endpoint and kept — collapsing/reopening a row doesn't call again;
+// "Refresh" on the breakdown clears it.
+const endpointLogCache = {};
+
+function EndpointLogs({ name, path, colSpan }) {
+  const key = `${name}|${path}`;
+  const [data, setData] = useState(endpointLogCache[key] || null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    if (endpointLogCache[key]) return;
+    fetch(`/api/services/${encodeURIComponent(name)}/endpoints/logs?path=${encodeURIComponent(path)}`)
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(d => { endpointLogCache[key] = d; setData(d); })
+      .catch(e => setErr(String(e.message || e)));
+  }, [key]);
+  return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
+    <div class="logs-bar">
+      <b style="color:var(--fg-2)">Logs</b><span>${path} · newest first · last ${data ? data.since_hours : 24}h</span>
+    </div>
+    ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
+      : !data ? html`<div style="color:var(--muted);font-size:12px">Loading logs…</div>`
+      : !data.lines.length ? html`<div style="color:var(--muted);font-size:12px">No requests for this endpoint.</div>`
+      : html`<div class="logs-box">${data.lines.map(l => html`
+          <div class=${`log-line ${l.timeout ? 'timeout' : 'sev-' + l.severity}`}>
+            <span class="ts">${fmt.ist(l.timestamp)}</span>
+            <span>${l.timeout ? 'TIMEOUT' : l.severity}</span>
+            <span>${l.message}${l.detail ? html`<br/><b>↳ ${l.detail}</b>` : ''}</span>
+          </div>`)}</div>`}
+  </td></tr>`;
+}
+
+// Red = real app errors (short AI/plain explanation), orange = the request was cut
+// off by the container/server timeout, green = no errors.
+function endpointDescription(e) {
+  const appErrors = e.errors - (e.timeouts || 0);
+  const logged = e.logged_errors || 0;   // app logged an error but still answered normally (e.g. 200)
+  return html`${(appErrors > 0 || logged > 0) && html`<div style="color:var(--critical-fg)">${e.description || 'Server error (500)'}${appErrors + logged > 1 ? ` (${appErrors + logged}×)` : ''}</div>`}
+    ${e.timeouts > 0 && html`<div style="color:var(--medium-fg)">Container timeout — ${e.timeouts} request${e.timeouts > 1 ? 's' : ''} cut off (not an app error)</div>`}
+    ${e.errors === 0 && logged === 0 && html`<span style="color:var(--success-fg)">✓ OK</span>`}
+    ${(e.errors > 0 || logged > 0) && html`<div style="color:var(--muted)">Click this row to see its logs</div>`}`;
+}
+
+// Per-URL request/error breakdown for a service — an aggregate error rate can
+// hide one broken endpoint inside otherwise-healthy traffic; this is how
+// that's found. Read live from Cloud Logging (no app change needed — Cloud
+// Run logs every request's URL/status on its own).
+function EndpointBreakdownPanel({ name, colSpan }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [openPath, setOpenPath] = useState(null);   // endpoint whose logs are expanded
+  const load = useCallback(() => {
+    setData(null); setErr(null);
+    Object.keys(endpointLogCache).forEach(k => k.startsWith(`${name}|`) && delete endpointLogCache[k]);
+    fetch(`/api/services/${encodeURIComponent(name)}/endpoints`)
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.detail || r.status); return d; })
+      .then(setData)
+      .catch(e => setErr(String(e.message || e)));
+  }, [name]);
+  useEffect(load, [load]);
+
+  return html`<tr class="logs-row"><td colspan=${colSpan} onClick=${e => e.stopPropagation()}>
+    <div class="logs-bar">
+      <b style="color:var(--fg-2)">Endpoints</b><span>${data ? `last ${data.since_hours}h` : ''}</span>
+      <button onClick=${load}>Refresh</button>
+    </div>
+    ${err ? html`<div style="color:var(--critical-fg);font-size:12px">${err}</div>`
+      : !data ? html`<div style="color:var(--muted);font-size:12px">Loading endpoint breakdown…</div>`
+      : !data.endpoints.length ? html`<div style="color:var(--muted);font-size:12px">No requests in this window.</div>`
+      : html`${data.background_errors && html`<div style="color:var(--muted);font-size:12px;margin-bottom:8px">
+            Not from any API call (background, ${data.background_errors.count}× in ${data.since_hours}h): ${data.background_errors.description || 'an error was logged'}</div>`}
+        <div class="table-scroll"><table>
+          <thead><tr><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Error rate</th><th>Description</th></tr></thead>
+          <tbody>${data.endpoints.map(e => html`<${Fragment} key=${e.path}>
+            <tr class="clickable" style=${(e.errors - (e.timeouts || 0) + (e.logged_errors || 0)) > 0 ? 'background:var(--critical-bg)' : ''}
+                onClick=${() => setOpenPath(openPath === e.path ? null : e.path)}>
+              <td class="mono clamp wide" title=${e.path} style="font-size:12px">${openPath === e.path ? '▾ ' : '▸ '}${e.path}</td>
+              <td>${e.requests}</td>
+              <td>${(() => { const real = e.errors - (e.timeouts || 0) + (e.logged_errors || 0);
+                  return html`<span style=${real ? 'color:var(--critical-fg)' : ''}>${real}</span>${e.timeouts > 0 && html`<div style="color:var(--medium-fg);font-size:11px">+${e.timeouts} timeout${e.timeouts > 1 ? 's' : ''}</div>`}`; })()}</td>
+              <td style=${e.error_rate_pct >= 50 ? 'color:var(--critical-fg);font-weight:600'
+                        : e.error_rate_pct > 0 ? 'color:var(--medium-fg)' : ''}>${e.error_rate_pct}%</td>
+              <td style="font-size:12px">${endpointDescription(e)}</td>
+            </tr>
+            ${openPath === e.path && html`<${EndpointLogs} name=${name} path=${e.path} colSpan=${5}/>`}
+          <//>`)}</tbody>
+        </table></div>`}
+  </td></tr>`;
+}
+
 // ─── Views ────────────────────────────────────────────────────────────────────
 
 function ServicesView() {
   const [rows] = useApi('/api/services');
   const [q, setQ] = useState('');
+  const [open, setOpen] = useState(null);   // service whose logs are expanded
+  const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No Cloud Run services registered.</div>`;
-  const shown = rows.filter(r => rowMatches(r, q));
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    request_count: r => r.request_count,
+    error_rate_pct: r => r.error_rate_pct,
+    instance_count: r => r.instance_count,
+    p95_latency_ms: r => r.p95_latency_ms,
+  });
   return html`
     <div class="view-head">
-      <div class="section-title">Services — ${rows.length} request-driven, always-listening</div>
+      <div class="section-title">Services — ${rows.length} request-driven, always-listening · click a row for endpoint breakdown & logs</div>
       <${SearchBox} value=${q} onInput=${setQ} placeholder="Search services…" count=${shown.length}/>
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Service</th><th>Requests (1h)</th>
-        <th>Err%</th><th>Instances</th>
-        <th>P95 Latency</th><th>Checked</th>
+        <th>Service</th><${Th} label="Requests (24h)" k="request_count" title="Total requests over the last 24 hours"/>
+        <${Th} label="Err% (24h)" k="error_rate_pct" title="5xx error rate over the last 24 hours, not just right now"/>
+        <${Th} label="Instances" k="instance_count" title="Current instance count (right now, not a 24h figure)"/>
+        <${Th} label="P95 Latency (24h peak)" k="p95_latency_ms" title="Worst P95 latency seen in the last 24 hours"/><th>Checked</th>
       </tr></thead>
       <tbody>
-        ${shown.map(r => html`<tr key=${r.service_name}>
-          <td class="mono">${r.service_name}</td>
+        ${shown.map(r => {
+          // Caught in the last 24h even if the current 1h snapshot looks clean: a
+          // service logging real internal errors while still returning 200 (silent
+          // failure), or one specific endpoint failing badly inside otherwise-healthy
+          // traffic. Name turns red so this doesn't require opening every row to find.
+          const hadRecentError = r.error_log_count_24h > 0 || r.had_bad_endpoint_24h;
+          return html`<${Fragment} key=${r.service_name}>
+          <tr class="clickable" onClick=${() => setOpen(open === r.service_name ? null : r.service_name)}>
+          <td class="mono" style=${hadRecentError ? 'color:var(--critical-fg);font-weight:600' : ''}
+              title=${hadRecentError ? `${r.error_log_count_24h} internal error log(s) in the last 24h${r.had_bad_endpoint_24h ? ' · a specific endpoint is failing badly' : ''}` : ''}>
+            ${open === r.service_name ? '▾' : '▸'} ${r.service_name}${hadRecentError ? ' ⚠' : ''}</td>
           <td>${fmt.num(r.request_count)}</td>
           <td style=${r.error_rate_pct > 5 ? 'color:var(--critical-fg);font-weight:600' : ''}>${fmt.pct(r.error_rate_pct)}</td>
           <td style=${r.instance_count === 0 ? 'color:var(--faint)' : ''}>${fmt.num(r.instance_count)}${r.instance_count === 0 ? ' (idle)' : ''}</td>
           <td>${fmt.ms(r.p95_latency_ms)}</td>
           <td style="color:var(--muted)">${fmt.ago(r.collected_at)}</td>
-        </tr>`)}
+          </tr>
+          ${open === r.service_name && html`<${EndpointBreakdownPanel} name=${r.service_name} colSpan=${6}/>`}
+        <//>`;})}
       </tbody>
     </table></div>`;
+}
+
+// Starts a job now (for re-running after a code fix, without GCP access). The backend
+// requires a run token; it is asked for once per browser session and kept in
+// sessionStorage only. Refuses if the job is already running.
+function RunJobButton({ name, region }) {
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    if (!confirm(`Run "${name}" now?
+
+This starts a real execution in production.`)) return;
+    let token = '';
+    try { token = sessionStorage.getItem('ct_run_token') || ''; } catch (e) {}
+    if (!token) token = prompt('Enter the run token:') || '';
+    if (!token) return;
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/jobs/${encodeURIComponent(name)}/run?region=${encodeURIComponent(region)}`,
+        { method: 'POST', headers: { 'X-Run-Token': token } });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (r.status === 403) { try { sessionStorage.removeItem('ct_run_token'); } catch (e) {} }
+        alert(d.detail || `Could not start the job (${r.status}).`);
+      } else {
+        try { sessionStorage.setItem('ct_run_token', token); } catch (e) {}
+        alert(`Started ${name}${d.execution ? ' — ' + d.execution : ''}. Open its row and press Refresh to follow the logs.`);
+      }
+    } catch (e) { alert('Could not reach the server: ' + e); }
+    setBusy(false);
+  };
+  return html`<button class="ack-btn" disabled=${busy} onClick=${run} title="Run this job now">${busy ? 'Starting…' : '▶ Run'}</button>`;
 }
 
 function JobsView() {
   const [rows] = useApi('/api/jobs');
   const [q, setQ] = useState('');
+  const { apply: applySort, Th } = useSort();
+  const [open, setOpen] = useState(null);   // job whose logs are expanded
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No Cloud Run jobs registered.</div>`;
 
-  const shown = rows.filter(r => rowMatches(r, q));
-  const failing = shown.filter(r => r.job_status === 'failed').length;
+  // Problem statuses rank first when sorted ascending: a stuck/cancelled/missed
+  // run is just as much a problem as an outright failure, just for a different
+  // reason — running is normal/neutral, succeeded is last.
+  const PROBLEM_STATUSES = ['failed', 'missed', 'cancelled', 'stuck'];
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    region: r => r.region,
+    job_status: r => PROBLEM_STATUSES.includes(r.job_status) ? 0 : r.job_status === 'succeeded' ? 2 : 1,
+  });
+  const failing = shown.filter(r => PROBLEM_STATUSES.includes(r.job_status)).length;
   const neverRun = shown.filter(r => !r.job_last_execution_at).length;
 
   return html`
     <div class="view-head">
       <div class="section-title">
         Jobs — ${rows.length} scheduled/batch
-        ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} failing</span>`}
+        ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} need attention</span>`}
         ${neverRun > 0 && html`<span style="color:var(--medium-fg)"> · ${neverRun} no execution data</span>`}
+        <span style="color:var(--faint);font-weight:400"> · click a row for logs</span>
       </div>
       <${SearchBox} value=${q} onInput=${setQ} placeholder="Search jobs…" count=${shown.length}/>
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Job</th><th>Region</th><th>Last outcome</th>
-        <th>Last run</th><th>Duration</th><th>Checked</th>
+        <th>Job</th><${Th} label="Region" k="region"/>
+        <${Th} label="Last outcome" k="job_status" title="Click to sort: problems first → succeeded first"/>
+        <th>Last run</th><th>Duration</th><th>Checked</th><th></th>
       </tr></thead>
       <tbody>
-        ${shown.map(r => html`<tr key=${r.service_name}>
-          <td class="mono">${r.service_name}</td>
+        ${shown.map(r => html`<${Fragment} key=${r.service_name}>
+          <tr class="clickable" onClick=${() => setOpen(open === r.service_name ? null : r.service_name)}>
+          <td class="mono">${open === r.service_name ? '▾' : '▸'} ${r.service_name}</td>
           <td style="color:var(--muted);font-size:12px">${r.region}</td>
-          <td>${r.job_status
-            ? html`<${StatusBadge} status=${r.job_status === 'succeeded' ? 'operational' : 'major_outage'}/>`
-            : html`<span class="badge unknown">no data</span>`}</td>
+          <td>${(([cls, label]) => html`<span class="badge ${cls}">${label}</span>`)(jobBadge(r.job_status))}</td>
           <td style=${`color:${agoColor(r.job_last_execution_at)}`}>
             ${r.job_last_execution_at ? fmt.ago(r.job_last_execution_at) : 'never seen'}
           </td>
-          <td>${fmt.ms(r.job_duration_ms)}</td>
+          <td>${fmt.ms(r.job_duration_ms)}${['running','stuck'].includes(r.job_status) ? ' so far' : ''}</td>
           <td style="color:var(--faint);font-size:12px">${fmt.ago(r.collected_at)}</td>
-        </tr>`)}
+          <td onClick=${e => e.stopPropagation()}><${RunJobButton} name=${r.service_name} region=${r.region}/></td>
+          </tr>
+          ${open === r.service_name && html`<${LogsPanel} kind="job" name=${r.service_name} region=${r.region} colSpan=${7}/>`}
+        <//>`)}
       </tbody>
     </table></div>
     <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.6">
       <b style="color:var(--muted)">Last run</b> = when the job itself finished executing (green ≤2h, gray ≤26h, amber older).
       <b style="color:var(--muted)">Checked</b> = when Control Tower last scraped this job's status — can be more recent
       than the job's actual last run if it's on an infrequent schedule.
+      <b style="color:var(--muted)">stuck</b> = still running, well past how long it normally takes.
+      <b style="color:var(--muted)">missed</b> = its own schedule says it should have run again by now, but hasn't.
     </div>
     <${SchedulerJobsView}/>`;
 }
 
 function SchedulerJobsView() {
   const [rows] = useApi('/api/scheduler-jobs');
+  const [q, setQ] = useState('');
+  const { apply: applySort, Th } = useSort();
   if (!rows) return null;
   if (!rows.length) return null;
-  const failing = rows.filter(r => r.last_attempt_status && !['ok', 'never run'].includes(r.last_attempt_status)).length;
+  const filtered = rows.filter(r => rowMatches(r, q));
+  // Problems first when sorted ascending: paused/disabled before enabled, failing
+  // before never-run before ok.
+  const shown = applySort(filtered, {
+    region: r => r.region,
+    state: r => (!r.state || r.state === 'ENABLED') ? 1 : 0,
+    last_attempt_at: r => r.last_attempt_at ? new Date(r.last_attempt_at).getTime() : null,
+    last_attempt_status: r => r.last_attempt_status === 'ok' ? 2 : r.last_attempt_status === 'never run' ? 1 : 0,
+  });
+  const failing = filtered.filter(r => r.last_attempt_status && !['ok', 'never run'].includes(r.last_attempt_status)).length;
+  const paused = shown.filter(r => r.state && r.state !== 'ENABLED').length;
+  const target = r =>
+    r.target_type === 'cloud_run_job' ? html`<span class="badge info">job</span> <span class="mono">${r.target_name}</span>`
+    : r.target_type === 'pubsub' ? html`<span class="badge">pubsub</span> <span class="mono">${r.target_name}</span>`
+    : r.target_uri ? html`<span class="badge">${r.target_type || 'http'}</span> <span class="mono">${r.target_uri}</span>`
+    : '—';
 
   return html`
-    <div class="section-title" style="margin-top:28px">
-      Scheduler-Triggered HTTP Endpoints — ${rows.length} (cron logic inside a service, not a real Cloud Run Job)
-      ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} failing</span>`}
+    <div class="view-head" style="margin-top:28px">
+      <div class="section-title">
+        Cloud Scheduler — ${rows.length} schedulers (all regions, auto-discovered)
+        ${failing > 0 && html`<span style="color:var(--critical-fg)"> · ${failing} failing</span>`}
+        ${paused > 0 && html`<span style="color:var(--medium-fg)"> · ${paused} paused</span>`}
+      </div>
+      <${SearchBox} value=${q} onInput=${setQ} placeholder="Search schedulers…" count=${shown.length}/>
     </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Scheduler</th><th>Region</th><th>Schedule</th>
-        <th>Last attempt</th><th>Outcome</th><th>Checked</th>
+        <th>Scheduler</th><${Th} label="Region" k="region"/><th>Schedule</th><th>Target</th>
+        <${Th} label="State" k="state" title="Click to sort: paused/disabled first → enabled first"/>
+        <${Th} label="Last attempt" k="last_attempt_at"/>
+        <${Th} label="Outcome" k="last_attempt_status" title="Click to sort: failing first → ok first"/>
+        <th>Checked</th>
       </tr></thead>
       <tbody>
-        ${rows.map(r => html`<tr key=${r.scheduler_name}>
+        ${shown.map(r => html`<tr key=${r.scheduler_name}>
           <td class="mono">${r.scheduler_name}</td>
           <td style="color:var(--muted);font-size:12px">${r.region}</td>
           <td class="mono" style="font-size:12px;color:var(--muted)">${r.schedule || '—'}</td>
+          <td class="clamp wide" style="font-size:12px" title=${r.target_uri || ''}>${target(r)}</td>
+          <td>${!r.state || r.state === 'ENABLED'
+            ? html`<span style="color:var(--muted);font-size:12px">${r.state ? 'enabled' : '—'}</span>`
+            : html`<span class="badge warn">${r.state.toLowerCase()}</span>`}</td>
           <td style=${`color:${agoColor(r.last_attempt_at)}`}>
             ${r.last_attempt_at ? fmt.ago(r.last_attempt_at) : 'never seen'}
           </td>
@@ -401,23 +717,74 @@ function SchedulerJobsView() {
     </table></div>`;
 }
 
+// Providers we know we depend on but don't have live monitoring wired up for yet.
+// Shows as a placeholder card so they aren't forgotten — swapped for a real card
+// automatically once /api/providers starts returning a row with this name.
+const PLACEHOLDER_PROVIDERS = ['BrightData', 'Capsolver', 'Gemini', 'Hiker'];
+// Account this token/login belongs to — shown so it's clear which account is
+// being checked. Static (not fetched from the API), so it can only ever show
+// what was actually given, never guessed.
+const PROVIDER_ACCOUNT = { brightdata: 'ai@holistique.in', hiker: 'hikerapi.com', gemini: 'Google AI Studio' };
+
+// Two real OpenAI keys exist in this project (one shared, one Sentinel-only) and
+// one dying doesn't mean the other did — shown together in one OpenAI card
+// (public status on top, each key's own line below) rather than one combined
+// "openai" row that could hide which credential broke.
+const OPENAI_KEY_LABEL = { openai_key: 'General Key', openai_sentinel_key: 'Sentinel Key' };
+
 function ProvidersView() {
   const [rows] = useApi('/api/providers');
   if (!rows) return html`<div class="loading">Loading…</div>`;
   const borderColor = { operational:'var(--success-bd)', degraded:'var(--medium-bd)', partial_outage:'var(--high-bd)', major_outage:'var(--critical-bd)' };
+  const openaiStatus = rows.find(r => r.provider.toLowerCase() === 'openai');
+  const openaiKeys = rows.filter(r => r.provider.toLowerCase() in OPENAI_KEY_LABEL);
+  const otherRows = rows.filter(r => r.provider.toLowerCase() !== 'openai' && !(r.provider.toLowerCase() in OPENAI_KEY_LABEL));
+  const known = new Set(rows.map(r => r.provider.toLowerCase()));
+  const placeholders = PLACEHOLDER_PROVIDERS.filter(p => !known.has(p.toLowerCase()));
+  const openaiWorst = [openaiStatus, ...openaiKeys].reduce((worst, r) => {
+    const rank = { operational: 0, degraded: 1, partial_outage: 2, major_outage: 3 };
+    return r && (rank[r.overall_status] ?? 0) > (rank[worst] ?? -1) ? r.overall_status : worst;
+  }, 'operational');
   return html`
     <div class="section-title">Third-Party Provider Status</div>
     <div class="provider-grid">
-      ${rows.map(r => {
+      ${(openaiStatus || openaiKeys.length > 0) && html`<div class="provider-card"
+        style=${`border-color:${borderColor[openaiWorst]||'var(--border)'}`}>
+        <div class="provider-name">OpenAI</div>
+        ${openaiStatus && html`<${Fragment}>
+          <${StatusBadge} status=${openaiStatus.overall_status}/>
+          ${openaiStatus.affected_components?.length > 0 && html`<div class="provider-components">${openaiStatus.affected_components.slice(0,3).join(', ')}</div>`}
+          <div style="font-size:11px;color:var(--faint);margin-top:4px">${fmt.ago(openaiStatus.polled_at)}</div>
+        <//>`}
+        ${openaiKeys.length > 0 && html`<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--faint);margin-bottom:6px">API KEYS</div>
+          ${openaiKeys.map(r => html`<${Fragment} key=${r.provider}>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <span style="font-size:12px">${OPENAI_KEY_LABEL[r.provider.toLowerCase()]}</span>
+              <${StatusBadge} status=${r.overall_status}/>
+            </div>
+            ${r.affected_components?.length > 0 && html`<div class="provider-components" style="margin-top:-2px">${r.affected_components.join(', ')}</div>`}
+          <//>`)}
+        </div>`}
+      </div>`}
+      ${otherRows.map(r => {
         const comps = Array.isArray(r.affected_components) ? r.affected_components : [];
+        const account = PROVIDER_ACCOUNT[r.provider.toLowerCase()];
         return html`<div key=${r.provider} class="provider-card"
           style=${`border-color:${borderColor[r.overall_status]||'var(--border)'}`}>
           <div class="provider-name">${r.provider}</div>
+          ${account && html`<div style="font-size:11px;color:var(--faint);margin:-4px 0 6px">${account}</div>`}
           <${StatusBadge} status=${r.overall_status}/>
           ${comps.length > 0 && html`<div class="provider-components">${comps.slice(0,3).join(', ')}${comps.length>3?` +${comps.length-3} more`:''}</div>`}
           <div style="font-size:11px;color:var(--faint);margin-top:8px">${fmt.ago(r.polled_at)}</div>
         </div>`;
       })}
+      ${placeholders.map(name => html`<div key=${name} class="provider-card"
+        style="border:1px dashed var(--border);filter:grayscale(1);opacity:.6">
+        <div class="provider-name" style="color:var(--faint)">${name}</div>
+        <span class="badge unknown">not monitored yet</span>
+        <div style="font-size:11px;color:var(--faint);margin-top:8px">awaiting monitoring setup</div>
+      </div>`)}
     </div>`;
 }
 
@@ -434,6 +801,12 @@ function alertTitle(t) {
     idle_sink: 'A data table went idle',
     third_party_degradation: 'A provider is degraded',
     ec2_resource_pressure: 'A server is under pressure',
+    job_failed: 'A job failed',
+    job_missed: 'A job missed its schedule',
+    job_cancelled: 'A job run was cancelled',
+    job_stuck: 'A job is stuck running',
+    silent_failure: 'A service is failing silently',
+    endpoint_failure: 'One endpoint is broken',
   };
   return map[t] || (t || 'Alert').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
@@ -447,6 +820,12 @@ function alertAdvice(t) {
     sentinel_reconciliation: 'Two tables that should roughly agree on a metric are diverging. One may be wrong or stale.',
     idle_sink: 'This ClickHouse table has not received new data recently. The job that feeds it likely failed.',
     third_party_degradation: 'An external API (OpenAI, Anthropic, etc.) is degraded. Errors here may be transient — check the provider status.',
+    job_failed: 'Open the job\'s logs (click it on the Jobs page) to see the actual error, then decide whether to just rerun it or fix the underlying cause.',
+    job_missed: 'Its own cron schedule says it should have run again by now. Check the Cloud Scheduler trigger for this job — it may have been deleted, paused, or lost permission to run it.',
+    job_cancelled: 'Someone or something cancelled this run before it finished. If nobody did this on purpose, check for a deploy, quota limit, or manual stop around that time.',
+    job_stuck: 'Still running well past how long it normally takes. It may finish on its own — if not, check its logs for a hang (e.g. waiting on a slow external call) and consider cancelling and rerunning it.',
+    silent_failure: 'This service is answering requests normally (no server errors) but is logging internal errors itself. Click it on the Services page and check its logs to see what\'s actually going wrong inside.',
+    endpoint_failure: 'One specific URL on this service is failing badly while the rest of the service is fine. Click the service on the Services page to see the per-endpoint breakdown and its logs.',
   };
   return map[t] || 'Review the details and the affected service.';
 }
@@ -497,48 +876,6 @@ function AlertsView() {
           <div style="margin-top:16px"><button class="ack-btn" onClick=${()=>ack(sel.alert_id)}>✓ Dismiss this alert</button></div>`;
       })()}
     </${Drawer}>`;
-}
-
-function PipelineView() {
-  const [rows] = useApi('/api/pipeline');
-  if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`
-    <div class="empty">
-      <p>No pipeline events yet.</p>
-      <p style="margin-top:8px;font-size:12px;color:var(--border)">
-        Add <code style="background:var(--sunken);padding:2px 6px;border-radius:4px">CT_METRICS:</code> log lines to your Cloud Run jobs to track processing metrics.
-      </p>
-    </div>`;
-
-  return html`
-    <div class="section-title">Pipeline Processing Metrics — last run per job</div>
-    <div class="table-scroll"><table>
-      <thead><tr>
-        <th>Job</th><th>Step</th><th>Status</th>
-        <th>Processed</th><th>Failed</th><th>Duration</th>
-        <th>24h runs</th><th>24h total processed</th><th>Last run</th>
-      </tr></thead>
-      <tbody>
-        ${rows.map(r => {
-          const h24 = r.history_24h || {};
-          return html`<tr key=${r.pipeline_id}>
-            <td class="mono">${r.pipeline_id}</td>
-            <td style="color:var(--muted)">${r.step_name}</td>
-            <td><${StatusBadge} status=${r.status}/></td>
-            <td><span class="num-badge num-ok">${fmt.num(r.rows_written)}</span></td>
-            <td>${r.rows_failed ? html`<span class="num-badge num-fail">${fmt.num(r.rows_failed)}</span>` : '—'}</td>
-            <td>${fmt.ms(r.duration_ms)}</td>
-            <td>${fmt.num(h24.runs_24h)}</td>
-            <td>${fmt.num(h24.total_processed_24h)}</td>
-            <td style="color:var(--muted)">${fmt.ago(r.occurred_at)}</td>
-          </tr>`;
-        })}
-      </tbody>
-    </table></div>
-    <div style="margin-top:16px;padding:14px;background:var(--bg);border-radius:8px;font-size:12px;color:var(--faint);line-height:1.8">
-      <b style="color:var(--muted)">How to add metrics to a service:</b><br/>
-      <code style="color:var(--success-fg)">log.info("CT_METRICS: " + json.dumps({"records_processed": 1234, "records_failed": 5, "step": "main"}))</code>
-    </div>`;
 }
 
 function CostsView() {
@@ -593,7 +930,7 @@ function CostsView() {
 
 // Maps a freshness sub-status (fresh/stale/dead/static) to a status-badge class.
 const freshBadge = (s) => s === 'fresh' ? 'operational' : s === 'stale' ? 'degraded'
-  : s === 'dead' ? 'major_outage' : s === 'static' ? 'info' : 'unknown';
+  : s === 'dead' ? 'major_outage' : s === 'static' ? 'info' : 'unknown';   // 'inactive' -> grey
 
 // Decimal weeks → human cadence label ("~daily", "~2h", "weekly", "monthly").
 function cadenceLabel(weeks) {
@@ -617,6 +954,7 @@ function freshDisplay(r) {
   if (s === 'stale')  return { cls: 'degraded', label: 'Stale' };
   if (s === 'dead')   return { cls: 'major_outage', label: 'Dead' };
   if (s === 'static') return { cls: 'info', label: 'Static' };
+  if (s === 'inactive') return { cls: 'unknown', label: 'Inactive' };
   return { cls: 'unknown', label: s };
 }
 
@@ -624,9 +962,20 @@ function FreshnessView() {
   const [rows] = useApi('/api/sentinel/freshness');
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(null);
+  const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
-  const shown = rows.filter(r => rowMatches(r, q));
+  // Dead/stale rank first (the problem you'd want to act on), static/n-a tables last
+  // (nothing to do there) — same "problems first" convention as the Jobs page.
+  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+    sync: r => r.is_static ? 4
+      : r.sync_status === 'dead' ? 0 : r.sync_status === 'stale' ? 1
+      : r.sync_status === 'fresh' ? 3 : 2,
+    data: r => r.is_static ? 5
+      : !r.data_column ? 4   // n/a — no business date column on this table at all
+      : r.data_status === 'dead' ? 0 : r.data_status === 'stale' ? 1
+      : r.data_status === 'fresh' ? 3 : r.data_status === 'inactive' ? 3.5 : 2,
+  });
   const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
   const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
   const dataBad = shown.filter(r => ['stale','dead'].includes(r.data_status)).length;
@@ -640,9 +989,22 @@ function FreshnessView() {
       ${dataBad > 0 && html`<span style="color:var(--high-fg)">● ${dataBad} data stale/dead (business date old)</span>`}
       ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (daily 07:30 IST)</span>`}
     </div>
+    <div class="callout" style="margin-bottom:14px;font-size:12px;line-height:1.7;background:var(--raised);border:1px solid var(--border);color:var(--fg-2)">
+      <b>How to read these statuses.</b>
+      <span class="badge operational">Fresh</span> newest data is inside the allowed window.
+      <span class="badge degraded">Stale</span> late: past the window but less than 3× it — a warning, it may still catch up.
+      <span class="badge major_outage">Dead</span> more than 3× the window — the feed has most likely stopped.
+      <span class="badge unknown">Inactive</span> no data in the last 12 months — not judged (old customers/channels never count as dead).
+      <br/>The <b>allowed window</b> is the table's normal update rhythm (daily, weekly, monthly…) and <b>never less than 3 days</b>:
+      a daily table is Fresh up to 3 days old, Stale from 3 to 9 days, Dead after 9 days; a weekly table is Fresh to 7 days, Stale to 21, Dead after.
+      Only the <b>last 12 months</b> of data are ever looked at. <b>Sync</b> = when rows were last written (is the pipeline running);
+      <b>Data</b> = newest business date, for the table and for each platform/brand inside it.
+    </div>
     <div class="table-scroll"><table>
       <thead><tr>
-        <th>Table</th><th>Sync</th><th>Data</th><th>Expected update</th>
+        <th>Table</th><${Th} label="Sync" k="sync" title="Click to sort: dead/stale first → fresh last"/>
+        <${Th} label="Data" k="data" title="Click to sort: dead/stale first → fresh last"/><th>Expected update</th>
+        <th title="The business/event date column Sentinel uses to judge Data freshness">Event date column</th>
         <th>Newest data</th><th>Monitored variables</th>
       </tr></thead>
       <tbody>
@@ -650,17 +1012,34 @@ function FreshnessView() {
           const tv = Array.isArray(r.tracked_variables) ? r.tracked_variables : [];
           const syncD = freshDisplay({ ...r, sentinel_status: r.sync_status || r.sentinel_status });
           const bad = ['stale','dead'].includes(r.data_status) || ['stale','dead'].includes(r.sync_status);
+          // A table with no table-level date column can still show a Data verdict here
+          // if one of its tracked variables (e.g. one platform) came back stale/dead —
+          // that escalation happens server-side, so data_status alone already covers it.
           const dataBadge = r.is_static ? html`<span class="badge unknown">—</span>`
-            : !r.data_column ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
+            : !r.data_column && !r.data_status ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
             : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
             : html`<span class="badge unknown">—</span>`;
+          // Short reason right in the row — e.g. "Platform: 2 stale" — so you don't
+          // have to open the drawer just to see which dimension is the problem.
+          const vfDetail = Array.isArray(r.variable_freshness_detail) ? r.variable_freshness_detail : [];
+          const reasonShort = vfDetail.map(d => {
+            const dead = (d.dead_values||[]).length, stale = (d.stale_values||[]).length;
+            return `${d.variable}: ` + [dead && `${dead} dead`, stale && `${stale} stale`].filter(Boolean).join(', ');
+          }).join(' · ');
           return html`<tr key=${`${r.database_name}.${r.table_name}`} onClick=${()=>setSel(r)} style=${bad ? 'background:var(--critical-bg)' : ''}>
             <td class="mono clamp wide" title=${`${r.database_name}.${r.table_name}`}>
               <span style="color:var(--muted)">${r.database_name}.</span>${r.table_name}
               ${r.is_static ? html`<span class="badge info" style="margin-left:6px">static</span>` : ''}</td>
             <td><span class=${`badge ${syncD.cls}`} title=${`synced ${fmt.ago(r.sync_last_write||r.sentinel_last_write)}`}>${r.is_static ? 'static' : syncD.label}</span></td>
-            <td title=${r.data_column ? `business date: ${r.data_column}` : ''}>${dataBadge}</td>
+            <td title=${r.data_column ? `business date: ${r.data_column}` : ''}>
+              ${dataBadge}
+              ${reasonShort && html`<div style="font-size:11px;color:var(--high-fg);margin-top:2px">${reasonShort}</div>`}
+            </td>
             <td style="color:var(--fg-2);font-size:13px">${r.is_static ? '—' : cadenceLabel(r.expected_cadence_weeks)}</td>
+            <td class="mono" style="font-size:12px">${r.is_static ? '—'
+              : (r.data_column || r.picked_event_column)
+                ? html`<span class="badge accent">${r.data_column || r.picked_event_column}</span>`
+                : html`<span style="color:var(--high-fg)" title="No business date column identified — only sync is tracked">none</span>`}</td>
             <td style="color:var(--muted)" title=${r.data_last || ''}>${r.data_column ? fmt.ago(r.data_last) : '—'}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length
               ? tv.map(v => html`<span class="badge accent" style="margin-right:4px">${v}</span>`)
@@ -676,6 +1055,7 @@ function FreshnessView() {
         const syncD = freshDisplay({ ...sel, sentinel_status: sel.sync_status });
         const dataLabel = sel.is_static ? 'not monitored (static)'
           : !sel.data_column ? 'no business date on this table — only sync is tracked'
+          : sel.data_status === 'inactive' ? 'inactive — no data in the last 12 months (not judged)'
           : sel.data_status ? sel.data_status : 'not checked yet';
         return html`
           ${sel.is_static ? html`<div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg);margin-bottom:16px">This is a frozen reference table — freshness is never alarmed on it.</div>` : ''}
@@ -685,8 +1065,27 @@ function FreshnessView() {
           <div class="kv"><div class="kv-label">Is the data current? (Data)</div>
             <div class=${`callout ${sel.data_status==='fresh'?'good':(['stale','dead'].includes(sel.data_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.data_status)?'background:var(--raised);border:1px solid var(--border)':''}>
               <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
-          ${(['stale','dead'].includes(sel.data_status) && !['stale','dead'].includes(sel.sync_status)) && html`
-            <div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`}
+          <div class="kv"><div class="kv-label">Event date column (used for Data freshness)</div>
+            <div class="mono">${sel.is_static ? '—' : (sel.data_column || sel.picked_event_column || 'none identified')}</div></div>
+          ${(() => {
+            if (!['stale','dead'].includes(sel.data_status) || ['stale','dead'].includes(sel.sync_status)) return null;
+            // the table's OWN date vs the same allowed window the checks use (cadence, never under 3 days)
+            const win = Math.max((Number(sel.expected_cadence_weeks) || 0.1428) * 7, 3);
+            const ageDays = sel.data_last ? (Date.now() - new Date(sel.data_last)) / 86400000 : Infinity;
+            if (ageDays > win) return html`<div class="callout bad">⚠ This table is <b>syncing fine but its data is stale</b> — the pipeline runs, but no new business records are coming in. Check the upstream source.</div>`;
+            const det = Array.isArray(sel.variable_freshness_detail) ? sel.variable_freshness_detail : [];
+            const n = det.reduce((a, d) => a + (d.dead_values || []).length + (d.stale_values || []).length, 0);
+            return html`<div class="callout bad">⚠ The table itself is <b>current</b> (newest ${sel.data_column || 'date'} ${fmt.ago(sel.data_last)}), but <b>${n} value${n === 1 ? '' : 's'}</b> inside it (${det.map(d => d.variable).join(', ')}) have no recent data — see the list below.</div>`;
+          })()}
+          ${Array.isArray(sel.variable_freshness_detail) && sel.variable_freshness_detail.length > 0 && html`
+            <div class="callout bad" style="margin-top:8px">
+              <b>⚠ Specific values with stale/dead data</b> — this is why Data shows ${sel.data_status} even if most of the table looks fine:
+              ${sel.variable_freshness_detail.map(d => html`<div style="margin-top:6px">
+                <b>${d.variable}</b>:
+                ${(d.dead_values||[]).map(v => html`<span class="badge major_outage" style="margin:2px 4px 0 0">${v}</span>`)}
+                ${(d.stale_values||[]).map(v => html`<span class="badge degraded" style="margin:2px 4px 0 0">${v}</span>`)}
+              </div>`)}
+            </div>`}
           <div class="kv"><div class="kv-label">Expected update frequency</div>${sel.is_static?'frozen':cadenceLabel(sel.expected_cadence_weeks)}</div>
           ${tv.length>0 && html`<div class="kv"><div class="kv-label">Monitored dimensions</div>${tv.map(v=>html`<span class="badge accent" style="margin-right:4px">${v}</span>`)}</div>`}
           ${sel.mismatch && html`<div class="kv"><div class="kv-label">Legacy check</div>The old freshness path disagrees (says ${sel.legacy_status}) — being verified before retiring it.</div>`}`;
@@ -770,7 +1169,7 @@ function CatalogView() {
   const [sel, setSel] = useState(null);
   const [q, setQ] = useState('');
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs daily at 06:45 IST.</div>`;
+  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs weekly, Mondays at 06:45 IST.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
   return html`
     <div class="view-head">
@@ -877,7 +1276,9 @@ function CoverageView() {
     <div class="table-scroll"><table>
       <thead><tr>
         <th>Table</th><th>Variable</th><th>Active values</th><th>Retired</th>
-        <th>Last check</th><th>Missing values</th><th>Last seen</th>
+        <th title="Result of the most recent coverage check">Last check</th>
+        <th title="When that check ran (IST)">Checked</th><th>Missing values</th>
+        <th title="When discovery last re-read this variable's list of values (weekly) - not when data arrived">Values refreshed</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => {
@@ -888,7 +1289,8 @@ function CoverageView() {
             <td style="color:var(--accent)">${r.variable}</td>
             <td>${fmt.num(r.active_values)}</td>
             <td style="color:var(--muted)">${fmt.num(r.retired_values)}</td>
-            <td>${r.last_check_status ? html`<${StatusBadge} status=${r.last_check_status}/>` : '—'}</td>
+            <td>${r.last_check_status ? html`<${StatusBadge} status=${r.last_check_status}/>` : html`<span style="color:var(--faint)" title="Checks run when a variable is due (every 1-4 weeks); a new variable waits for its first run">not yet</span>`}</td>
+            <td style="color:var(--muted);font-size:12px" title=${r.last_check_at ? fmt.ist(r.last_check_at) : ''}>${r.last_check_at ? fmt.ago(r.last_check_at) : '—'}</td>
             <td class="clamp" style="color:var(--medium-fg);font-size:12px" title=${missing.join(', ')}>${missing.length
               ? `${missing.slice(0,5).join(', ')}${missing.length>5?` +${missing.length-5}`:''}`
               : html`<span style="color:var(--faint)">—</span>`}</td>
@@ -1073,7 +1475,6 @@ const NAV_GROUPS = [
     { id: 'services',   icon: '▦', label: 'Services'   },
     { id: 'jobs',       icon: '⚙', label: 'Jobs'       },
     { id: 'providers',  icon: '⚡', label: 'Providers'  },
-    { id: 'pipeline',   icon: '⇌', label: 'Pipeline'   },
     { id: 'alerts',     icon: '◈', label: 'Alerts'     },
     { id: 'costs',      icon: '₹', label: 'Costs'      },
   ]},
@@ -1238,7 +1639,6 @@ function App() {
           ${view === 'services'  && html`<${ServicesView}/>`}
           ${view === 'jobs'      && html`<${JobsView}/>`}
           ${view === 'providers' && html`<${ProvidersView}/>`}
-          ${view === 'pipeline'  && html`<${PipelineView}/>`}
           ${view === 'freshness' && html`<${FreshnessView}/>`}
           ${view === 'alerts'    && html`<${AlertsView}/>`}
           ${view === 'costs'     && html`<${CostsView}/>`}

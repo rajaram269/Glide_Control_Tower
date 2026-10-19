@@ -3,13 +3,14 @@ Control Tower UI — FastAPI backend
 Serves React dashboard at GET / and REST API at /api/*.
 Connects directly to PostgreSQL (same Cloud SQL instance as collectors).
 """
-import os, json
+import os, json, re, hmac, time, logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Request, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -50,7 +51,7 @@ def summary():
                     FROM control_tower.service_health
                     WHERE platform = 'cloud_run_job'
                     ORDER BY service_name, collected_at DESC
-                 ) j WHERE job_status = 'failed') AS jobs_failing,
+                 ) j WHERE job_status IN ('failed', 'missed', 'cancelled', 'stuck')) AS jobs_failing,
                 (SELECT COUNT(*) FROM control_tower.alerts WHERE acknowledged_at IS NULL) AS open_alerts,
                 (SELECT COUNT(*) FROM control_tower.alerts WHERE acknowledged_at IS NULL AND severity = 'critical') AS critical_alerts,
                 (SELECT COALESCE(SUM(cost_usd), 0) FROM control_tower.cost_metrics
@@ -63,17 +64,67 @@ def summary():
 
 @app.get("/api/services")
 def services():
-    """Cloud Run services only — request-driven, has traffic/latency metrics."""
+    """Cloud Run services only — request-driven, has traffic/latency metrics.
+    Traffic/error numbers are a real 24h rollup, not a single 1h snapshot — a service
+    that errored heavily 3 hours ago but looks clean right now should still show it."""
     with get_db() as cur:
         cur.execute("""
-            SELECT DISTINCT ON (service_name)
-                service_name, platform, region,
-                request_count, error_count, error_rate_pct,
-                instance_count, p50_latency_ms, p95_latency_ms,
-                collected_at
-            FROM control_tower.service_health
-            WHERE platform = 'cloud_run_service'
-            ORDER BY service_name, collected_at DESC
+            WITH latest AS (
+                -- instance_count/collected_at are point-in-time gauges (how many
+                -- instances RIGHT NOW) — summing those across a day is meaningless,
+                -- so this part still takes the latest snapshot.
+                SELECT DISTINCT ON (service_name)
+                    service_name, platform, region,
+                    instance_count, collected_at
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND service_name IN (
+                      SELECT service_name FROM control_tower.registered_services WHERE active = true)
+                ORDER BY service_name, collected_at DESC
+            ),
+            day AS (
+                -- request_count/error_count are per-hour deltas, so SUM gives a true
+                -- 24h total; error_rate_pct is recomputed from those sums (not
+                -- averaged — averaging per-hour percentages skews toward quiet hours).
+                -- p95 latency takes the worst hour in the day, not just whatever the
+                -- latest snapshot happened to catch.
+                SELECT service_name,
+                       SUM(COALESCE(request_count, 0))               AS request_count_24h,
+                       SUM(COALESCE(error_count, 0))                 AS error_count_24h,
+                       MAX(p95_latency_ms)                            AS p95_latency_ms_24h
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND collected_at >= now() - interval '24 hours'
+                GROUP BY service_name
+            ),
+            -- 24h rollup of the "deeper than 5xx rate" signals (migration 020) — the
+            -- latest single row can show 0 errors even though this service logged a
+            -- real internal error a few hours ago; this is what drives the red-name
+            -- highlight so you don't have to open every service to find out.
+            err24 AS (
+                SELECT service_name,
+                       SUM(COALESCE(error_log_count, 0)) AS error_log_count_24h,
+                       bool_or(bad_endpoints IS NOT NULL
+                               AND jsonb_array_length(bad_endpoints) > 0) AS had_bad_endpoint_24h
+                FROM control_tower.service_health
+                WHERE platform = 'cloud_run_service'
+                  AND collected_at >= now() - interval '24 hours'
+                GROUP BY service_name
+            )
+            SELECT latest.service_name, latest.platform, latest.region,
+                   latest.instance_count, latest.collected_at,
+                   COALESCE(day.request_count_24h, 0) AS request_count,
+                   COALESCE(day.error_count_24h, 0) AS error_count,
+                   CASE WHEN COALESCE(day.request_count_24h, 0) > 0
+                        THEN round(100.0 * day.error_count_24h / day.request_count_24h, 2)
+                        ELSE 0 END AS error_rate_pct,
+                   day.p95_latency_ms_24h AS p95_latency_ms,
+                   COALESCE(err24.error_log_count_24h, 0) AS error_log_count_24h,
+                   COALESCE(err24.had_bad_endpoint_24h, false) AS had_bad_endpoint_24h
+            FROM latest
+            LEFT JOIN day   USING (service_name)
+            LEFT JOIN err24 USING (service_name)
+            ORDER BY service_name
         """)
         return cur.fetchall()
 
@@ -91,25 +142,592 @@ def jobs():
                 job_last_execution_at, collected_at
             FROM control_tower.service_health
             WHERE platform = 'cloud_run_job'
+              AND service_name IN (
+                  SELECT service_name FROM control_tower.registered_services WHERE active = true)
             ORDER BY service_name, collected_at DESC
         """)
         return cur.fetchall()
 
 
+# ─── Run a job from the dashboard ─────────────────────────────────────────────
+#
+# Lets developers who have no GCP "execute" permission re-run a job after fixing code
+# (the pipeline deploys from git; the re-run is the missing step). The dashboard itself
+# has NO login, so this is guarded: disabled until RUN_JOB_TOKEN is configured (Secret
+# Manager -> env), the caller must send it, only registered+active Cloud Run jobs can be
+# started, a job that is already running is never started twice, and there is a per-job
+# cooldown. Every attempt is written to the logs. Needs roles/run.developer (or
+# run.jobs.run) on the UI's service account.
+
+RUN_JOB_TOKEN = os.environ.get("RUN_JOB_TOKEN", "").strip()
+RUN_COOLDOWN_SECONDS = 60
+_last_run_at = {}
+audit_log = logging.getLogger("ct.run_job")
+
+
+@app.post("/api/jobs/{name}/run")
+def run_job(name: str, region: str, request: Request, x_run_token: str = Header(default="")):
+    who = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0].strip()
+    if not _RUN_NAME.match(name) or not _RUN_NAME.match(region):
+        raise HTTPException(400, "invalid job name or region")
+    if not RUN_JOB_TOKEN:
+        raise HTTPException(403, "Running jobs from the dashboard is disabled (RUN_JOB_TOKEN is not configured).")
+    if not hmac.compare_digest(x_run_token.encode(), RUN_JOB_TOKEN.encode()):
+        audit_log.warning("RUN DENIED (bad token) job=%s region=%s from=%s", name, region, who)
+        raise HTTPException(403, "Wrong run token.")
+    with get_db() as cur:
+        cur.execute("""SELECT 1 FROM control_tower.registered_services
+                       WHERE active = true AND platform = 'cloud_run_job'
+                         AND service_name = %s AND region = %s""", (name, region))
+        if not cur.fetchone():
+            raise HTTPException(404, "Not a registered, active Cloud Run job.")
+    now = time.time()
+    if now - _last_run_at.get(name, 0) < RUN_COOLDOWN_SECONDS:
+        raise HTTPException(429, f"{name} was just started — wait {RUN_COOLDOWN_SECONDS}s before running it again.")
+    from google.cloud import run_v2
+    from google.api_core import exceptions as gexc
+    try:
+        parent = f"projects/{LOG_PROJECT}/locations/{region}/jobs/{name}"
+        latest = next(iter(run_v2.ExecutionsClient().list_executions(parent=parent)), None)
+        if latest is not None and not latest.completion_time:
+            raise HTTPException(409, f"{name} is already running ({latest.name.split('/')[-1]}).")
+        _last_run_at[name] = now
+        op = run_v2.JobsClient().run_job(request=run_v2.RunJobRequest(name=parent))
+        try:
+            execution = op.metadata.name.split("/")[-1]
+        except Exception:
+            execution = None
+    except HTTPException:
+        raise
+    except gexc.PermissionDenied:
+        raise HTTPException(503, "The dashboard's service account lacks permission to run jobs (needs roles/run.developer).")
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Could not start job: {type(e).__name__}: {first_line}")
+    audit_log.warning("RUN STARTED job=%s region=%s execution=%s from=%s", name, region, execution, who)
+    return {"ok": True, "job": name, "execution": execution}
+
+
 @app.get("/api/scheduler-jobs")
 def scheduler_jobs():
-    """Cloud Scheduler jobs whose target is a plain HTTP endpoint on a Cloud
-    Run service (cron logic living inside the service, not a real Cloud Run
-    Job) — the scheduler's own last-attempt status is the only signal for these."""
+    """Every Cloud Scheduler job in the project (all regions, all target types),
+    auto-discovered by the GCP collector. target_type/target_name say what each
+    one triggers (a Cloud Run Job, an HTTP endpoint, Pub/Sub, App Engine)."""
     with get_db() as cur:
         cur.execute("""
             SELECT scheduler_name, schedule, target_uri, region,
+                   target_type, target_name, state,
                    last_attempt_at, last_attempt_status, checked_at
             FROM control_tower.scheduler_jobs
             WHERE active = true
             ORDER BY scheduler_name
         """)
         return cur.fetchall()
+
+
+# ─── Logs (read live from Cloud Logging) ──────────────────────────────────────
+#
+# Lets developers without GCP console access read a job's / service's logs
+# from the dashboard. Uses the UI's own service account (roles/logging.viewer).
+# Jobs: entries of a chosen execution, defaulting to the latest (last 2 days).
+# Services: last 24 hours.
+
+LOG_PROJECT = os.environ.get("GCP_PROJECT", "seoai-479305")
+_LOG_TARGETS = {
+    "job":     ("cloud_run_job",      "job_name",     timedelta(days=2)),
+    "service": ("cloud_run_revision", "service_name", timedelta(hours=24)),
+}
+# Cloud Run naming rules — also keeps the name from injecting into the filter.
+_RUN_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_EXEC_LABEL = "run.googleapis.com/execution_name"
+
+
+def _log_line(entry):
+    p = entry.payload
+    raw = None
+    if isinstance(p, dict):
+        status = p.get("status") if isinstance(p.get("status"), dict) else None
+        # Plain app logs have "message"/"msg". Cloud Run execution audit-log entries
+        # (job started/failed/etc.) instead carry it at status.message — e.g.
+        # "Execution my-job-abcd has failed to complete, 0/1 tasks were a success."
+        # Without this, these render as one unreadable multi-hundred-field JSON dump
+        # (the raw audit record) instead of the one line Cloud Console shows.
+        msg = p.get("message") or p.get("msg") or (status and status.get("message"))
+        if msg:
+            raw = json.dumps(p, default=str)[:4000]  # kept so the full record can be inspected
+        else:
+            msg = json.dumps(p, default=str)
+    else:
+        msg = "" if p is None else str(p)
+    req = entry.http_request or {}
+    if req:   # Cloud Run request log: show which request, its status and latency
+        msg = (f'{req.get("requestMethod", "")} {req.get("requestUrl", "")} → '
+               f'{req.get("status", "")} ({req.get("latency", "")}) {msg}').strip()
+    return {"timestamp": entry.timestamp, "severity": entry.severity or "DEFAULT",
+            "message": msg[:4000], "raw": raw}
+
+
+@app.get("/api/logs/job/{name}/executions")
+def job_executions(name: str, region: str):
+    """Every execution of this job from the same 2-day window the logs themselves
+    use — not a fixed count. A job that runs every 10 minutes should list all of
+    today's and yesterday's runs, however many that is; a job that runs weekly
+    should list just the one or two that fall in that window."""
+    if not _RUN_NAME.match(name) or not _RUN_NAME.match(region):
+        raise HTTPException(400, "invalid job name or region")
+    cutoff = datetime.now(timezone.utc) - _LOG_TARGETS["job"][2]
+    SAFETY_CAP = 200  # guards only against a pathological once-a-minute job; not a normal limit
+    try:
+        from google.cloud import run_v2
+        client = run_v2.ExecutionsClient()
+        parent = f"projects/{LOG_PROJECT}/locations/{region}/jobs/{name}"
+        execs = []
+        for e in client.list_executions(parent=parent):  # API returns newest-first
+            start = e.start_time or e.create_time
+            if start and start < cutoff:
+                break  # everything from here on is even older than the window
+            execs.append({
+                "execution": e.name.split("/")[-1],
+                "started_at": start.isoformat() if start else None,
+                "completed_at": e.completion_time.isoformat() if e.completion_time else None,
+                "status": "running" if not e.completion_time
+                          else ("failed" if e.failed_count else "succeeded"),
+            })
+            if len(execs) >= SAFETY_CAP:
+                break
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Executions unavailable: {type(e).__name__}: {first_line}")
+    return execs
+
+
+@app.get("/api/logs/{kind}/{name}")
+def logs(kind: str, name: str, execution: str = None, errors_only: bool = False, limit: int = 200):
+    if kind not in _LOG_TARGETS or not _RUN_NAME.match(name):
+        raise HTTPException(400, "unknown log target")
+    if execution is not None and not _RUN_NAME.match(execution):
+        raise HTTPException(400, "invalid execution name")
+    resource_type, label, window = _LOG_TARGETS[kind]
+    limit = max(1, min(limit, 500))
+    since = (datetime.now(timezone.utc) - window).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = (f'resource.type="{resource_type}" AND resource.labels.{label}="{name}" '
+            f'AND timestamp>="{since}"')
+
+    try:
+        from google.cloud import logging as gcp_logging
+        client = gcp_logging.Client(project=LOG_PROJECT)
+        if kind == "job":
+            if execution:
+                # A specific run was picked from the execution dropdown.
+                base += f' AND labels."{_EXEC_LABEL}"="{execution}"'
+            else:
+                # No run picked (first load) — default to whichever one logged most
+                # recently, same as before the dropdown existed.
+                newest = next(iter(client.list_entries(
+                    filter_=base, order_by=gcp_logging.DESCENDING, max_results=1)), None)
+                execution = newest.labels.get(_EXEC_LABEL) if newest and newest.labels else None
+                if execution:
+                    base += f' AND labels."{_EXEC_LABEL}"="{execution}"'
+        flt = base + (" AND severity>=ERROR" if errors_only else "")
+        entries = client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
+                                      max_results=limit, page_size=limit)
+        lines = [_log_line(e) for e in entries]
+    except Exception as e:
+        # Typically no GCP credentials (local run) or a Logging API quota hit.
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Logs unavailable: {type(e).__name__}: {first_line}")
+
+    return {"kind": kind, "name": name, "execution": execution,
+            "since": since, "lines": lines}
+
+
+# Same normalization rule the collector uses (see gcp_collector's
+# _normalize_path) — kept here too since this endpoint reads Cloud Logging
+# live rather than the collector's stored per-run snapshot, to give a fuller
+# window (24h) when someone clicks in to investigate a service.
+_ENDPOINT_ID_SEGMENT = re.compile(
+    r'^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d+|[0-9a-zA-Z]{20,})$'
+)
+
+
+def _normalize_endpoint_path(path):
+    return '/'.join('{id}' if _ENDPOINT_ID_SEGMENT.match(seg) else seg for seg in path.split('/'))
+
+
+_TIMEOUT_CACHE = {}
+
+
+def _service_timeout(name):
+    """The service's configured request timeout in seconds (default 300). Cloud Run
+    often reports a timed-out request as a plain 500 that took about this long."""
+    if name not in _TIMEOUT_CACHE:
+        secs = 300
+        try:
+            from google.cloud import run_v2
+            for svc in run_v2.ServicesClient().list_services(parent=f"projects/{LOG_PROJECT}/locations/-"):
+                if svc.name.split("/")[-1] == name:
+                    secs = int(svc.template.timeout.total_seconds()) or 300
+                    break
+        except Exception:
+            pass
+        _TIMEOUT_CACHE[name] = secs
+    return _TIMEOUT_CACHE[name]
+
+
+def _request_note(entry):
+    """Cloud Run's own note on a request log (e.g. 'container ... too much memory')."""
+    p = entry.payload
+    if isinstance(p, dict):
+        p = p.get("message") or p.get("msg")
+    return str(p).strip() if p else ""
+
+
+_REASON_WORDS = re.compile(r"can't|cannot|unable|failed|refused|denied|timed out|timeout|exception|error|invalid", re.I)
+
+
+_STRONG_WORDS = re.compile(r"can't|cannot|unable|refused|denied|timed out|failed|unreachable", re.I)
+
+
+def _headline(text):
+    """The most telling line of a multi-line error: first one with an error word
+    (ignoring bare labels like 'prisma:error'), else the last line."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for words in (_STRONG_WORDS, _REASON_WORDS):
+        for l in lines:
+            if words.search(l) and len(l) > 20:
+                return l
+    return lines[-1] if lines else ""
+
+
+def _latency_secs(entry):
+    try:
+        return float(str((entry.http_request or {}).get("latency") or "0").rstrip("s"))
+    except ValueError:
+        return 0.0
+
+
+def _window_note(client, gcp_logging, base, entry):
+    """Apps like Node/Prisma log their error without a trace id. Fall back to the
+    app log lines written while this request was running."""
+    req = entry.http_request or {}
+    try:
+        secs = float(str(req.get("latency") or "0").rstrip("s"))
+    except ValueError:
+        secs = 0
+    start = entry.timestamp
+    end = start + timedelta(seconds=secs + 1)
+    flt = (f'{base} AND -httpRequest.status:* AND timestamp>="{start.isoformat()}" '
+           f'AND timestamp<="{end.isoformat()}"')
+    texts = []
+    for e in client.list_entries(filter_=flt, order_by=gcp_logging.ASCENDING, max_results=30, page_size=30):
+        t = _log_line(e)["message"]
+        if t.strip():
+            texts.append(t)
+    return _headline(chr(10).join(texts)) if any(_REASON_WORDS.search(t) for t in texts) else None
+
+
+def _is_timeout(entry, limit):
+    """A request cut off at the container/server timeout — 504, Cloud Run's own
+    'maximum request timeout' note, or a 5xx that ran right up to the limit."""
+    req = entry.http_request or {}
+    if (req.get("status") or 0) < 500:
+        return False
+    try:
+        secs = float(str(req.get("latency") or "0").rstrip("s"))
+    except ValueError:
+        secs = 0
+    return (req.get("status") == 504 or "maximum request timeout" in _request_note(entry)
+            or secs >= limit - 5)
+
+
+SUMMARY_MODEL = os.environ.get("OPENAI_SUMMARY_MODEL", "gpt-5-mini")
+_DESC_CACHE = {}   # (service, path, error text) -> description; keeps AI calls rare
+
+
+def _describe_errors(name, samples):
+    """{path: short plain-English reason} for endpoints with app errors. Only the
+    error text is sent to the AI (never successes), in one cheap gpt-5-mini call,
+    and cached. Without OPENAI_API_KEY (or on failure) falls back to the raw error line."""
+    import urllib.request
+    out, todo = {}, {}
+    for path, msgs in samples.items():
+        key = (name, path, "\n".join(msgs)[:2000])
+        if key in _DESC_CACHE:
+            out[path] = _DESC_CACHE[key]
+        elif not msgs:
+            out[path] = "Server error (500) — no app error line found"
+        else:
+            todo[path] = key
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    fallback = lambda path: _headline(samples[path][0]).split(". ")[0][:140]
+    if todo and api_key:
+        try:
+            body = json.dumps({
+                "model": SUMMARY_MODEL, "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "You explain server errors to a non-expert. For each "
+                     "endpoint, write ONE short sentence (max 15 words) in very simple English saying what "
+                     "went wrong. Use only the error text given. Reply as JSON: {\"<endpoint>\": \"<sentence>\"}."},
+                    {"role": "user", "content": json.dumps({p: [m[:700] for m in samples[p][:3]] for p in todo})[:12000]}],
+                # gpt-5* / o-series are reasoning models: no temperature, max_completion_tokens (reasoning
+                # tokens count toward it, billed as output) and the lowest reasoning effort for a one-line summary.
+                **({"max_completion_tokens": 1500,
+                    "reasoning_effort": "minimal" if SUMMARY_MODEL == "gpt-5" or SUMMARY_MODEL.startswith("gpt-5-") else "low"}
+                   if SUMMARY_MODEL.startswith(("gpt-5", "o1", "o3", "o4"))
+                   else {"max_tokens": 600, "temperature": 0.2})}).encode()
+            req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, headers={
+                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                got = json.loads(json.load(r)["choices"][0]["message"]["content"])
+            for path, key in todo.items():
+                val = got.get(path)
+                if val is None and len(todo) == 1 and len(got) == 1:
+                    val = next(iter(got.values()))      # model renamed the single key
+                if isinstance(val, str) and val.strip():
+                    out[path] = _DESC_CACHE[key] = val.strip()
+                else:
+                    logging.getLogger("ct.describe").warning("no summary matched %r in %r", path, list(got)[:5])
+        except Exception as e:
+            logging.getLogger("ct.describe").warning("error summary failed: %s: %s", type(e).__name__, e)
+    for path in todo:
+        out.setdefault(path, fallback(path))
+    return out
+
+
+@app.get("/api/services/{name}/endpoints")
+def service_endpoints(name: str, hours: int = 24):
+    """Per-URL request/error breakdown for a Cloud Run service, read live from
+    Cloud Logging — Cloud Run logs every request's URL and status on its own,
+    no app change needed. An aggregate error rate can hide one broken endpoint
+    inside otherwise-healthy traffic; this is how that's found."""
+    if not _RUN_NAME.match(name):
+        raise HTTPException(400, "invalid service name")
+    hours = max(1, min(hours, 168))
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    flt = (f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" '
+           f'AND httpRequest.status>0 AND timestamp>="{since}"')
+
+    try:
+        from google.cloud import logging as gcp_logging
+        from urllib.parse import urlparse
+        client = gcp_logging.Client(project=LOG_PROJECT)
+        by_path = {}
+        trace_path, fail_traces = {}, set()   # request trace -> endpoint; traces of 5xx requests
+        fail_windows = []                     # (start, end) of each 5xx request, for trace-less app errors
+        limit = _service_timeout(name)
+        for entry in client.list_entries(filter_=flt, order_by=gcp_logging.DESCENDING,
+                                          max_results=2000, page_size=1000):
+            req = entry.http_request or {}
+            status = req.get("status") or 0
+            path = _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/")
+            d = by_path.setdefault(path, {"requests": 0, "errors": 0, "timeouts": 0, "fails": [],
+                                          "logged": 0, "logged_msgs": []})
+            d["requests"] += 1
+            if entry.trace:
+                trace_path[entry.trace] = path
+            if status >= 500:
+                d["errors"] += 1
+                if entry.trace:
+                    fail_traces.add(entry.trace)
+                fail_windows.append((entry.timestamp, entry.timestamp + timedelta(seconds=_latency_secs(entry) + 1)))
+                if _is_timeout(entry, limit):
+                    d["timeouts"] += 1
+                else:
+                    if len(d["fails"]) < 5:
+                        d["fails"].append(entry)
+        # Errors the app logged itself while still answering normally (e.g. HTTP 200) —
+        # the "silent failures". Matched to their request by trace so the failing API is
+        # named; any that can't be tied to a request are kept and shown on their own row.
+        unattributed, seen_traces = [], set()
+        for entry in client.list_entries(
+                filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND -httpRequest.status:*"),
+                order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+            msg, tr = _log_line(entry)["message"], entry.trace
+            if tr and tr in trace_path:
+                if tr in fail_traces or tr in seen_traces:
+                    continue    # a 5xx request: explained by its own failure below
+                seen_traces.add(tr)
+                d = by_path[trace_path[tr]]
+                d["logged"] += 1
+                if len(d["logged_msgs"]) < 5:
+                    d["logged_msgs"].append(msg)
+            elif not any(a <= entry.timestamp <= b for a, b in fail_windows):
+                # (lines logged while a failing request ran belong to that request —
+                # they already explain its 5xx, so they are not "background")
+                unattributed.append((entry.timestamp, msg))
+        # One error spreads over many log lines (a Python traceback is dozens) — lines
+        # within 2s of each other are one event, so "92 lines" is not reported as 92 errors.
+        unattributed.sort(key=lambda x: x[0])
+        events, last_ts = [], None
+        for ts, msg in unattributed:
+            if last_ts is None or (ts - last_ts).total_seconds() > 2:
+                events.append([])
+            events[-1].append(msg)
+            last_ts = ts
+        unattributed = ["\n".join(ev) for ev in events]
+        # The app's own ERROR line (matched by trace) says *why* a request failed.
+        wanted = {e.trace for d in by_path.values() for e in d["fails"] if e.trace and not _request_note(e)}
+        app_msgs = {}
+        if wanted:
+            for entry in client.list_entries(
+                    filter_=flt.replace("httpRequest.status>0", "severity>=ERROR AND -httpRequest.status:*"),
+                    order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+                if entry.trace in wanted and entry.trace not in app_msgs:
+                    app_msgs[entry.trace] = _log_line(entry)["message"]
+        base = flt.replace(" AND httpRequest.status>0", "")
+        samples = {}
+        for p, d in by_path.items():
+            msgs = []
+            for e in d["fails"]:
+                msg = _request_note(e) or app_msgs.get(e.trace) or _window_note(client, gcp_logging, base, e)
+                if msg:
+                    msgs.append(msg)
+            samples[p] = msgs + d["logged_msgs"]
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Endpoint breakdown unavailable: {type(e).__name__}: {first_line}")
+
+    to_explain = {p: samples[p] for p, d in by_path.items()
+                  if d["errors"] > d["timeouts"] or d["logged"] > 0}
+    OUTSIDE = "(background)"   # errors not tied to any API call: described, but never an endpoint row
+    if unattributed:
+        to_explain[OUTSIDE] = list(dict.fromkeys(unattributed))[:5]
+    descriptions = _describe_errors(name, to_explain)
+    endpoints = [
+        {"path": p, "requests": d["requests"], "errors": d["errors"], "timeouts": d["timeouts"],
+         "logged_errors": d["logged"],
+         # container timeouts are not app errors — kept out of the error rate
+         "error_rate_pct": round(100 * (d["errors"] - d["timeouts"] + d["logged"]) / d["requests"], 1),
+         "description": descriptions.get(p)}
+        for p, d in by_path.items()
+    ]
+    background = ({"count": len(unattributed), "description": descriptions.get(OUTSIDE)}
+                  if unattributed else None)
+    endpoints.sort(key=lambda r: (-(r["errors"] - r["timeouts"] + r["logged_errors"]), -r["timeouts"], -r["requests"]))
+    return {"since_hours": hours, "endpoints": endpoints, "background_errors": background}
+
+
+_LOGS_CACHE = {}   # (service, path, hours) -> (fetched_at, lines); a re-open never re-queries Logging
+_LOGS_TTL = 120
+
+
+def _endpoint_logs(name, path, hours, limit=50):
+    """Recent request logs for one (normalized) endpoint path — successes and
+    failures. A failed request (5xx) is paired with the reason it failed: Cloud
+    Run's own note, the app's ERROR line from the same trace, or the app lines
+    written while it ran."""
+    import time
+    from google.cloud import logging as gcp_logging
+    from urllib.parse import urlparse
+    ckey = (name, path, hours)
+    hit = _LOGS_CACHE.get(ckey)
+    if hit and time.time() - hit[0] < _LOGS_TTL:
+        return hit[1]
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = (f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" '
+            f'AND timestamp>="{since}"')
+    client = gcp_logging.Client(project=LOG_PROJECT)
+    requests_ = []
+    limit_s = _service_timeout(name)
+    for entry in client.list_entries(filter_=base + " AND httpRequest.status>0",
+                                     order_by=gcp_logging.DESCENDING, max_results=1000, page_size=1000):
+        req = entry.http_request or {}
+        if _normalize_endpoint_path(urlparse(req.get("requestUrl") or "").path or "/") == path:
+            requests_.append(entry)
+    # Keep every recent failure (up to 20) even if it is older than the newest
+    # `limit` requests, then fill the rest with the newest requests.
+    is_fail = lambda e: (e.http_request or {}).get("status", 0) >= 500
+    failed = [e for e in requests_ if is_fail(e)][:20]
+    others = [e for e in requests_ if not is_fail(e)][:max(limit - len(failed), 0)]
+    requests_ = sorted(failed + others, key=lambda e: e.timestamp, reverse=True)
+    traces = {e.trace for e in failed if e.trace and not _request_note(e)}
+    app_msgs = {}
+    if traces:
+        for entry in client.list_entries(filter_=base + " AND severity>=ERROR AND -httpRequest.status:*",
+                                         order_by=gcp_logging.DESCENDING, max_results=500, page_size=500):
+            if entry.trace in traces and entry.trace not in app_msgs:
+                app_msgs[entry.trace] = _log_line(entry)["message"]
+    lines, looked_up = [], 0
+    for e in requests_:
+        line = _log_line(e)
+        line["detail"] = None
+        line["timeout"] = False
+        if is_fail(e):
+            line["timeout"] = _is_timeout(e, limit_s)
+            line["detail"] = app_msgs.get(e.trace)
+            if not line["detail"] and not _request_note(e) and looked_up < 15:
+                looked_up += 1
+                line["detail"] = _window_note(client, gcp_logging, base, e)
+        lines.append(line)
+    _LOGS_CACHE[ckey] = (time.time(), lines)
+    return lines
+
+
+@app.get("/api/services/{name}/endpoints/logs")
+def service_endpoint_logs(name: str, path: str, hours: int = 24):
+    if not _RUN_NAME.match(name):
+        raise HTTPException(400, "invalid service name")
+    hours = max(1, min(hours, 168))
+    try:
+        return {"path": path, "since_hours": hours, "lines": _endpoint_logs(name, path, hours)}
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Endpoint logs unavailable: {type(e).__name__}: {first_line}")
+
+
+def _check_hiker_live():
+    api_key = os.environ.get("HIKER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.hikerapi.com/sys/balance",
+            headers={"x-access-key": api_key, "User-Agent": "GlideControlTower/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                amount = data.get("amount")
+                currency = data.get("currency", "USD")
+                requests_count = data.get("requests")
+                components = []
+                if amount is not None:
+                    components.append(f"Balance: ${amount:,.2f}" if currency == "USD" else f"Balance: {amount} {currency}")
+                return {
+                    "provider": "hiker",
+                    "overall_status": "operational" if (amount is None or amount > 0) else "major_outage",
+                    "affected_components": components,
+                    "polled_at": datetime.now(timezone.utc),
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _check_gemini_live():
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            headers={"User-Agent": "GlideControlTower/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name", "") for m in data.get("models", []) if "gemini" in m.get("name", "")]
+                return {
+                    "provider": "gemini",
+                    "overall_status": "operational",
+                    "affected_components": [],
+                    "polled_at": datetime.now(timezone.utc),
+                }
+    except Exception:
+        pass
+    return None
 
 
 @app.get("/api/providers")
@@ -128,6 +746,18 @@ def providers():
                     r["affected_components"] = json.loads(r["affected_components"])
                 except Exception:
                     pass
+            if str(r.get("provider", "")).lower() == "hiker" and isinstance(r.get("affected_components"), list):
+                r["affected_components"] = [c for c in r["affected_components"] if str(c).startswith("Balance:")]
+            if str(r.get("provider", "")).lower() == "gemini" and r.get("overall_status") == "operational":
+                r["affected_components"] = []
+        if not any(str(r.get("provider", "")).lower() == "hiker" for r in rows):
+            hiker_status = _check_hiker_live()
+            if hiker_status:
+                rows.append(hiker_status)
+        if not any(str(r.get("provider", "")).lower() == "gemini" for r in rows):
+            gemini_status = _check_gemini_live()
+            if gemini_status:
+                rows.append(gemini_status)
         return rows
 
 
@@ -161,41 +791,6 @@ def ack_alert(alert_id: str):
         if not cur.fetchone():
             raise HTTPException(404, "Alert not found or already acknowledged")
     return {"ok": True}
-
-
-@app.get("/api/pipeline")
-def pipeline(limit: int = 100):
-    with get_db() as cur:
-        cur.execute("""
-            SELECT DISTINCT ON (pipeline_id)
-                pipeline_id, step_name, execution_id, event_type, status,
-                rows_written, rows_failed, duration_ms, error_message,
-                metadata_json, occurred_at
-            FROM control_tower.pipeline_events
-            ORDER BY pipeline_id, occurred_at DESC
-        """)
-        latest = cur.fetchall()
-
-        # Last 24h history per job for trend
-        cur.execute("""
-            SELECT pipeline_id,
-                   COUNT(*) AS runs_24h,
-                   SUM(rows_written) AS total_processed_24h,
-                   SUM(rows_failed) AS total_failed_24h,
-                   SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_runs_24h
-            FROM control_tower.pipeline_events
-            WHERE occurred_at > NOW() - INTERVAL '24 hours'
-              AND event_type = 'run_complete'
-            GROUP BY pipeline_id
-        """)
-        history = {r["pipeline_id"]: dict(r) for r in cur.fetchall()}
-
-        result = []
-        for row in latest:
-            d = dict(row)
-            d["history_24h"] = history.get(d["pipeline_id"], {})
-            result.append(d)
-        return result
 
 
 @app.get("/api/costs")
@@ -350,6 +945,24 @@ def sentinel_set_static(database_name: str, table_name: str, value: bool = True)
         return {"ok": True, "is_static": value}
 
 
+@app.post("/api/sentinel/overlay/{database_name}/{table_name}/event_date_column")
+def sentinel_set_event_date_column(database_name: str, table_name: str, column: str):
+    """Human sets/corrects the business-date column. Human-pinned (same convention as
+    /static) so discovery's next reprocessing can't silently reset it back to null —
+    the AI re-guesses this from scratch every run with no memory of a prior fix."""
+    with get_db() as cur:
+        cur.execute("""
+            UPDATE sentinel.catalog_overlay
+            SET event_date_column=%s, updated_by='human', updated_at=now()
+            WHERE database_name=%s AND table_name=%s
+        """, (column, database_name, table_name))
+        cur.execute("""
+            UPDATE sentinel.monitor_targets SET event_date_column=%s
+            WHERE database_name=%s AND table_name=%s AND variable=''
+        """, (column, database_name, table_name))
+        return {"ok": True, "event_date_column": column}
+
+
 @app.get("/api/sentinel/coverage")
 def sentinel_coverage():
     with get_db() as cur:
@@ -359,10 +972,11 @@ def sentinel_coverage():
                    COUNT(*) FILTER (WHERE v.lifecycle = 'retired') AS retired_values,
                    MAX(v.last_seen) AS last_seen,
                    lc.status       AS last_check_status,
-                   lc.missing      AS missing_values
+                   lc.missing      AS missing_values,
+                   lc.run_ts       AS last_check_at
             FROM sentinel.variable_values v
             LEFT JOIN LATERAL (
-                SELECT status, observed->'missing_values' AS missing
+                SELECT status, observed->'missing_values' AS missing, run_ts
                 FROM sentinel.check_results c
                 WHERE c.check_type = 'variable_coverage'
                   AND c.database_name = v.database_name
@@ -370,7 +984,7 @@ def sentinel_coverage():
                   AND c.variable = v.variable
                 ORDER BY run_ts DESC LIMIT 1
             ) lc ON true
-            GROUP BY v.database_name, v.table_name, v.variable, lc.status, lc.missing
+            GROUP BY v.database_name, v.table_name, v.variable, lc.status, lc.missing, lc.run_ts
             ORDER BY v.database_name, v.table_name, v.variable
         """)
         return cur.fetchall()
@@ -443,8 +1057,38 @@ def sentinel_freshness():
                 GROUP BY database_name, table_name
             ),
             stat AS (   -- static (intentionally-frozen) tables
-                SELECT DISTINCT database_name, table_name, is_static
+                SELECT DISTINCT database_name, table_name, is_static,
+                       event_date_column AS picked_event_column
                 FROM sentinel.monitor_targets WHERE variable = ''
+            ),
+            varfresh_latest AS (   -- latest variable_freshness result per tracked variable
+                SELECT DISTINCT ON (database_name, table_name, variable)
+                    database_name, table_name, variable, status, observed
+                FROM sentinel.check_results
+                WHERE check_type = 'variable_freshness'
+                  -- only variables still being tracked: a retired variable's old result
+                  -- must not keep marking the table dead
+                  AND (database_name, table_name, variable) IN (
+                      SELECT database_name, table_name, variable
+                      FROM sentinel.monitor_targets
+                      WHERE variable <> '' AND status = 'active')
+                ORDER BY database_name, table_name, variable, run_ts DESC
+            ),
+            varfresh AS (   -- rolled up to table level: a stale PLATFORM makes the
+                -- table's own Data badge stale too, not just the whole-table max date —
+                -- otherwise one dead platform hides behind 73 healthy ones (§ the whole
+                -- point of this check existing).
+                SELECT database_name, table_name,
+                       bool_or(status = 'fail') AS any_dead,
+                       bool_or(status IN ('warn','fail')) AS any_stale,
+                       jsonb_agg(jsonb_build_object(
+                           'variable', variable, 'status', status,
+                           'stale_values', observed->'stale_values',
+                           'dead_values', observed->'dead_values'
+                       ) ORDER BY variable) FILTER (WHERE status IN ('warn','fail'))
+                           AS stale_detail
+                FROM varfresh_latest
+                GROUP BY database_name, table_name
             ),
             leg AS (
                 SELECT DISTINCT ON (database_name, table_name)
@@ -460,15 +1104,24 @@ def sentinel_freshness():
                    sen.sentinel_status, sen.mechanism, sen.sentinel_last_write,
                    sen.expected_cadence_weeks, sen.sentinel_checked_at,
                    sen.sync_status, sen.sync_last_write,
-                   sen.data_status, sen.data_column, sen.data_last,
+                   -- Data badge = worst of the whole-table date AND any tracked
+                   -- variable's own date — a stale/dead platform now shows up here,
+                   -- not only buried in a separate, easy-to-miss check.
+                   CASE WHEN vf.any_dead OR sen.data_status = 'dead' THEN 'dead'
+                        WHEN vf.any_stale OR sen.data_status = 'stale' THEN 'stale'
+                        ELSE sen.data_status END AS data_status,
+                   sen.data_column, sen.data_last,
+                   vf.stale_detail AS variable_freshness_detail,
                    leg.legacy_status, leg.legacy_last_write, leg.legacy_checked_at,
                    vars.tracked_variables, COALESCE(stat.is_static, false) AS is_static,
+                   stat.picked_event_column,
                    (sen.sentinel_status IS NOT NULL AND leg.legacy_status IS NOT NULL
                     AND sen.sentinel_status <> leg.legacy_status) AS mismatch
             FROM sen
-            FULL OUTER JOIN leg  USING (database_name, table_name)
-            LEFT JOIN      vars USING (database_name, table_name)
-            LEFT JOIN      stat USING (database_name, table_name)
+            FULL OUTER JOIN leg      USING (database_name, table_name)
+            LEFT JOIN      vars      USING (database_name, table_name)
+            LEFT JOIN      stat      USING (database_name, table_name)
+            LEFT JOIN      varfresh vf USING (database_name, table_name)
             ORDER BY mismatch DESC NULLS LAST, database_name, table_name
         """)
         return cur.fetchall()

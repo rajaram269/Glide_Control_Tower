@@ -75,7 +75,8 @@ LOCAL="postgresql://agenteye_app:${PG_PW}@127.0.0.1:${PROXY_PORT}/control_tower"
 psql "$LOCAL" -tc "SELECT current_database()" | grep -q control_tower \
   || { echo "ERROR: not connected to control_tower via proxy" >&2; exit 1; }
 for m in migrations/011_*.sql migrations/012_*.sql migrations/013_*.sql migrations/014_*.sql \
-         migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql; do
+         migrations/015_*.sql migrations/016_*.sql migrations/017_*.sql \
+         migrations/018_*.sql migrations/019_*.sql migrations/020_*.sql migrations/021_*.sql migrations/022_*.sql; do
   echo "  → $m"
   psql "$LOCAL" -v ON_ERROR_STOP=1 -qf "$m"
 done
@@ -113,7 +114,7 @@ GEMINI_API_KEY=ct-sentinel-gemini-key:latest,\
 ANTHROPIC_API_KEY=ct-sentinel-anthropic-key:latest" 3600
 
 # Check engine: PG + CH read only, no LLM.
-deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" "" 1800
+deploy_sentinel_job "ct-sentinel-check" "sentinel/check_engine" "" 3600
 
 # Auto-resolver: adjudicates needs_review rows with a 3rd LLM + evidence. Reuses the
 # discovery introspection + LLM modules — copy them into its build context first.
@@ -146,12 +147,16 @@ create_schedule "ct-sentinel-check"     "0 2 * * *"  "Sentinel check tick — da
 # ── 5. Redeploy UI (Atlas-styled + /api/sentinel/*) ───────────────────────
 echo ""
 echo "[5/6] Redeploying UI..."
+# Optional: enables the dashboard's Run job button when the secret exists (see document.md).
+RUN_TOKEN_SECRET=""
+gcloud secrets describe ct-run-job-token --project="$PROJECT" >/dev/null 2>&1 \
+  && RUN_TOKEN_SECRET=",RUN_JOB_TOKEN=ct-run-job-token:latest"
 gcloud builds submit ui/backend --tag="gcr.io/${PROJECT}/ct-ui:latest" --project="$PROJECT" --quiet
 gcloud run deploy ct-ui \
   --image="gcr.io/${PROJECT}/ct-ui:latest" \
   --region="$REGION" --service-account="$SA_EMAIL" \
   --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
-  --set-secrets="PG_CONN=ct-pg-connection-string:latest" \
+  --set-secrets="PG_CONN=ct-pg-connection-string:latest${RUN_TOKEN_SECRET}" \
   --allow-unauthenticated --min-instances=1 --max-instances=2 --memory=512Mi \
   --project="$PROJECT" --quiet
 echo "  UI: $(gcloud run services describe ct-ui --region=$REGION --project=$PROJECT --format='value(status.url)' 2>/dev/null)"

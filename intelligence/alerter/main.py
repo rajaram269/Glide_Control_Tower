@@ -17,12 +17,15 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PG_CONN = os.environ["PG_CONN"]
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ALERT_EMAIL = os.environ["ALERT_EMAIL"]
 # ai@holistique.in is the only mailbox the tenant's AppOnly AccessPolicy allows
 # this app to send as (hr@ and others return ErrorAccessDenied / RAOP)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "ai@holistique.in")
 WEEKLY_DIGEST = os.environ.get("WEEKLY_DIGEST", "false").lower() == "true"
+# Suppresses real email delivery — alerts still process/acknowledge normally. Set
+# during the Sentinel rebuild so 740 tables' worth of resettling alerts don't email.
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # Email transport: "graph" (MS Graph, default) or "ses" (AWS SES).
 EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "graph").lower()
@@ -36,6 +39,8 @@ SES_SECRET_ACCESS_KEY = os.environ.get("SES_SECRET_ACCESS_KEY", "")
 SES_REGION = os.environ.get("SES_REGION", "ap-south-1")
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
+# Everything a person reads (emails, digests) is shown in IST; logic stays on UTC `NOW`.
+NOW_IST = NOW.astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
 
 SEVERITY_EMOJI = {"info": "ℹ️", "warn": "⚠️", "critical": "🔴"}
 
@@ -94,8 +99,16 @@ def _send_via_ses(subject, html_body, to):
 
 
 def send_email(token, subject, html_body, to_email=None):
-    """Dispatch by EMAIL_TRANSPORT. `token` is the MS Graph token (None for SES)."""
+    """Dispatch by EMAIL_TRANSPORT. `token` is the MS Graph token (None for SES).
+    DRY_RUN (env) skips actual delivery — alerts still get written/acknowledged
+    normally so the UI reflects everything, just nothing hits an inbox. For the
+    Sentinel rebuild: re-running discovery+checks across the whole catalog will
+    surface a burst of alerts while things resettle; those shouldn't go out as
+    real email until the rebuild is confirmed good."""
     to = to_email or ALERT_EMAIL
+    if DRY_RUN:
+        log.info("DRY RUN (no email sent): %s -> %s", subject, to)
+        return
     if EMAIL_TRANSPORT == "ses":
         _send_via_ses(subject, html_body, to)
     else:
@@ -124,8 +137,9 @@ Recent history (past 24h same service):
 Respond in exactly 2-3 sentences: (1) most likely root cause, (2) single most important remediation step."""
 
         message = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-5-5",
             max_tokens=200,
+            extra_body={"thinking": {"type": "disabled"}},   # Haiku 5.5 thinks by default; 200 tokens is the answer; extra_body: pinned SDK predates `thinking`
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text
@@ -166,7 +180,7 @@ def build_alert_email(alert, provider_context, triage):
         {provider_html}
         {triage_html}
         <hr style='margin-top:20px'>
-        <small style='color:#999'>Control Tower · {NOW.strftime("%Y-%m-%d %H:%M UTC")} · Alert ID: {alert["alert_id"]}</small>
+        <small style='color:#999'>Control Tower · {NOW_IST.strftime("%Y-%m-%d %H:%M IST")} · Alert ID: {alert["alert_id"]}</small>
     </div>"""
 
 
@@ -228,7 +242,7 @@ def send_weekly_digest(pg_cur, token):
 
     html = f"""
     <div style='font-family:sans-serif;max-width:640px'>
-        <h2>📊 Weekly Cost Digest — {NOW.strftime("%b %d, %Y")}</h2>
+        <h2>📊 Weekly Cost Digest — {NOW_IST.strftime("%b %d, %Y")}</h2>
         <table style='border-collapse:collapse;width:100%;border:1px solid #dee2e6'>
             <thead style='background:#f8f9fa'>
                 <tr>
@@ -248,10 +262,10 @@ def send_weekly_digest(pg_cur, token):
                 </tr>
             </tfoot>
         </table>
-        <small style='color:#999'>Control Tower · {NOW.strftime("%Y-%m-%d %H:%M UTC")}</small>
+        <small style='color:#999'>Control Tower · {NOW_IST.strftime("%Y-%m-%d %H:%M IST")}</small>
     </div>"""
 
-    send_email(token, f"📊 Weekly Cost Digest — {NOW.strftime('%b %d')}", html)
+    send_email(token, f"📊 Weekly Cost Digest — {NOW_IST.strftime('%b %d')}", html)
     log.info("Weekly digest sent.")
 
 
@@ -337,7 +351,13 @@ def main():
 
                 try:
                     send_email(token, subject, html)
-                    acknowledged_ids.append(alert["alert_id"])
+                    # In DRY_RUN, don't acknowledge — the point is to see what WOULD
+                    # have fired. Auto-acking here defeated that: everything vanished
+                    # from the Alerts page's default "unacked" view within ~15 minutes
+                    # regardless of whether a real email went out (seen in prod: 39
+                    # Sentinel alerts fired, all already acked, page looked empty).
+                    if not DRY_RUN:
+                        acknowledged_ids.append(alert["alert_id"])
                     log.info("Sent: %s", subject)
                 except Exception as e:
                     log.error("Failed to send alert %s: %s", alert["alert_id"], e)
