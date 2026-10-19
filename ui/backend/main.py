@@ -1126,6 +1126,66 @@ def sentinel_freshness():
         return cur.fetchall()
 
 
+# Freshness drawer "Run freshness check": starts ONLY the Sentinel check job, scoped to
+# one table via SENTINEL_ONLY_TABLE (it re-judges that table's freshness and exits).
+# Same guard as /api/jobs/{name}/run: RUN_JOB_TOKEN required, per-table cooldown.
+SENTINEL_CHECK_PROJECT = os.environ.get("PROJECT", LOG_PROJECT)
+SENTINEL_CHECK_REGION = os.environ.get("REGION", "asia-south1")
+SENTINEL_CHECK_JOB = os.environ.get("SENTINEL_CHECK_JOB", "ct-sentinel-check")
+
+
+@app.post("/api/sentinel/freshness/{database_name}/{table_name}/trigger")
+def trigger_table_freshness(database_name: str, table_name: str, request: Request,
+                            x_run_token: str = Header(default="")):
+    who = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0].strip()
+    table_key = f"{database_name}.{table_name}"
+    if not RUN_JOB_TOKEN:
+        raise HTTPException(403, "Running jobs from the dashboard is disabled (RUN_JOB_TOKEN is not configured).")
+    if not hmac.compare_digest(x_run_token.encode(), RUN_JOB_TOKEN.encode()):
+        audit_log.warning("FRESHNESS RUN DENIED (bad token) table=%s from=%s", table_key, who)
+        raise HTTPException(403, "Wrong run token.")
+    with get_db() as cur:
+        cur.execute(
+            """SELECT 1 FROM sentinel.monitor_targets
+               WHERE database_name = %s AND table_name = %s
+                 AND COALESCE(variable,'') = '' AND status = 'active'
+               LIMIT 1""",
+            (database_name, table_name),
+        )
+        if not cur.fetchone():
+            raise HTTPException(404, "No active table-level Sentinel target")
+    now = time.time()
+    if now - _last_run_at.get(table_key, 0) < RUN_COOLDOWN_SECONDS:
+        raise HTTPException(429, f"A freshness check for {table_key} was just started — wait {RUN_COOLDOWN_SECONDS}s.")
+    from google.cloud import run_v2
+    from google.api_core import exceptions as gexc
+    try:
+        parent = f"projects/{SENTINEL_CHECK_PROJECT}/locations/{SENTINEL_CHECK_REGION}/jobs/{SENTINEL_CHECK_JOB}"
+        latest = next(iter(run_v2.ExecutionsClient().list_executions(parent=parent)), None)
+        if latest is not None and not latest.completion_time:
+            raise HTTPException(409, f"{SENTINEL_CHECK_JOB} is already running ({latest.name.split('/')[-1]}) — try again when it finishes.")
+        _last_run_at[table_key] = now
+        overrides = run_v2.RunJobRequest.Overrides(container_overrides=[
+            run_v2.RunJobRequest.Overrides.ContainerOverride(env=[
+                run_v2.EnvVar(name="SENTINEL_ONLY_TABLE", value=table_key),
+                run_v2.EnvVar(name="SENTINEL_MANUAL_TRIGGER", value="ui"),
+            ])])
+        op = run_v2.JobsClient().run_job(request=run_v2.RunJobRequest(name=parent, overrides=overrides))
+        try:
+            execution = op.metadata.name.split("/")[-1]
+        except Exception:
+            execution = None
+    except HTTPException:
+        raise
+    except gexc.PermissionDenied:
+        raise HTTPException(503, "The dashboard's service account lacks permission to run jobs (needs roles/run.developer).")
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        raise HTTPException(503, f"Could not start freshness check: {type(e).__name__}: {first_line}")
+    audit_log.warning("FRESHNESS RUN STARTED table=%s execution=%s from=%s", table_key, execution, who)
+    return {"queued": True, "table": table_key, "execution": execution}
+
+
 # ─── Health check ─────────────────────────────────────────────────────────────
 
 @app.get("/healthz")
