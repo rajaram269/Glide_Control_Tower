@@ -533,7 +533,10 @@ def build_overlay_row(meta, columns, inferred, review):
     version_col, delete_col = _cdc_cols(columns)
     # A CDC/Replacing table with no dedup key is an I3 violation → unresolved_dedup
     requires_dedup = bool(inferred["requires_dedup"]) or "Replacing" in (meta["engine"] or "")
-    dedup_key = inferred.get("dedup_key") or []
+    # The AI sometimes names a key column that is not in the table (e.g. LineNo on a view
+    # that has no such column) — keep only real columns.
+    real = {c["name"] for c in columns}
+    dedup_key = [k for k in (inferred.get("dedup_key") or []) if k in real]
     conflict = "none"
     if requires_dedup and not dedup_key:
         conflict = "unresolved_dedup"
@@ -1133,6 +1136,15 @@ def main():
             meta["structure_hash"] = structure_hash(columns)
 
             prior = existing.get(key)
+            # Self-heal: a stored dedup key naming a column the table does not have is
+            # dropped without re-classifying (no AI cost). Applies to pinned rows too —
+            # it is a fact about the schema, not a judgement.
+            cur.execute(
+                """UPDATE sentinel.catalog_overlay
+                   SET dedup_key = ARRAY(SELECT k FROM unnest(dedup_key) k WHERE k = ANY(%s))
+                   WHERE database_name = %s AND table_name = %s
+                     AND EXISTS (SELECT 1 FROM unnest(dedup_key) k WHERE NOT (k = ANY(%s)))""",
+                ([c["name"] for c in columns], db, tbl, [c["name"] for c in columns]))
             # 4. Incremental gate — unchanged structure skips the LLM. This is what
             # makes PROGRESSIVE scanning work: tables catalogued in an earlier run
             # are skipped here, so each run advances the frontier of new/changed
