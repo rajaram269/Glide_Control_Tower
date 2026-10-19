@@ -187,6 +187,7 @@ gcloud run deploy ct-ui \
   --service-account="$SA_EMAIL" \
   --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
   --set-secrets="PG_CONN=ct-pg-connection-string:latest" \
+  --set-env-vars="PROJECT=${PROJECT},REGION=${REGION},SENTINEL_CHECK_JOB=ct-sentinel-check" \
   --allow-unauthenticated \
   --min-instances=1 \
   --max-instances=2 \
@@ -199,33 +200,49 @@ echo ""
 echo "[6/7] Setting up Cloud Scheduler..."
 SCHEDULER_SA="$SA_EMAIL"
 
+# Create, else update in place. Schedulers run in Asia/Kolkata (SCHEDULES.md), so the
+# crons below are IST and --time-zone is always set — an update without it would keep
+# the job's existing zone and silently shift the run time.
 create_schedule() {
   local job_name=$1
   local schedule=$2
   local description=$3
-  gcloud scheduler jobs create http "trigger-${job_name}" \
+  if gcloud scheduler jobs create http "trigger-${job_name}" \
     --location="$REGION" \
     --schedule="$schedule" \
+    --time-zone="Asia/Kolkata" \
     --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${job_name}:run" \
     --http-method=POST \
     --oauth-service-account-email="$SCHEDULER_SA" \
     --description="$description" \
-    --project="$PROJECT" 2>/dev/null \
-    && echo "  Created schedule: $job_name ($schedule)" \
-    || echo "  Schedule exists: $job_name"
+    --project="$PROJECT" 2>/dev/null; then
+    echo "  Created schedule: $job_name ($schedule IST)"
+  else
+    gcloud scheduler jobs update http "trigger-${job_name}" \
+      --location="$REGION" \
+      --schedule="$schedule" \
+      --time-zone="Asia/Kolkata" \
+      --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${job_name}:run" \
+      --http-method=POST \
+      --oauth-service-account-email="$SCHEDULER_SA" \
+      --description="$description" \
+      --project="$PROJECT" --quiet >/dev/null
+    echo "  Updated schedule: $job_name ($schedule IST)"
+  fi
 }
 
-# Collector at :00, anomaly detector at :30, alerter at :45
+# Collector at :00, anomaly detector at :30, alerter at :45 (IST)
 create_schedule "ct-gcp-collector"    "0 * * * *"            "GCP Collector — hourly"
 create_schedule "ct-aws-collector"    "0 * * * *"            "AWS Collector — hourly"
-create_schedule "ct-cost-collector"   "30 0 * * *"           "Cost Collector — daily 06:00 IST"
+create_schedule "ct-cost-collector"   "0 6 * * *"            "Cost Collector — daily 06:00 IST"
 create_schedule "ct-anomaly-detector" "30 * * * *"           "Anomaly Detector — hourly at :30"
 create_schedule "ct-alerter"          "45 * * * *"           "Alerter — hourly at :45"
-create_schedule "ct-alerter-weekly"   "15 3 * * 1"           "Weekly cost digest — Mon 09:00 IST"
+create_schedule "ct-alerter-weekly"   "0 9 * * 1"            "Weekly cost digest — Mon 09:00 IST"
 
-# Sentinel: discovery daily 06:45 IST (after cost collector), check tick daily 07:30 IST
-create_schedule "ct-sentinel-discovery" "15 1 * * *"         "Sentinel discovery — daily 06:45 IST"
-create_schedule "ct-sentinel-check"     "0 2 * * *"          "Sentinel check tick — daily 07:30 IST"
+# Sentinel: discovery weekly Mon 06:45 IST (same as deploy.sh), check tick 3x/day — the
+# first run of each IST day refreshes every freshness verdict; heavy checks stay due-gated.
+create_schedule "ct-sentinel-discovery" "45 6 * * 1"         "Sentinel discovery — weekly Mon 06:45 IST"
+create_schedule "ct-sentinel-check"     "30 7,13,19 * * *"   "Sentinel check tick — 07:30/13:30/19:30 IST"
 
 # ── 7. Verify ─────────────────────────────────────────────────────────────
 echo ""

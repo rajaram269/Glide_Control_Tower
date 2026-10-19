@@ -175,6 +175,7 @@
     .ack-btn { padding: 4px 12px; border: 1px solid var(--border); border-radius: 8px;
                background: var(--surface); color: var(--fg-2); cursor: pointer; font-size: 12px; transition: all .12s; }
     .ack-btn:hover { background: var(--raised); border-color: var(--border-strong); }
+    .filter-btn.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
 
     /* wide tables get a comfortable min-width and scroll inside the card */
     .table-scroll table { min-width: 640px; }
@@ -930,7 +931,8 @@ function CostsView() {
 
 // Maps a freshness sub-status (fresh/stale/dead/static) to a status-badge class.
 const freshBadge = (s) => s === 'fresh' ? 'operational' : s === 'stale' ? 'degraded'
-  : s === 'dead' ? 'major_outage' : s === 'static' ? 'info' : 'unknown';   // 'inactive' -> grey
+  : s === 'dead' ? 'major_outage'
+  : ['static','ignored','not_monitored'].includes(s) ? 'info' : 'unknown';   // 'inactive' -> grey
 
 // Decimal weeks → human cadence label ("~daily", "~2h", "weekly", "monthly").
 function cadenceLabel(weeks) {
@@ -958,16 +960,49 @@ function freshDisplay(r) {
   return { cls: 'unknown', label: s };
 }
 
+// Bucket for the Freshness status filter (one per row, problems first).
+function freshnessClass(r) {
+  if (r.is_static) return 'static';
+  if (!r.sync_status && !r.sentinel_status) return 'not_checked';
+  if (['dead','stale'].includes(r.sync_status)) return 'sync_bad';
+  if (['dead','stale'].includes(r.data_status)) return 'data_bad';
+  if (['ignored','not_monitored'].includes(r.data_status)) return 'not_monitored';
+  if (r.data_status === 'inactive') return 'inactive';
+  return 'fresh';
+}
+
+const freshnessFilterLabels = {
+  all: 'All',
+  fresh: 'Fresh',
+  sync_bad: 'Sync stale/dead',
+  data_bad: 'Data stale/dead',
+  not_monitored: 'Sync-only',
+  inactive: 'Inactive',
+  static: 'Static',
+  not_checked: 'Not checked'
+};
+
 function FreshnessView() {
-  const [rows] = useApi('/api/sentinel/freshness');
+  const [rows, , refresh] = useApi('/api/sentinel/freshness');
   const [q, setQ] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
   const [sel, setSel] = useState(null);
+  const [triggering, setTriggering] = useState(false);
+  const [triggerMsg, setTriggerMsg] = useState('');
+  useEffect(() => { setTriggerMsg(''); setTriggering(false); }, [sel && `${sel.database_name}.${sel.table_name}`]);
   const { apply: applySort, Th } = useSort();
   if (!rows) return html`<div class="loading">Loading…</div>`;
   if (!rows.length) return html`<div class="empty">No tables yet. Sentinel discovery is still building the catalog.</div>`;
+  const searched = rows.filter(r => rowMatches(r, q));
+  const statusCounts = searched.reduce((acc, r) => {
+    const cls = freshnessClass(r);
+    acc[cls] = (acc[cls] || 0) + 1;
+    return acc;
+  }, { all: searched.length });
+  const filterOrder = ['all','fresh','sync_bad','data_bad','not_monitored','inactive','static','not_checked'];
   // Dead/stale rank first (the problem you'd want to act on), static/n-a tables last
   // (nothing to do there) — same "problems first" convention as the Jobs page.
-  const shown = applySort(rows.filter(r => rowMatches(r, q)), {
+  const shown = applySort(searched.filter(r => statusFilter === 'all' || freshnessClass(r) === statusFilter), {
     sync: r => r.is_static ? 4
       : r.sync_status === 'dead' ? 0 : r.sync_status === 'stale' ? 1
       : r.sync_status === 'fresh' ? 3 : 2,
@@ -976,9 +1011,9 @@ function FreshnessView() {
       : r.data_status === 'dead' ? 0 : r.data_status === 'stale' ? 1
       : r.data_status === 'fresh' ? 3 : r.data_status === 'inactive' ? 3.5 : 2,
   });
-  const notChecked = shown.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
-  const syncBad = shown.filter(r => ['stale','dead'].includes(r.sync_status)).length;
-  const dataBad = shown.filter(r => ['stale','dead'].includes(r.data_status)).length;
+  const notChecked = searched.filter(r => !r.is_static && !r.sync_status && !r.sentinel_status).length;
+  const syncBad = searched.filter(r => ['stale','dead'].includes(r.sync_status)).length;
+  const dataBad = searched.filter(r => ['stale','dead'].includes(r.data_status)).length;
   return html`
     <div class="view-head">
       <div class="section-title">Data Freshness — ${rows.length} tables</div>
@@ -988,6 +1023,12 @@ function FreshnessView() {
       ${syncBad > 0 && html`<span style="color:var(--critical-fg)">● ${syncBad} sync stale/dead (pipeline)</span>`}
       ${dataBad > 0 && html`<span style="color:var(--high-fg)">● ${dataBad} data stale/dead (business date old)</span>`}
       ${notChecked > 0 && html`<span>◌ ${notChecked} not checked yet (daily 07:30 IST)</span>`}
+    </div>
+    <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+      ${filterOrder.map(k => html`
+        <button class=${`ack-btn filter-btn ${statusFilter===k?'active':''}`} onClick=${()=>setStatusFilter(k)}>
+          ${freshnessFilterLabels[k]} ${statusCounts[k] || 0}
+        </button>`)}
     </div>
     <div class="callout" style="margin-bottom:14px;font-size:12px;line-height:1.7;background:var(--raised);border:1px solid var(--border);color:var(--fg-2)">
       <b>How to read these statuses.</b>
@@ -1016,6 +1057,8 @@ function FreshnessView() {
           // if one of its tracked variables (e.g. one platform) came back stale/dead —
           // that escalation happens server-side, so data_status alone already covers it.
           const dataBadge = r.is_static ? html`<span class="badge unknown">—</span>`
+            : r.data_status === 'ignored' ? html`<span class="badge info" title="sync-only metadata/reference table">sync-only</span>`
+            : r.data_status === 'not_monitored' ? html`<span class="badge info" title="insert freshness is monitored; no business-date check applies">sync-only</span>`
             : !r.data_column && !r.data_status ? html`<span style="color:var(--faint)" title="no business date column — sync-only">n/a</span>`
             : r.data_status ? html`<span class=${`badge ${freshBadge(r.data_status)}`}>${r.data_status}</span>`
             : html`<span class="badge unknown">—</span>`;
@@ -1040,7 +1083,7 @@ function FreshnessView() {
               : (r.data_column || r.picked_event_column)
                 ? html`<span class="badge accent">${r.data_column || r.picked_event_column}</span>`
                 : html`<span style="color:var(--high-fg)" title="No business date column identified — only sync is tracked">none</span>`}</td>
-            <td style="color:var(--muted)" title=${r.data_last || ''}>${r.data_column ? fmt.ago(r.data_last) : '—'}</td>
+            <td style="color:var(--muted)" title=${r.data_last || ''}>${['ignored','not_monitored'].includes(r.data_status) ? 'sync-only' : (r.data_column ? fmt.ago(r.data_last) : '—')}</td>
             <td class="clamp" style="font-size:12px" title=${tv.join(', ')}>${tv.length
               ? tv.map(v => html`<span class="badge accent" style="margin-right:4px">${v}</span>`)
               : html`<span style="color:var(--faint)">table-level</span>`}</td>
@@ -1054,17 +1097,53 @@ function FreshnessView() {
         const tv = Array.isArray(sel.tracked_variables) ? sel.tracked_variables : [];
         const syncD = freshDisplay({ ...sel, sentinel_status: sel.sync_status });
         const dataLabel = sel.is_static ? 'not monitored (static)'
+          : sel.data_status === 'ignored' ? 'sync-only metadata/reference table'
+          : sel.data_status === 'not_monitored' ? 'sync-only'
           : !sel.data_column ? 'no business date on this table — only sync is tracked'
           : sel.data_status === 'inactive' ? 'inactive — no data in the last 12 months (not judged)'
           : sel.data_status ? sel.data_status : 'not checked yet';
+        const dataDetail = sel.data_status === 'ignored'
+          ? html` — ${sel.data_column} is present, but this table has no monitored business dimensions, so data freshness is not used.`
+          : sel.data_status === 'not_monitored'
+            ? html` — insert freshness is monitored; no business-date freshness check applies for this table.`
+            : sel.data_column ? html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).` : '';
+        // Same run-token flow as RunJobButton (asked once per browser session).
+        const trigger = async () => {
+          let token = '';
+          try { token = sessionStorage.getItem('ct_run_token') || ''; } catch (e) {}
+          if (!token) token = prompt('Enter the run token:') || '';
+          if (!token) return;
+          setTriggering(true); setTriggerMsg('');
+          try {
+            const path = `/api/sentinel/freshness/${encodeURIComponent(sel.database_name)}/${encodeURIComponent(sel.table_name)}/trigger`;
+            const res = await fetch(path, { method: 'POST', headers: { 'X-Run-Token': token } });
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              if (res.status === 403) { try { sessionStorage.removeItem('ct_run_token'); } catch (e) {} }
+              setTriggerMsg(d.detail || `Could not queue check (${res.status})`);
+            } else {
+              try { sessionStorage.setItem('ct_run_token', token); } catch (e) {}
+              setTriggerMsg('Freshness check queued');
+              refresh && refresh();
+            }
+          } catch (e) {
+            setTriggerMsg('Could not queue check');
+          } finally {
+            setTriggering(false);
+          }
+        };
         return html`
           ${sel.is_static ? html`<div class="callout" style="background:var(--info-bg);border:1px solid var(--info-bd);color:var(--info-fg);margin-bottom:16px">This is a frozen reference table — freshness is never alarmed on it.</div>` : ''}
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+            <button class="ack-btn" onClick=${trigger} disabled=${triggering}>${triggering ? 'Queueing…' : 'Run freshness check'}</button>
+            ${triggerMsg && html`<span style="font-size:12px;color:var(--muted)">${triggerMsg}</span>`}
+          </div>
           <div class="kv"><div class="kv-label">Is the pipeline running? (Sync)</div>
             <div class=${`callout ${sel.sync_status==='fresh'?'good':(['stale','dead'].includes(sel.sync_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.sync_status)?'background:var(--raised);border:1px solid var(--border)':''}>
               <b>${sel.is_static?'static':syncD.label}</b> — rows were last written ${fmt.ago(sel.sync_last_write||sel.sentinel_last_write)}.</div></div>
           <div class="kv"><div class="kv-label">Is the data current? (Data)</div>
             <div class=${`callout ${sel.data_status==='fresh'?'good':(['stale','dead'].includes(sel.data_status)?'bad':'')}`} style=${!['fresh','stale','dead'].includes(sel.data_status)?'background:var(--raised);border:1px solid var(--border)':''}>
-              <b>${dataLabel}</b>${sel.data_column?html` — newest ${sel.data_column} is ${fmt.ago(sel.data_last)} (${sel.data_last?new Date(sel.data_last).toLocaleDateString():'—'}).`:''}</div></div>
+              <b>${dataLabel}</b>${dataDetail}</div></div>
           <div class="kv"><div class="kv-label">Event date column (used for Data freshness)</div>
             <div class="mono">${sel.is_static ? '—' : (sel.data_column || sel.picked_event_column || 'none identified')}</div></div>
           ${(() => {
@@ -1092,7 +1171,7 @@ function FreshnessView() {
       })()}
     </${Drawer}>
     <div style="margin-top:14px;font-size:12px;color:var(--faint);line-height:1.7">
-      Two independent freshnesses. <b style="color:var(--muted)">Sync</b> = is the pipeline running. <b style="color:var(--muted)">Data</b> = is the data itself current (a table can sync today yet hold only May's data). <b>n/a</b> = no business date (reference tables). Click any row for detail.
+      Two independent freshnesses. <b style="color:var(--muted)">Sync</b> = is the pipeline running. <b style="color:var(--muted)">Data</b> = is the data itself current (a table can sync today yet hold only May's data). <b>sync-only</b> = no business-date check applies (metadata/reference, log/cache/state, resync or uncatalogued table) — only inserts are judged. <b>n/a</b> = no business date (reference tables). Click any row for detail.
     </div>`;
 }
 

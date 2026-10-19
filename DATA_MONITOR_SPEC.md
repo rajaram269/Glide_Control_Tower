@@ -28,7 +28,8 @@ ClickHouse holds the data and is queried live; Postgres holds Sentinel's metadat
 ## 2. Two cadences (independent)
 
 - **Discovery / overlay refresh** — frequent, configurable (daily+). Introspection is cheap; the LLM runs only on tables whose structure changed since last run (§10), so frequent is affordable.
-- **Per-table check frequency** — integer **weeks, 1–4**, assigned per target by the loop. A daily check-engine tick runs only the targets that are *due* (§5B `next_due_at`), so cadence is data-driven, not a schedule per table.
+- **Freshness frequency** — the check engine ticks 3x/day (07:30/13:30/19:30 IST); the first tick of each IST day refreshes freshness for every active target (later ticks pick up leftovers). Freshness is cheap and time-sensitive.
+- **Heavy check frequency** — volume, schema drift, coverage and reconciliation use integer **weeks, 1–4**, assigned per target by the loop, and run only when targets are *due* (§5B `next_due_at`), so the more frequent ticks do not multiply expensive scans.
 
 ---
 
@@ -37,7 +38,7 @@ ClickHouse holds the data and is queried live; Postgres holds Sentinel's metadat
 | Component | Cloud Run form | Trigger | Reads | Writes |
 |---|---|---|---|---|
 | **Discovery loop** | Job | Cloud Scheduler (frequent, e.g. daily) | ClickHouse `system.*` + PII-safe samples | Postgres: overlay, targets, values, recon proposals |
-| **Check engine** | Job | Cloud Scheduler (daily tick) | ClickHouse `system.parts` + light/reconciliation queries; Postgres targets | Postgres: `check_results`, `incidents` |
+| **Check engine** | Job | Cloud Scheduler (3 ticks/day, IST) | ClickHouse `system.parts` + light/reconciliation queries; Postgres targets | Postgres: `check_results`, `incidents` |
 
 Deployment notes:
 - **Cloud SQL for PostgreSQL** as the store; jobs connect via the Cloud SQL connector.
@@ -182,7 +183,7 @@ The only correctness gate on *behavior* lives at query-resolution time (§7.2.5)
 ## 8. The monitor (checks)
 
 Each runs table-level and, where a variable is attached, per value:
-1. **Freshness** — latest data vs the target's `monitor_frequency_weeks` + tolerance.
+1. **Freshness** — latest data vs the target's `monitor_frequency_weeks` + tolerance. Sync (insert) freshness applies to every active table. Business-date freshness is marked non-applicable (`not_monitored`) for legacy-only/no-catalog, resync/shadow, log/cache/state and reference/config targets — they stay sync-monitored. Validity/report-window columns such as `start_date`/`end_date` are `ignored` only on tables with no monitored business dimensions; fact/report tables still use them.
 2. **Volume/completeness** — recent row count vs expected band.
 3. **Variable coverage** — which `active` values are missing (set-difference vs `variable_values`).
 4. **Schema drift** — columns added/removed/retyped from `system.columns`.

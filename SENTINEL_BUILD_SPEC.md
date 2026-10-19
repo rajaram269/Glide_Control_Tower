@@ -131,7 +131,9 @@ Keep thin: `infer_overlay(payload) -> dict`, `check(payload, maker_result) -> ag
 
 ## 5. Check engine — `ct-sentinel-check`
 
-Cloud Run Job, Cloud Scheduler daily tick (`0 2 * * *` → 07:30 IST). Selects `monitor_targets` where
+Cloud Run Job, Cloud Scheduler tick three times/day (`30 7,13,19 * * *`, time zone Asia/Kolkata). The first
+tick of each IST day refreshes freshness for every active target. Volume, schema drift, coverage and
+reconciliation select `monitor_targets` where
 `next_due_at <= now() AND status='active'`; runs; updates `last_checked_at`/`next_due_at`
 (`+ monitor_frequency_weeks weeks`). Advisory lock + `max-instances=1`. 5 checks (§8 design), table-level
 + per attached variable value:
@@ -139,7 +141,12 @@ Cloud Run Job, Cloud Scheduler daily tick (`0 2 * * *` → 07:30 IST). Selects `
 1. **Freshness** — latest data vs frequency + `freshness_tolerance`. **Primary mechanism: `system.parts`**
    (`max(modification_time)`); **fallback: `max(freshness_column)`** — the proven collector pattern
    ([gcp_collector/main.py:507-511](collectors/gcp_collector/main.py#L507-L511)) — selected per config/probe (Lapse 4).
-   **dedup OFF** (signal). Freshness sub-status `fresh|stale|dead` written inside `observed` JSONB; the row
+   Native `Date`/`DateTime` columns use a direct `max(col)`. Business-date freshness is non-applicable
+   (`not_monitored`) for legacy-only/no-catalog, resync/shadow, log/cache/state and reference/config
+   targets (still sync-monitored); `start_date`/`end_date` window columns are `ignored` only on tables
+   with no monitored business dimensions. `SENTINEL_ONLY_TABLE=db.table` runs a manual freshness check
+   for one table and exits. **dedup OFF** (signal). Freshness sub-status
+   `fresh|stale|dead|inactive|ignored|not_monitored` written inside `observed` JSONB; the row
    `status` is `ok|warn|fail`.
 2. **Volume/completeness** — recent row count vs band (`sum(rows)` over active parts, or light
    `GROUP BY {variable}` on pruned partitions). **dedup OFF**. This is the genuinely-new coverage the old
@@ -219,7 +226,10 @@ nav tabs; rework Freshness with better UX.
 
 **Reworked screens:**
 - **Freshness** — during cutover Phase A/B: two columns (Sentinel verdict | legacy `data_freshness`) for
-  comparison. After switch: Sentinel-only, richer (freshness + volume band + drift in one view).
+  comparison. After switch: Sentinel-only, richer (freshness + volume band + drift in one view). The drawer
+  has a "Run freshness check" action (run-token guarded) that starts only `ct-sentinel-check` with
+  `SENTINEL_ONLY_TABLE=db.table`. Status filters: all, fresh, sync stale/dead, data stale/dead, sync-only,
+  inactive, static, not checked.
 - **Overview** — add Sentinel summary cards: tables cataloged, needs-review count, open incidents,
   reconciliation rules active.
 
