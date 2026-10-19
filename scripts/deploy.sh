@@ -161,9 +161,6 @@ echo ""
 echo "[5/6] Redeploying UI..."
 # --set-secrets/--set-env-vars REPLACE the service's whole list, so every secret/env var
 # ct-ui reads must be listed here or the deploy wipes it.
-# TODO: HIKER_API_KEY (Providers-tab Hiker balance check) is also read by ct-ui, but its
-# Secret Manager name is not recorded in this repo — add ",HIKER_API_KEY=<secret>:latest"
-# to --set-secrets below once confirmed, or this deploy removes it from the live service.
 # Optional: enables the dashboard's Run job button when the secret exists (see document.md).
 RUN_TOKEN_SECRET=""
 gcloud secrets describe ct-run-job-token --project="$PROJECT" >/dev/null 2>&1 \
@@ -173,7 +170,7 @@ gcloud run deploy ct-ui \
   --image="gcr.io/${PROJECT}/ct-ui:latest" \
   --region="$REGION" --service-account="$SA_EMAIL" \
   --set-cloudsql-instances="${PROJECT}:us-central1:${INSTANCE}" \
-  --set-secrets="PG_CONN=ct-pg-connection-string:latest,OPENAI_API_KEY=ct-openai-api-key:latest,GEMINI_API_KEY=ct-gemini-api-key:latest${RUN_TOKEN_SECRET}" \
+  --set-secrets="PG_CONN=ct-pg-connection-string:latest,OPENAI_API_KEY=ct-openai-api-key:latest,GEMINI_API_KEY=ct-gemini-api-key:latest,HIKER_API_KEY=ct-hiker-api-key:latest${RUN_TOKEN_SECRET}" \
   --set-env-vars="PROJECT=${PROJECT},REGION=${REGION},SENTINEL_CHECK_JOB=ct-sentinel-check" \
   --allow-unauthenticated --min-instances=1 --max-instances=2 --memory=512Mi \
   --project="$PROJECT" --quiet
