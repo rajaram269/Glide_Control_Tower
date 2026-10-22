@@ -25,7 +25,7 @@ change one, update this file in the same commit.
 
 | Task | Job | Schedule (IST) | Notes |
 |---|---|---|---|
-| 1 + 2 | `ct-sentinel-discovery` | **Mondays 06:45** | Each table is classified **once**; re-done only if its columns change, `CLASSIFIER_VERSION` is bumped, or it is new. Max 80 tables per run; human-pinned tables are skipped |
+| 1 + 2 | `ct-sentinel-discovery` | **Daily 06:45** | Each table is classified **once**; re-done only if its columns change, `CLASSIFIER_VERSION` is bumped, or it is new. Max 80 tables per run; human-pinned tables are skipped |
 | 3 | `ct-sentinel-resolver` | **Daily 07:10** | Only touches rows in Needs Review |
 | 4 | `ct-ui` (service) | When someone opens a service's endpoint breakdown | Only if an API has errors |
 | 5 | `ct-alerter` | **Hourly at :45** | Only for new *critical* alerts |

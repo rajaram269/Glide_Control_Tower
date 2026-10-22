@@ -1169,7 +1169,7 @@ function CatalogView() {
   const [sel, setSel] = useState(null);
   const [q, setQ] = useState('');
   if (!rows) return html`<div class="loading">Loading…</div>`;
-  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs weekly, Mondays at 06:45 IST.</div>`;
+  if (!rows.length) return html`<div class="empty">Catalog empty. Sentinel discovery runs daily at 06:45 IST.</div>`;
   const shown = rows.filter(r => rowMatches(r, q));
   return html`
     <div class="view-head">
@@ -1278,7 +1278,7 @@ function CoverageView() {
         <th>Table</th><th>Variable</th><th>Active values</th><th>Retired</th>
         <th title="Result of the most recent coverage check">Last check</th>
         <th title="When that check ran (IST)">Checked</th><th>Missing values</th>
-        <th title="When discovery last re-read this variable's list of values (weekly) - not when data arrived">Values refreshed</th>
+        <th title="When discovery last re-read this variable's list of values (daily) - not when data arrived">Values refreshed</th>
       </tr></thead>
       <tbody>
         ${shown.map(r => {

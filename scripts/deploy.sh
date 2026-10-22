@@ -137,10 +137,10 @@ create_schedule() {
     --description="$desc" --project="$PROJECT" 2>/dev/null \
     && echo "  Created trigger-${job} ($sched)" || echo "  trigger-${job} exists"
 }
-# Discovery WEEKLY (steady-state only re-LLMs new/changed tables via the structure_hash
-# gate, so a daily catalog scan is wasteful) → resolver + check DAILY (they act on the
-# catalog + live data). Mon 06:45 IST → resolver 07:10 IST → check tick 07:30 IST.
-create_schedule "ct-sentinel-discovery" "15 1 * * 1" "Sentinel discovery — weekly Mon 06:45 IST"
+# Discovery DAILY so new tables reach the catalog within a day. Steady state is cheap:
+# the structure_hash gate only re-LLMs new/changed tables, so a quiet day makes no AI
+# calls. Discovery 06:45 IST → resolver 07:10 IST → check tick 07:30 IST.
+create_schedule "ct-sentinel-discovery" "15 1 * * *" "Sentinel discovery — daily 06:45 IST"
 create_schedule "ct-sentinel-resolver"  "40 1 * * *" "Sentinel auto-resolver — daily 07:10 IST"
 create_schedule "ct-sentinel-check"     "0 2 * * *"  "Sentinel check tick — daily 07:30 IST"
 

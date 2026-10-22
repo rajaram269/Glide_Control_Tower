@@ -29,9 +29,9 @@ data-verified classification of event date + variables; per-platform cadence; 3-
 minimum Data window; Event date column visible in the UI; IST everywhere; all Anthropic
 calls on Haiku 5.5. **Still open:**
 
-1. **Finish the re-classification.** Discovery handles 80 tables per run; it runs weekly
-   (Monday 06:45 IST) and continues where it left off. It is deliberately not run
-   manually any more, to save AI cost.
+1. **Finish the re-classification.** Discovery handles 80 tables per run; it runs daily
+   (06:45 IST) and continues where it left off. Only new/changed tables reach the AI,
+   so a quiet day costs nothing.
 2. **Ghost tables.** ~220 rows on the Freshness tab are tables in the old
    `control_tower.watched_tables` list that no longer exist in ClickHouse ("Not checked
    yet" forever). Once discovery has finished, deactivate watched_tables entries that

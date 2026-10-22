@@ -134,7 +134,7 @@ that Control Tower only reads from.
 
 ## 7a. How Sentinel decides things (current rules)
 
-- **Each table is classified once.** Discovery (weekly, Monday 06:45 IST) looks at the
+- **Each table is classified once.** Discovery (daily, 06:45 IST) looks at the
   full column list plus real data profiles (min/max/future dates per date column,
   common values per text column) and records the table's **event date column** (the
   business date, e.g. `SalesDate`) and up to 3 **monitored variables** (e.g. Platform).
