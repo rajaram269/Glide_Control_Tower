@@ -239,9 +239,9 @@ create_schedule "ct-anomaly-detector" "30 * * * *"           "Anomaly Detector �
 create_schedule "ct-alerter"          "45 * * * *"           "Alerter — hourly at :45"
 create_schedule "ct-alerter-weekly"   "0 9 * * 1"            "Weekly cost digest — Mon 09:00 IST"
 
-# Sentinel: discovery weekly Mon 06:45 IST (same as deploy.sh), check tick 3x/day — the
+# Sentinel: discovery daily 06:45 IST (same as deploy.sh), check tick 3x/day — the
 # first run of each IST day refreshes every freshness verdict; heavy checks stay due-gated.
-create_schedule "ct-sentinel-discovery" "45 6 * * 1"         "Sentinel discovery — weekly Mon 06:45 IST"
+create_schedule "ct-sentinel-discovery" "45 6 * * *"         "Sentinel discovery — daily 06:45 IST"
 create_schedule "ct-sentinel-check"     "30 7,13,19 * * *"   "Sentinel check tick — 07:30/13:30/19:30 IST"
 
 # ── 7. Verify ─────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ Each background job is a **Cloud Run Job** (`ct-…`) started by a **Cloud Sched
 | `ct-alerter` | Sends email for new alerts; adds an AI triage paragraph for critical ones | **Every hour at :45** | 25 sec | 46 sec | 10 min | 2 | OK |
 | `ct-cost-collector` | Collects spend (GCP billing export, AWS, ClickHouse Cloud, OpenAI, Anthropic, Cohere) and runs cost anomaly checks | **Daily 06:00** | 23 sec | 42 sec | 10 min | 2 | OK |
 | `ct-alerter-weekly` | Weekly cost-digest email (same code as the alerter with `WEEKLY_DIGEST=true`) | **Mondays 09:00** | 15 sec | 42 sec | 10 min | 2 | OK |
-| `ct-sentinel-discovery` | Catalogs each table once: description, event-date column, monitored variables, dedup rule (uses the LLMs — see [LLM_USAGE.md](LLM_USAGE.md)) | **Mondays 06:45** | 48 min | 4 h* | 2 h | 1 | OK (80 tables per run) |
+| `ct-sentinel-discovery` | Catalogs each table once: description, event-date column, monitored variables, dedup rule (uses the LLMs — see [LLM_USAGE.md](LLM_USAGE.md)) | **Daily 06:45** | 48 min | 4 h* | 2 h | 1 | OK (80 tables per run) |
 | `ct-sentinel-resolver` | Settles "Needs Review" tables with a third AI opinion | **Daily 07:10** | 2.6 min | 17 min | 1 h | 1 | OK |
 | `ct-sentinel-check` | Freshness (Sync + Data, per table and per platform) for every table; volume, schema drift, coverage and reconciliation when due; opens/closes incidents and alerts | **Daily 07:30, 13:30, 19:30** | 41 sec** | 47 min | 1 h | 1 | OK |
 | `ct-ui` *(service)* | The dashboard and its API | **Always on** (1–2 instances) | — | — | 5 min per request | — | OK |

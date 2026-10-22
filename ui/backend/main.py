@@ -972,10 +972,11 @@ def sentinel_coverage():
                    COUNT(*) FILTER (WHERE v.lifecycle = 'retired') AS retired_values,
                    MAX(v.last_seen) AS last_seen,
                    lc.status       AS last_check_status,
-                   lc.missing      AS missing_values
+                   lc.missing      AS missing_values,
+                   lc.run_ts       AS last_check_at
             FROM sentinel.variable_values v
             LEFT JOIN LATERAL (
-                SELECT status, observed->'missing_values' AS missing
+                SELECT status, observed->'missing_values' AS missing, run_ts
                 FROM sentinel.check_results c
                 WHERE c.check_type = 'variable_coverage'
                   AND c.database_name = v.database_name
@@ -983,7 +984,7 @@ def sentinel_coverage():
                   AND c.variable = v.variable
                 ORDER BY run_ts DESC LIMIT 1
             ) lc ON true
-            GROUP BY v.database_name, v.table_name, v.variable, lc.status, lc.missing
+            GROUP BY v.database_name, v.table_name, v.variable, lc.status, lc.missing, lc.run_ts
             ORDER BY v.database_name, v.table_name, v.variable
         """)
         return cur.fetchall()
